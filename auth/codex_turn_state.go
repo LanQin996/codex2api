@@ -33,12 +33,18 @@ type CodexTurnStateTicket struct {
 	Source     string    `json:"source,omitempty"`
 }
 
+// ValidCodexTurnStateTicketValue accepts both observed ticket formats. The
+// configured length remains an additional supported format for compatibility.
+func ValidCodexTurnStateTicketValue(state string, targetLength int) bool {
+	state = strings.TrimSpace(state)
+	length := len(state)
+	return (length == 292 || length == 332 || (targetLength > 0 && length == targetLength)) &&
+		strings.HasPrefix(state, "gAAAAA") && ValidateCodexTurnState(state) == nil
+}
+
 func (t CodexTurnStateTicket) Valid(now time.Time, targetLength int) bool {
-	if targetLength <= 0 {
-		targetLength = 292
-	}
 	state := strings.TrimSpace(t.State)
-	return state != "" && len(state) == targetLength && t.Length == targetLength && strings.HasPrefix(state, "gAAAAA") && !t.ExpiresAt.IsZero() && now.Before(t.ExpiresAt)
+	return ValidCodexTurnStateTicketValue(state, targetLength) && t.Length == len(state) && !t.ExpiresAt.IsZero() && now.Before(t.ExpiresAt)
 }
 
 // ValidateCodexTurnState 只放行能原样进 HTTP 头的单行 ASCII 可见字符串。不做截断——

@@ -4183,7 +4183,7 @@
     "codexTurnStateModelPlaceholder": "Enter a model and press Enter",
     "codexTurnStateAdd": "Add",
     "codexTurnStateRemove": "Remove",
-    "codexTurnStateTargetLength": "Ticket length",
+    "codexTurnStateTargetLength": "Additional accepted length (292 / 332 supported automatically)",
     "codexTurnStateTTL": "Ticket TTL",
     "codexTurnStateRefreshBefore": "Refresh before expiry",
     "codexTurnStateConcurrency": "Harvest concurrency",
@@ -4243,6 +4243,7 @@
       "claudeDesc": "Global defaults for the Claude Code (Anthropic OAuth) channel"
     },
     "unit": {
+      "characters": "characters",
       "concurrency": "inflight",
       "rpm": "/min",
       "times": "x",

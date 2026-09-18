@@ -79,7 +79,7 @@ func prepareCodexTurnStateInjection(ctx context.Context, account *auth.Account, 
 	cfg := CurrentCodexTurnStateTicketConfig()
 	if cfg.PreserveExisting && headers != nil {
 		existing := observedCodexTurnState(headers.Get(codexTurnStateHeader))
-		if existing != "" && len(existing) == cfg.TargetLength && strings.HasPrefix(existing, "gAAAAA") {
+		if auth.ValidCodexTurnStateTicketValue(existing, cfg.TargetLength) {
 			injected = existing
 		}
 	}

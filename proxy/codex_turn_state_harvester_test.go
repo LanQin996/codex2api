@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,5 +84,37 @@ func TestCodexTurnStateMissingRequestQueuesWithBackoff(t *testing.T) {
 		}
 	default:
 		t.Fatal("response ticket not scheduled for persistence")
+	}
+}
+
+func TestCodexTurnStateMixedTicketLengths(t *testing.T) {
+	for _, configured := range []int{292, 332} {
+		t.Run(fmt.Sprint(configured), func(t *testing.T) {
+			h, account := ticketHarvesterFixture(t)
+			cfg := *CurrentCodexTurnStateTicketConfig()
+			cfg.TargetLength = configured
+			SetCodexTurnStateTicketConfig(&cfg)
+			for _, length := range []int{292, 332} {
+				model := fmt.Sprintf("gpt-test-%d", length)
+				state := "gAAAAA" + strings.Repeat("x", length-6)
+				ctx := BindCodexTurnStateRequest(context.Background(), account, model)
+				StageCodexTurnStateValue(ctx, state)
+				CommitCodexTurnStateRequest(ctx)
+				h.pruneAccountTickets(account, &cfg, time.Now())
+				if got := account.CodexTurnStateTicketInjection(model, configured, time.Now()); got != state {
+					t.Fatalf("length %d not retained with config %d", length, configured)
+				}
+				_, _, headers := prepareCodexTurnStateInjection(context.Background(), account, []byte(fmt.Sprintf("{\"model\":\"%s\"}", model)), nil, false)
+				if headers.Get(codexTurnStateHeader) != state {
+					t.Fatalf("length %d not injected", length)
+				}
+			}
+			if auth.ValidCodexTurnStateTicketValue("gAAAAA"+strings.Repeat("x", 300-6), configured) {
+				t.Fatal("unexpected length accepted")
+			}
+			if auth.ValidCodexTurnStateTicketValue("gAAAAA"+strings.Repeat("x", 292-7)+"\n", configured) {
+				t.Fatal("malformed ticket accepted")
+			}
+		})
 	}
 }

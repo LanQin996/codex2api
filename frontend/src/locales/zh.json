@@ -4217,6 +4217,7 @@
       "claudeDesc": "Claude Code(Anthropic OAuth)通道的全局默认配置"
     },
     "unit": {
+      "characters": "字符",
       "concurrency": "并发",
       "rpm": "/min",
       "times": "次",
@@ -4581,7 +4582,7 @@
     "codexTurnStateModelPlaceholder": "输入模型名后回车",
     "codexTurnStateAdd": "添加",
     "codexTurnStateRemove": "删除",
-    "codexTurnStateTargetLength": "票据长度",
+    "codexTurnStateTargetLength": "额外兼容长度（自动兼容 292 / 332）",
     "codexTurnStateTTL": "票据有效期",
     "codexTurnStateRefreshBefore": "提前刷新",
     "codexTurnStateConcurrency": "并发采集数",

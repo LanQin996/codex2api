@@ -325,7 +325,7 @@ func StageCodexTurnStateValue(ctx context.Context, value string) {
 	}
 	cfg := CurrentCodexTurnStateTicketConfig()
 	value = observedCodexTurnState(value)
-	if value == "" || len(value) != cfg.TargetLength || !strings.HasPrefix(value, "gAAAAA") {
+	if !auth.ValidCodexTurnStateTicketValue(value, cfg.TargetLength) {
 		return
 	}
 	h.pendingMu.Lock()
@@ -647,7 +647,7 @@ func (h *CodexTurnStateHarvester) probe(ctx context.Context, account *auth.Accou
 		return errors.New("missing access token")
 	}
 	state, status, err := h.fireProbe(ctx, account, token, model, cfg)
-	if err != nil || status != http.StatusOK || len(state) != cfg.TargetLength || !strings.HasPrefix(state, "gAAAAA") {
+	if err != nil || status != http.StatusOK || !auth.ValidCodexTurnStateTicketValue(state, cfg.TargetLength) {
 		if err != nil {
 			return err
 		}
@@ -664,7 +664,7 @@ func (h *CodexTurnStateHarvester) recordTicket(account *auth.Account, model, sta
 	cfg := CurrentCodexTurnStateTicketConfig()
 	now := time.Now().UTC()
 	state = strings.TrimSpace(state)
-	if state == "" || len(state) != cfg.TargetLength || !strings.HasPrefix(state, "gAAAAA") {
+	if state == "" || !auth.ValidCodexTurnStateTicketValue(state, cfg.TargetLength) {
 		return
 	}
 	model = strings.ToLower(strings.TrimSpace(model))
