@@ -9949,6 +9949,17 @@ export default function Accounts() {
                               <Hourglass className="size-4 text-amber-500" />
                               <span>{t("accounts.codexTurnStateTitle")}</span>
                             </div>
+                            <div className="mt-2 space-y-2 text-xs">
+                              <CodexTurnStateTicketBadge account={editingAccount} />
+                              {(editingAccount.codex_turn_state_tickets ?? []).map(ticket => (
+                                <div key={ticket.model} className="rounded border p-2 break-words">
+                                  <strong>{ticket.model}</strong>: {t("accounts.turnStatePhase." + ticket.state, { defaultValue: ticket.state })}
+                                  {ticket.last_error && <p className="text-red-600">{ticket.last_error}</p>}
+                                  {ticket.last_attempt && !ticket.last_attempt.startsWith("0001") && <p>{t("accounts.turnStateLastAttempt")}: {new Date(ticket.last_attempt).toLocaleString()}</p>}
+                                  {ticket.next_attempt && !ticket.next_attempt.startsWith("0001") && <p>{t("accounts.turnStateNextAttempt")}: {new Date(ticket.next_attempt).toLocaleString()}</p>}
+                                </div>
+                              ))}
+                            </div>
                             <p className="mt-1 text-xs text-muted-foreground leading-relaxed">
                               {t("accounts.codexTurnStateHint")}
                             </p>
@@ -13567,13 +13578,13 @@ function CodexTurnStateTicketBadge({ account }: { account: AccountRow }) {
     return null;
   }
   const managed = account.codex_turn_state_managed_count ?? 0;
-  if (managed <= 0) return null;
+
   const ready = account.codex_turn_state_ready_count ?? 0;
   const complete = ready >= managed;
   const partial = ready > 0;
   const tickets = account.codex_turn_state_tickets ?? [];
   const detail = tickets.length > 0
-    ? tickets.map((ticket) => `${ticket.model}: ${ticket.state}`).join(" · ")
+    ? tickets.map((ticket) => `${ticket.model}: ${t("accounts.turnStatePhase." + ticket.state, { defaultValue: ticket.state })}${ticket.last_error ? " — " + ticket.last_error : ""}${ticket.last_attempt && !ticket.last_attempt.startsWith("0001") ? " | " + t("accounts.turnStateLastAttempt") + ": " + new Date(ticket.last_attempt).toLocaleString() : ""}${ticket.next_attempt && !ticket.next_attempt.startsWith("0001") ? " | " + t("accounts.turnStateNextAttempt") + ": " + new Date(ticket.next_attempt).toLocaleString() : ""}`).join(" · ")
     : t("accounts.codexTurnStateNoTickets");
   const className = complete
     ? "bg-emerald-50 text-emerald-700 ring-emerald-200/80 dark:bg-emerald-950/40 dark:text-emerald-300 dark:ring-emerald-400/20"

@@ -463,7 +463,7 @@ func (h *CodexTurnStateHarvester) refresh(ctx context.Context) {
 	}
 	now := time.Now()
 	for _, account := range h.store.Accounts() {
-		if !isNativeCodexOAuth(account) || account.RuntimeStatus() == "disabled" {
+		if !isNativeCodexOAuth(account) || !account.IsAvailable() {
 			continue
 		}
 		// Keep learned concrete models eligible even after their ticket expires.
@@ -512,8 +512,24 @@ func (h *CodexTurnStateHarvester) pruneAccountTickets(account *auth.Account, cfg
 	}
 }
 
+func (h *CodexTurnStateHarvester) probeEligible(key codexTurnStateProbeKey) bool {
+	if h == nil || h.store == nil {
+		return false
+	}
+	account := h.store.FindByID(key.accountID)
+	if !isNativeCodexOAuth(account) || !account.IsAvailable() || account.IsModelRateLimited(key.model) {
+		return false
+	}
+	// Background maintenance must not spend credits to bypass exhausted usage windows.
+	switch account.RuntimeStatus() {
+	case "usage_exhausted", "rate_limited", "rate_limited_5h", "quota_paused":
+		return false
+	}
+	return true
+}
+
 func (h *CodexTurnStateHarvester) enqueueProbe(key codexTurnStateProbeKey, now time.Time) {
-	if key.accountID <= 0 || key.model == "" {
+	if key.accountID <= 0 || key.model == "" || !h.probeEligible(key) {
 		return
 	}
 	h.queueMu.Lock()
@@ -586,12 +602,12 @@ func (h *CodexTurnStateHarvester) runProbeTask(ctx context.Context, key codexTur
 		}
 	}
 	defer h.active.Add(-1)
-	h.probed.Add(1)
 	account := h.store.FindByID(key.accountID)
 	cfg := CurrentCodexTurnStateTicketConfig()
-	if account == nil || !cfg.Enabled {
+	if account == nil || !cfg.Enabled || !h.probeEligible(key) {
 		return
 	}
+	h.probed.Add(1)
 	err := h.probe(ctx, account, key.model, cfg)
 	h.queueMu.Lock()
 	if err == nil {
@@ -610,7 +626,8 @@ func (h *CodexTurnStateHarvester) runProbeTask(ctx context.Context, key codexTur
 		}
 		jitter := time.Duration(rand.Int63n(int64(backoff/4) + 1))
 		state.NextAttempt = time.Now().Add(backoff + jitter)
-		state.LastError = err.Error()
+		state.LastError = codexTurnStateProbeError(err)
+		log.Printf("[codex-turn-state] account=%d model=%s failures=%d next_attempt=%s error=%s", key.accountID, key.model, state.Failures, state.NextAttempt.UTC().Format(time.RFC3339), state.LastError)
 	}
 	h.queueMu.Unlock()
 	if err == nil {
@@ -794,7 +811,7 @@ func TriggerCodexTurnStateProbe(accountID int64, model string) bool {
 	}
 	cfg := CurrentCodexTurnStateTicketConfig()
 	model = strings.TrimSpace(model)
-	if accountID <= 0 || model == "" || !cfg.ModelManaged(model) {
+	if !cfg.Enabled || accountID <= 0 || model == "" || !cfg.ModelManaged(model) || !h.probeEligible(codexTurnStateProbeKey{accountID: accountID, model: strings.ToLower(model)}) {
 		return false
 	}
 	h.queueMu.Lock()
@@ -863,4 +880,55 @@ func (h *CodexTurnStateHarvester) fireProbe(ctx context.Context, account *auth.A
 	}
 	defer resp.Body.Close()
 	return strings.TrimSpace(resp.Header.Get(codexTurnStateHeader)), resp.StatusCode, nil
+}
+
+// CodexTurnStateProbeDiagnostics returns a metadata-only snapshot for one account.
+func CodexTurnStateProbeDiagnostics(accountID int64) map[string]struct {
+	Queued      bool
+	InFlight    bool
+	LastAttempt time.Time
+	LastSuccess time.Time
+	NextAttempt time.Time
+	LastError   string
+} {
+	result := make(map[string]struct {
+		Queued      bool
+		InFlight    bool
+		LastAttempt time.Time
+		LastSuccess time.Time
+		NextAttempt time.Time
+		LastError   string
+	})
+	if h := activeCodexTurnStateHarvester.Load(); h != nil {
+		h.queueMu.Lock()
+		defer h.queueMu.Unlock()
+		for key, state := range h.states {
+			if key.accountID == accountID {
+				result[key.model] = struct {
+					Queued      bool
+					InFlight    bool
+					LastAttempt time.Time
+					LastSuccess time.Time
+					NextAttempt time.Time
+					LastError   string
+				}{state.Queued, state.InFlight, state.LastAttempt, state.LastSuccess, state.NextAttempt, state.LastError}
+			}
+		}
+	}
+	return result
+}
+
+// Do not expose transport URLs, proxy credentials or token-refresh response bodies.
+func codexTurnStateProbeError(err error) string {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "probe timeout"
+	}
+	if errors.Is(err, context.Canceled) {
+		return "probe canceled"
+	}
+	message := err.Error()
+	if strings.HasPrefix(message, "probe returned status=") || message == "missing access token" {
+		return message
+	}
+	return "proxy/network or token refresh failed (details suppressed to protect credentials)"
 }

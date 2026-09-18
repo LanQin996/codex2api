@@ -118,3 +118,54 @@ func TestCodexTurnStateMixedTicketLengths(t *testing.T) {
 		})
 	}
 }
+
+func TestCodexTurnStateProbeSkipsUnavailableAccounts(t *testing.T) {
+	for _, reason := range []string{"quota", "disabled", "model"} {
+		t.Run(reason, func(t *testing.T) {
+			h, account := ticketHarvesterFixture(t)
+			key := codexTurnStateProbeKey{accountID: account.ID(), model: "gpt-test"}
+			switch reason {
+			case "quota":
+				account.UsagePercent7d = 100
+				account.UsagePercent7dValid = true
+				account.Reset7dAt = time.Now().Add(time.Hour)
+			case "disabled":
+				account.Disabled = 1
+			case "model":
+				account.SetModelCooldownUntil(key.model, "rate_limited", time.Now().Add(time.Hour))
+			}
+			h.enqueueProbe(key, time.Now())
+			if len(h.tasks) != 0 {
+				t.Fatal("unavailable account queued")
+			}
+			if TriggerCodexTurnStateProbe(account.ID(), key.model) {
+				t.Fatal("manual probe bypassed availability")
+			}
+			h.runProbeTask(context.Background(), key)
+			if h.probed.Load() != 0 {
+				t.Fatal("queued probe ran after account became unavailable")
+			}
+			account.UsagePercent7d = 0
+			account.Disabled = 0
+			account.ClearModelCooldown(key.model)
+			h.enqueueProbe(key, time.Now())
+			if len(h.tasks) != 1 {
+				t.Fatal("recovered account did not resume probing")
+			}
+		})
+	}
+}
+
+func TestCodexTurnStateDiagnosticsProtectCredentials(t *testing.T) {
+	h, account := ticketHarvesterFixture(t)
+	key := codexTurnStateProbeKey{accountID: account.ID(), model: "gpt-test"}
+	h.states[key] = &codexTurnStateProbeStatus{Failures: 1, NextAttempt: time.Now().Add(time.Minute), LastError: "probe returned status=403 length=0"}
+	got := CodexTurnStateProbeDiagnostics(account.ID())[key.model]
+	if got.LastError == "" || got.NextAttempt.IsZero() {
+		t.Fatal("missing diagnostics")
+	}
+	secret := "socks5://user:secret@example.com:1234"
+	if strings.Contains(codexTurnStateProbeError(fmt.Errorf("connect %s failed", secret)), "secret") {
+		t.Fatal("proxy credential leaked")
+	}
+}

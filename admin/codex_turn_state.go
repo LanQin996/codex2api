@@ -17,6 +17,7 @@ type codexTurnStateTicketStatus struct {
 	RemainingSeconds int64     `json:"remaining_seconds"`
 	LastAttempt      time.Time `json:"last_attempt,omitempty"`
 	LastSuccess      time.Time `json:"last_success,omitempty"`
+	NextAttempt      time.Time `json:"next_attempt,omitempty"`
 	LastError        string    `json:"last_error,omitempty"`
 }
 

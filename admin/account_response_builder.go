@@ -31,6 +31,28 @@ func codexTurnStateTicketStatuses(row *database.AccountRow, runtimeAccount *auth
 		}
 		runtimeAccount.Mu().RUnlock()
 	}
+	diagnostics := proxy.CodexTurnStateProbeDiagnostics(row.ID)
+	for _, model := range cfg.ProbeModels {
+		model = strings.ToLower(strings.TrimSpace(model))
+		if cfg.ModelManaged(model) && !strings.Contains(model, "*") {
+			if tickets == nil {
+				tickets = make(map[string]auth.CodexTurnStateTicket)
+			}
+			if _, ok := tickets[model]; !ok {
+				tickets[model] = auth.CodexTurnStateTicket{}
+			}
+		}
+	}
+	for model := range diagnostics {
+		if cfg.ModelManaged(model) {
+			if tickets == nil {
+				tickets = make(map[string]auth.CodexTurnStateTicket)
+			}
+			if _, ok := tickets[model]; !ok {
+				tickets[model] = auth.CodexTurnStateTicket{}
+			}
+		}
+	}
 	now := time.Now()
 	ready := 0
 	items := make([]codexTurnStateTicketStatus, 0, len(tickets))
@@ -43,6 +65,19 @@ func codexTurnStateTicketStatuses(row *database.AccountRow, runtimeAccount *auth
 		item := codexTurnStateTicketStatus{Model: model, State: state, CapturedAt: ticket.CapturedAt, ExpiresAt: ticket.ExpiresAt}
 		if state == "ready" {
 			item.RemainingSeconds = max(0, int64(time.Until(ticket.ExpiresAt).Seconds()))
+		}
+		if ticket.State == "" {
+			item.State = "missing"
+		}
+		if diagnostic, ok := diagnostics[model]; ok {
+			item.LastAttempt, item.LastSuccess, item.NextAttempt, item.LastError = diagnostic.LastAttempt, diagnostic.LastSuccess, diagnostic.NextAttempt, diagnostic.LastError
+			if diagnostic.InFlight {
+				item.State = "refreshing"
+			} else if diagnostic.Queued {
+				item.State = "queued"
+			} else if diagnostic.LastError != "" && state != "ready" {
+				item.State = "failed"
+			}
 		}
 		items = append(items, item)
 	}
@@ -60,7 +95,7 @@ func codexTurnStateTicketStatuses(row *database.AccountRow, runtimeAccount *auth
 			}
 		}
 	}
-	return items, ready, managed, true
+	return items, ready, max(managed, len(items)), true
 }
 
 func antigravityPersistedStatus(row *database.AccountRow) (string, string) {
