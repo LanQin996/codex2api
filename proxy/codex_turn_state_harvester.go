@@ -265,8 +265,11 @@ func BindCodexTurnStateRequest(ctx context.Context, account *auth.Account, model
 	if !cfg.Enabled || model == "" || !cfg.ModelManaged(model) {
 		return ctx
 	}
-	id := h.nextID.Add(1)
 	now := time.Now()
+	if account.CodexTurnStateTicketInjection(model, cfg.TargetLength, now) == "" || h.ticketNeedsRefresh(account, model, now, cfg) {
+		h.enqueueProbe(codexTurnStateProbeKey{accountID: account.ID(), model: strings.ToLower(model)}, now)
+	}
+	id := h.nextID.Add(1)
 	h.pendingMu.Lock()
 	h.prunePendingLocked(now)
 	if len(h.pending) >= codexTurnStateMaxPendingCaptures {
@@ -349,7 +352,7 @@ func CommitCodexTurnStateRequest(ctx context.Context) {
 		return
 	}
 	if account := h.store.FindByID(pending.key.accountID); account != nil {
-		h.recordTicket(account, pending.key.model, pending.candidate, "response", false)
+		h.recordTicket(account, pending.key.model, pending.candidate, "response", true)
 	}
 }
 
@@ -455,7 +458,7 @@ func isNativeCodexOAuth(account *auth.Account) bool {
 
 func (h *CodexTurnStateHarvester) refresh(ctx context.Context) {
 	cfg := CurrentCodexTurnStateTicketConfig()
-	if h == nil || h.store == nil || h.db == nil || !cfg.Enabled || len(cfg.ProbeModels) == 0 {
+	if h == nil || h.store == nil || h.db == nil || !cfg.Enabled {
 		return
 	}
 	now := time.Now()
@@ -463,10 +466,24 @@ func (h *CodexTurnStateHarvester) refresh(ctx context.Context) {
 		if !isNativeCodexOAuth(account) || account.RuntimeStatus() == "disabled" {
 			continue
 		}
+		// Keep learned concrete models eligible even after their ticket expires.
+		models := append([]string(nil), cfg.ProbeModels...)
+		account.Mu().RLock()
+		for model := range account.CodexTurnStateTickets {
+			models = append(models, model)
+		}
+		account.Mu().RUnlock()
+		h.queueMu.Lock()
+		for key := range h.states {
+			if key.accountID == account.ID() {
+				models = append(models, key.model)
+			}
+		}
+		h.queueMu.Unlock()
 		h.pruneAccountTickets(account, cfg, now)
-		for _, model := range cfg.ProbeModels {
+		for _, model := range models {
 			model := strings.TrimSpace(model)
-			if model == "" || !cfg.ModelManaged(model) {
+			if model == "" || strings.Contains(model, "*") || !cfg.ModelManaged(model) {
 				continue
 			}
 			if ticket := account.CodexTurnStateTicketInjection(model, cfg.TargetLength, now); ticket != "" && !h.ticketNeedsRefresh(account, model, now, cfg) {
@@ -581,6 +598,7 @@ func (h *CodexTurnStateHarvester) runProbeTask(ctx context.Context, key codexTur
 		state.Failures = 0
 		state.NextAttempt = time.Time{}
 		state.LastSuccess = time.Now()
+		state.LastError = ""
 	} else {
 		state.Failures++
 		backoff := time.Duration(1<<min(state.Failures, 6)) * time.Second
@@ -657,6 +675,12 @@ func (h *CodexTurnStateHarvester) recordTicket(account *auth.Account, model, sta
 	account.Mu().Lock()
 	if account.CodexTurnStateTickets == nil {
 		account.CodexTurnStateTickets = make(map[string]auth.CodexTurnStateTicket)
+	}
+	// An echoed opaque value is not a newly minted ticket. Extending its TTL
+	// here indefinitely postpones proactive refresh on busy accounts.
+	if existing, ok := account.CodexTurnStateTickets[model]; ok && existing.State == state {
+		account.Mu().Unlock()
+		return
 	}
 	account.CodexTurnStateTickets[model] = ticket
 	for len(account.CodexTurnStateTickets) > codexTurnStateMaxTicketsPerAccount {
