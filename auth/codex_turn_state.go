@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -16,12 +17,29 @@ const (
 	CodexTurnStateModelsCredentialKey = "codex_turn_state_models"
 	// CodexTurnStateSetAtCredentialKey 记录注入值最后一次被换掉的时刻（RFC3339）。
 	// 只服务于界面上的 1 小时时效倒计时：换值时重置，只改模型名单时保持不变。
-	CodexTurnStateSetAtCredentialKey = "codex_turn_state_set_at"
+	CodexTurnStateSetAtCredentialKey   = "codex_turn_state_set_at"
+	CodexTurnStateTicketsCredentialKey = "codex_turn_state_tickets"
 
 	// maxCodexTurnStateBytes：实测值在 300 字符上下，留一个数量级余量即可。
 	maxCodexTurnStateBytes       = 4096
 	maxCodexTurnStateModelsBytes = 1024
 )
+
+type CodexTurnStateTicket struct {
+	State      string    `json:"state"`
+	CapturedAt time.Time `json:"captured_at"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	Length     int       `json:"length"`
+	Source     string    `json:"source,omitempty"`
+}
+
+func (t CodexTurnStateTicket) Valid(now time.Time, targetLength int) bool {
+	if targetLength <= 0 {
+		targetLength = 292
+	}
+	state := strings.TrimSpace(t.State)
+	return state != "" && len(state) == targetLength && t.Length == targetLength && strings.HasPrefix(state, "gAAAAA") && !t.ExpiresAt.IsZero() && now.Before(t.ExpiresAt)
+}
 
 // ValidateCodexTurnState 只放行能原样进 HTTP 头的单行 ASCII 可见字符串。不做截断——
 // 截断后的 state 上游必然拒收，不如让操作者自己看见长度超限。
@@ -147,6 +165,23 @@ func (a *Account) CodexTurnStateInjection(models ...string) string {
 	return value
 }
 
+func (a *Account) CodexTurnStateTicketInjection(model string, targetLength int, now time.Time) string {
+	if a == nil {
+		return ""
+	}
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "" {
+		return ""
+	}
+	a.mu.RLock()
+	ticket, ok := a.CodexTurnStateTickets[model]
+	a.mu.RUnlock()
+	if !ok || !ticket.Valid(now, targetLength) {
+		return ""
+	}
+	return strings.TrimSpace(ticket.State)
+}
+
 // CodexTurnStateConfig 返回配置快照（值、模型名单、设置时刻）。
 func (a *Account) CodexTurnStateConfig() (value, models string, setAt time.Time) {
 	if a == nil {
@@ -174,4 +209,49 @@ func (s *Store) ApplyAccountCodexTurnState(id int64, value, models string, setAt
 		a.CodexTurnStateSetAt = setAt
 		a.mu.Unlock()
 	}
+}
+
+func (s *Store) ApplyAccountCodexTurnStateTicket(id int64, model string, ticket CodexTurnStateTicket) {
+	if s == nil {
+		return
+	}
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "" {
+		return
+	}
+	if a := s.FindByID(id); a != nil {
+		a.mu.Lock()
+		if a.CodexTurnStateTickets == nil {
+			a.CodexTurnStateTickets = make(map[string]CodexTurnStateTicket)
+		}
+		a.CodexTurnStateTickets[model] = ticket
+		a.mu.Unlock()
+	}
+}
+
+func ParseCodexTurnStateTickets(raw any) map[string]CodexTurnStateTicket {
+	if raw == nil {
+		return nil
+	}
+	b, err := json.Marshal(raw)
+	if err != nil {
+		return nil
+	}
+	var decoded map[string]CodexTurnStateTicket
+	if json.Unmarshal(b, &decoded) != nil {
+		return nil
+	}
+	result := make(map[string]CodexTurnStateTicket, len(decoded))
+	for model, ticket := range decoded {
+		model = strings.ToLower(strings.TrimSpace(model))
+		ticket.State = strings.TrimSpace(ticket.State)
+		if model == "" || ticket.State == "" {
+			continue
+		}
+		if ticket.Length <= 0 {
+			ticket.Length = len(ticket.State)
+		}
+		result[model] = ticket
+	}
+	return result
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/codex2api/auth"
@@ -73,10 +74,28 @@ func prepareCodexTurnStateInjection(ctx context.Context, account *auth.Account, 
 		return ctx, requestBody, headers
 	}
 	upstreamModel := strings.TrimSpace(gjson.GetBytes(requestBody, "model").String())
-	injected := account.CodexTurnStateInjection(codexClientModelFromContext(ctx), upstreamModel)
+	clientModel := codexClientModelFromContext(ctx)
+	injected := ""
+	cfg := CurrentCodexTurnStateTicketConfig()
+	if cfg.PreserveExisting && headers != nil {
+		existing := observedCodexTurnState(headers.Get(codexTurnStateHeader))
+		if existing != "" && len(existing) == cfg.TargetLength && strings.HasPrefix(existing, "gAAAAA") {
+			injected = existing
+		}
+	}
+	if injected == "" && cfg.Enabled && cfg.ModelManaged(clientModel, upstreamModel) {
+		injected = account.CodexTurnStateTicketInjection(upstreamModel, cfg.TargetLength, time.Now())
+		if injected == "" {
+			injected = account.CodexTurnStateTicketInjection(clientModel, cfg.TargetLength, time.Now())
+		}
+	}
+	if injected == "" {
+		injected = account.CodexTurnStateInjection(clientModel, upstreamModel)
+	}
 	if injected == "" {
 		return ctx, requestBody, headers
 	}
+	NoteCodexTurnStateInjected()
 	ctx = withCodexTurnStateInjection(ctx, injected)
 	if headers == nil {
 		headers = make(http.Header)
@@ -179,6 +198,7 @@ func codexTurnStateFromFrame(payload []byte) string {
 // 就记到本次尝试的追踪里（用量日志据此显示"回带 Turn State"）。
 func ObserveCodexTurnStateFrame(ctx context.Context, payload []byte) {
 	if state := codexTurnStateFromFrame(payload); state != "" {
+		StageCodexTurnStateValue(ctx, state)
 		noteUpstreamTurnState(ctx, state)
 	}
 }

@@ -359,6 +359,21 @@ func main() {
 	store.TriggerAutoCleanupAsync()
 	defer store.Stop()
 	backgroundCtx, cancelBackground := context.WithCancel(context.Background())
+	// Codex x-codex-turn-state 自动采集器：设置保存在数据库，启动时先加载一次，
+	// 后台循环会继续读取以支持多实例/管理端热更新。
+	if ticketSettings, ticketErr := db.GetCodexTurnStateSettings(backgroundCtx); ticketErr != nil {
+		log.Printf("加载 Codex Turn State 自动采集设置失败（保持关闭）: %v", ticketErr)
+	} else {
+		proxy.SetCodexTurnStateTicketConfig(&proxy.CodexTurnStateTicketConfig{
+			Enabled: ticketSettings.Enabled, HarvestProxyURL: ticketSettings.HarvestProxyURL,
+			Models: ticketSettings.Models, ProbeModels: ticketSettings.ProbeModels, TargetLength: ticketSettings.TargetLength,
+			TTLSeconds: ticketSettings.TTLSeconds, RefreshBeforeSeconds: ticketSettings.RefreshBeforeSeconds,
+			ProbeIntervalSeconds: ticketSettings.ProbeIntervalSeconds, AttemptTimeoutSeconds: ticketSettings.AttemptTimeoutSeconds,
+			Concurrency: ticketSettings.Concurrency, PreserveExisting: ticketSettings.PreserveExisting, FailClosed: ticketSettings.FailClosed,
+		})
+	}
+	ticketHarvester := proxy.NewCodexTurnStateHarvester(store, db)
+	ticketHarvester.Start(backgroundCtx)
 	adminHandler.StartQualityTests(backgroundCtx)
 	defer cancelBackground()
 	if !proxy.StartResponseCacheSettingsPoller(backgroundCtx, db) {
@@ -648,6 +663,7 @@ func main() {
 	adminHandler.WaitAutoResetCredits()
 	adminHandler.WaitAutoActivate5hWindow()
 	adminHandler.WaitQualityTests()
+	ticketHarvester.Stop()
 	wsKeepalive.Stop()
 	wsrelay.ShutdownExecutor()
 	if !proxy.DrainResponseCacheBackendWrites(2 * time.Second) {

@@ -13561,6 +13561,36 @@ function GroupChipList({
   return <div className="mt-1.5 flex flex-wrap gap-1">{content}</div>;
 }
 
+function CodexTurnStateTicketBadge({ account }: { account: AccountRow }) {
+  const { t } = useTranslation();
+  if (!account.codex_turn_state_auto_enabled || account.openai_responses_api || account.grok_api || account.claude_api || account.antigravity_api) {
+    return null;
+  }
+  const managed = account.codex_turn_state_managed_count ?? 0;
+  if (managed <= 0) return null;
+  const ready = account.codex_turn_state_ready_count ?? 0;
+  const complete = ready >= managed;
+  const partial = ready > 0;
+  const tickets = account.codex_turn_state_tickets ?? [];
+  const detail = tickets.length > 0
+    ? tickets.map((ticket) => `${ticket.model}: ${ticket.state}`).join(" · ")
+    : t("accounts.codexTurnStateNoTickets");
+  const className = complete
+    ? "bg-emerald-50 text-emerald-700 ring-emerald-200/80 dark:bg-emerald-950/40 dark:text-emerald-300 dark:ring-emerald-400/20"
+    : partial
+      ? "bg-amber-50 text-amber-700 ring-amber-200/80 dark:bg-amber-950/40 dark:text-amber-300 dark:ring-amber-400/20"
+      : "bg-red-50 text-red-700 ring-red-200/80 dark:bg-red-950/40 dark:text-red-300 dark:ring-red-400/20";
+  return (
+    <span
+      className={`codex-account-card__flag inline-flex items-center gap-1 ring-1 ring-inset ${className}`}
+      title={`${t("accounts.codexTurnStateStatus")}: ${detail}`}
+    >
+      {complete ? <ShieldCheck className="size-3" /> : <ShieldAlert className="size-3" />}
+      {t("accounts.codexTurnStateBadge", { ready, total: managed })}
+    </span>
+  );
+}
+
 function AccountMobileCard({
   account,
   sequence,
@@ -13739,6 +13769,7 @@ function AccountMobileCard({
                 subscription={account.subscription}
                 canRefresh
               />
+              <CodexTurnStateTicketBadge account={account} />
               {account.at_only && (
                 <span className="codex-account-card__flag">
                   <KeyRound className="size-3" />

@@ -4913,6 +4913,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		readCtx := upstreamResponseReadContext(c.Request.Context(), upstreamCtx, continuousRetryPolicy)
 		upstreamCtx = context.WithValue(upstreamCtx, encryptedContentSessionKey{}, sessionIdentity.affinityID)
 		upstreamCtx = WithCodexClientModel(upstreamCtx, model)
+		upstreamCtx = BindCodexTurnStateRequest(upstreamCtx, account, attemptEffectiveModel)
 		// 身份按 attempt 附加实际选中账号维度：account_* 门随重试换号重新匹配（issue #410）。
 		attemptIdentity := ruleIdentity.WithSelectedAccount(account, h.store)
 		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, attemptIdentity)
@@ -4935,6 +4936,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
+			AbortCodexTurnStateRequest(upstreamCtx)
 			if apiKeyModelRequestError(reqErr) != nil {
 				ttftGuard.Stop()
 				h.store.Release(account)
@@ -5017,6 +5019,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 
 		if resp.StatusCode != http.StatusOK {
+			AbortCodexTurnStateRequest(upstreamCtx)
 			ttftGuard.Stop()
 			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, durationMs, 0, resp.StatusCode)
@@ -5131,6 +5134,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
 			return
 		}
+		StageCodexTurnStateResponse(upstreamCtx, resp.Header)
 
 		if !isStream || !continuousRetryBuffersAttempts(continuousRetryPolicy) {
 			relayCodexTurnStateResponseHeader(c, affinityKey, account, resp.Header)
@@ -5635,6 +5639,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					return
 				}
 			} else {
+				CommitCodexTurnStateRequest(upstreamCtx)
 				for _, payload := range compactionProvenancePayloads {
 					h.recordCompactionProvenanceFromPayload(context.Background(), account, payload)
 				}
@@ -5642,6 +5647,9 @@ func (h *Handler) Responses(c *gin.Context) {
 					cacheCompletedResponseWithOutputItems(respCacheOwner, []byte(expandedInputRaw), completedResponseData, completedResponseOutputItems)
 				}
 			}
+		}
+		if outcome.logStatusCode != http.StatusOK {
+			AbortCodexTurnStateRequest(upstreamCtx)
 		}
 		_ = streamAttempt.Close()
 

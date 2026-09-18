@@ -395,6 +395,22 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			last_seen_at TIMESTAMP NULL,
 			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 		);`,
+		`CREATE TABLE IF NOT EXISTS codex_turn_state_settings (
+			id INTEGER PRIMARY KEY CHECK (id = 1),
+			enabled INTEGER NOT NULL DEFAULT 0,
+			harvest_proxy_url TEXT NOT NULL DEFAULT '',
+			models TEXT NOT NULL DEFAULT '["gpt-6-astra","gpt-5.6-sol"]',
+			probe_models TEXT NOT NULL DEFAULT '["gpt-6-astra","gpt-5.6-sol"]',
+			target_length INTEGER NOT NULL DEFAULT 292,
+			ttl_seconds INTEGER NOT NULL DEFAULT 3600,
+			refresh_before_seconds INTEGER NOT NULL DEFAULT 600,
+			probe_interval_seconds INTEGER NOT NULL DEFAULT 6,
+			attempt_timeout_seconds INTEGER NOT NULL DEFAULT 25,
+			concurrency INTEGER NOT NULL DEFAULT 8,
+			preserve_existing INTEGER NOT NULL DEFAULT 1,
+			fail_closed INTEGER NOT NULL DEFAULT 0
+		);`,
+		`INSERT OR IGNORE INTO codex_turn_state_settings (id) VALUES (1);`,
 		`CREATE TABLE IF NOT EXISTS model_registry_sync (
 			id INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
 			source_url TEXT DEFAULT '',
@@ -538,6 +554,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"accounts", "note", "TEXT DEFAULT ''"},
 		{"accounts", "deleted_at", "TIMESTAMP NULL"},
 		{"accounts", "credential_generation", "INTEGER NOT NULL DEFAULT 1"},
+		{"codex_turn_state_settings", "probe_models", "TEXT NOT NULL DEFAULT '[\"gpt-6-astra\",\"gpt-5.6-sol\"]'"},
+		{"codex_turn_state_settings", "preserve_existing", "INTEGER NOT NULL DEFAULT 1"},
 		{"usage_logs", "channel", "TEXT DEFAULT ''"},
 		{"usage_logs", "input_tokens", "INTEGER DEFAULT 0"},
 		{"usage_logs", "output_tokens", "INTEGER DEFAULT 0"},

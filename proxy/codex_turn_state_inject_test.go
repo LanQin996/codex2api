@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/codex2api/auth"
 	"github.com/tidwall/gjson"
@@ -102,6 +103,24 @@ func TestPrepareCodexTurnStateInjectionWebsocketBody(t *testing.T) {
 	ctx, body, headers = prepareCodexTurnStateInjection(context.Background(), plain, []byte(`{"model":"gpt-5.5"}`), nil, true)
 	if headers != nil || gjson.GetBytes(body, "client_metadata").Exists() || CodexTurnStateInjectionFromContext(ctx) != "" {
 		t.Fatal("unconfigured account must be a no-op")
+	}
+}
+
+func TestPrepareCodexTurnStateInjectionPrefersManagedTicket(t *testing.T) {
+	const state = "gAAAAAautomatic-ticket"
+	previous := CurrentCodexTurnStateTicketConfig()
+	t.Cleanup(func() { SetCodexTurnStateTicketConfig(previous) })
+	SetCodexTurnStateTicketConfig(&CodexTurnStateTicketConfig{Enabled: true, Models: []string{"gpt-5.5"}, TargetLength: len(state)})
+	account := &auth.Account{DBID: 9, CodexTurnState: "manual-state", CodexTurnStateTickets: map[string]auth.CodexTurnStateTicket{
+		"gpt-5.5": {State: state, Length: len(state), ExpiresAt: time.Now().Add(time.Hour)},
+	}}
+	ctx := WithCodexClientModel(context.Background(), "gpt-5.5")
+	ctx, _, headers := prepareCodexTurnStateInjection(ctx, account, []byte(`{"model":"gpt-5.5"}`), nil, false)
+	if got := headers.Get(codexTurnStateHeader); got != state {
+		t.Fatalf("automatic ticket = %q, want %q", got, state)
+	}
+	if got := CodexTurnStateInjectionFromContext(ctx); got != state {
+		t.Fatalf("context ticket = %q, want %q", got, state)
 	}
 }
 

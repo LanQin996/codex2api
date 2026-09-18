@@ -341,6 +341,10 @@ export interface AccountRow {
   codex_turn_state_models?: string
   /** RFC3339 timestamp of the last time the injected value changed; absent = unknown. */
   codex_turn_state_set_at?: string
+  codex_turn_state_auto_enabled?: boolean
+  codex_turn_state_ready_count?: number
+  codex_turn_state_managed_count?: number
+  codex_turn_state_tickets?: CodexTurnStateTicketStatus[]
   health_tier?: string
   scheduler_score?: number
   dispatch_score?: number
@@ -457,6 +461,17 @@ export interface AccountRow {
   image_quota_total?: number
   today_used_count?: number
   image_quota_reset_at?: ISODateString
+}
+
+export interface CodexTurnStateTicketStatus {
+  model: string
+  state: 'ready' | 'expired' | 'refreshing' | 'missing' | string
+  captured_at?: string
+  expires_at?: string
+  remaining_seconds?: number
+  last_attempt?: string
+  last_success?: string
+  last_error?: string
 }
 
 export type AccountsResponse = ApiListResponse<'accounts', AccountRow>
@@ -2033,6 +2048,17 @@ export interface SystemSettings {
 	  recovery_probe_interval_minutes: number
   lazy_mode: boolean
   codex_oauth_keepalive_enabled: boolean
+  codex_turn_state_auto_enabled: boolean
+  codex_turn_state_harvest_proxy_url: string
+  codex_turn_state_managed_models: string[]
+  codex_turn_state_probe_models: string[]
+  codex_turn_state_target_length: number
+  codex_turn_state_ttl_seconds: number
+  codex_turn_state_refresh_before_seconds: number
+  codex_turn_state_probe_interval_seconds: number
+  codex_turn_state_attempt_timeout_seconds: number
+  codex_turn_state_concurrency: number
+  codex_turn_state_preserve_existing: boolean
   proxy_url?: string
   pg_max_conns: number
   redis_pool_size: number

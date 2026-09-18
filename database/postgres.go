@@ -1292,7 +1292,7 @@ func (db *DB) migrate(ctx context.Context) error {
 	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS limits JSONB DEFAULT '{}'::jsonb;
 	ALTER TABLE api_keys ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE;
 
-			CREATE TABLE IF NOT EXISTS system_settings (
+		CREATE TABLE IF NOT EXISTS system_settings (
 				id                 INTEGER PRIMARY KEY DEFAULT 1 CHECK (id = 1),
 				site_name          TEXT DEFAULT 'CodexProxy',
 				site_logo          TEXT DEFAULT '',
@@ -1327,6 +1327,24 @@ func (db *DB) migrate(ctx context.Context) error {
 			response_cache_config_generation BIGINT NOT NULL DEFAULT 1,
 			models_list_read_max_bytes BIGINT NOT NULL DEFAULT 8388608
 		);
+		CREATE TABLE IF NOT EXISTS codex_turn_state_settings (
+			id INTEGER PRIMARY KEY,
+			enabled BOOLEAN NOT NULL DEFAULT FALSE,
+			harvest_proxy_url TEXT NOT NULL DEFAULT '',
+			models TEXT NOT NULL DEFAULT '["gpt-6-astra","gpt-5.6-sol"]',
+			probe_models TEXT NOT NULL DEFAULT '["gpt-6-astra","gpt-5.6-sol"]',
+			target_length INTEGER NOT NULL DEFAULT 292,
+			ttl_seconds INTEGER NOT NULL DEFAULT 3600,
+			refresh_before_seconds INTEGER NOT NULL DEFAULT 600,
+			probe_interval_seconds INTEGER NOT NULL DEFAULT 6,
+			attempt_timeout_seconds INTEGER NOT NULL DEFAULT 25,
+			concurrency INTEGER NOT NULL DEFAULT 8,
+			preserve_existing BOOLEAN NOT NULL DEFAULT TRUE,
+			fail_closed BOOLEAN NOT NULL DEFAULT FALSE
+		);
+		ALTER TABLE codex_turn_state_settings ADD COLUMN IF NOT EXISTS probe_models TEXT NOT NULL DEFAULT '["gpt-6-astra","gpt-5.6-sol"]';
+		ALTER TABLE codex_turn_state_settings ADD COLUMN IF NOT EXISTS preserve_existing BOOLEAN NOT NULL DEFAULT TRUE;
+		INSERT INTO codex_turn_state_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
 	CREATE TABLE IF NOT EXISTS api_key_model_request_counters (
 		api_key_id BIGINT NOT NULL,
 		rule_id VARCHAR(80) NOT NULL,

@@ -2,6 +2,7 @@ package admin
 
 import (
 	"encoding/json"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -9,7 +10,58 @@ import (
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/codex2api/internal/openaiidentity"
+	"github.com/codex2api/proxy"
 )
+
+func codexTurnStateTicketStatuses(row *database.AccountRow, runtimeAccount *auth.Account) ([]codexTurnStateTicketStatus, int, int, bool) {
+	cfg := proxy.CurrentCodexTurnStateTicketConfig()
+	if cfg == nil || !cfg.Enabled || row == nil {
+		return nil, 0, 0, false
+	}
+	upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
+	if strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses) || strings.EqualFold(upstreamType, auth.UpstreamGrok) || strings.EqualFold(upstreamType, auth.UpstreamClaude) || strings.EqualFold(upstreamType, auth.UpstreamAntigravity) {
+		return nil, 0, 0, false
+	}
+	tickets := auth.ParseCodexTurnStateTickets(row.Credentials[auth.CodexTurnStateTicketsCredentialKey])
+	if runtimeAccount != nil {
+		runtimeAccount.Mu().RLock()
+		tickets = make(map[string]auth.CodexTurnStateTicket, len(runtimeAccount.CodexTurnStateTickets))
+		for model, ticket := range runtimeAccount.CodexTurnStateTickets {
+			tickets[model] = ticket
+		}
+		runtimeAccount.Mu().RUnlock()
+	}
+	now := time.Now()
+	ready := 0
+	items := make([]codexTurnStateTicketStatus, 0, len(tickets))
+	for model, ticket := range tickets {
+		state := "expired"
+		if ticket.Valid(now, cfg.TargetLength) {
+			state = "ready"
+			ready++
+		}
+		item := codexTurnStateTicketStatus{Model: model, State: state, CapturedAt: ticket.CapturedAt, ExpiresAt: ticket.ExpiresAt}
+		if state == "ready" {
+			item.RemainingSeconds = max(0, int64(time.Until(ticket.ExpiresAt).Seconds()))
+		}
+		items = append(items, item)
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Model < items[j].Model })
+	managed := 0
+	for _, model := range cfg.ProbeModels {
+		if cfg.ModelManaged(model) {
+			managed++
+		}
+	}
+	if managed == 0 {
+		for _, model := range cfg.Models {
+			if !strings.Contains(model, "*") {
+				managed++
+			}
+		}
+	}
+	return items, ready, managed, true
+}
 
 func antigravityPersistedStatus(row *database.AccountRow) (string, string) {
 	if row == nil {
@@ -208,6 +260,7 @@ func (h *Handler) buildAccountResponse(
 		}
 		allowedAPIKeyIDs = row.GetCredentialInt64Slice("allowed_api_key_ids")
 	}
+	codexTurnStateTickets, codexTurnStateReadyCount, codexTurnStateManagedCount, codexTurnStateEnabled := codexTurnStateTicketStatuses(row, runtimeAccount)
 	resp := accountResponse{
 		DetailLoaded:                 includeDetails,
 		ID:                           row.ID,
@@ -267,6 +320,10 @@ func (h *Handler) buildAccountResponse(
 		CodexTurnState:               strings.TrimSpace(row.GetCredential(auth.CodexTurnStateCredentialKey)),
 		CodexTurnStateModels:         auth.NormalizeCodexTurnStateModels(row.GetCredential(auth.CodexTurnStateModelsCredentialKey)),
 		CodexTurnStateSetAt:          strings.TrimSpace(row.GetCredential(auth.CodexTurnStateSetAtCredentialKey)),
+		CodexTurnStateAutoEnabled:    codexTurnStateEnabled,
+		CodexTurnStateReadyCount:     codexTurnStateReadyCount,
+		CodexTurnStateManagedCount:   codexTurnStateManagedCount,
+		CodexTurnStateTickets:        codexTurnStateTickets,
 		CustomHeaders:                customHeaders,
 		UpstreamRequestIDHeader:      row.GetCredential(auth.UpstreamRequestIDHeaderCredentialKey),
 		ProxyURL:                     row.ProxyURL,
