@@ -26,14 +26,16 @@ type QualityTestMetrics struct {
 
 // Account identity is a snapshot, so renaming/deleting an account cannot rewrite history.
 type QualityTestJob struct {
-	ID              int64  `json:"id"`
-	AccountID       int64  `json:"account_id"`
-	AccountName     string `json:"account_name"`
-	PlanType        string `json:"plan_type"`
-	Channel         string `json:"channel"`
-	Model           string `json:"model"`
-	ReasoningEffort string `json:"reasoning_effort"`
-	Prompt          string `json:"prompt,omitempty"`
+	BatchID         string     `json:"batch_id,omitempty"`
+	StartedAt       *time.Time `json:"started_at,omitempty"`
+	ID              int64      `json:"id"`
+	AccountID       int64      `json:"account_id"`
+	AccountName     string     `json:"account_name"`
+	PlanType        string     `json:"plan_type"`
+	Channel         string     `json:"channel"`
+	Model           string     `json:"model"`
+	ReasoningEffort string     `json:"reasoning_effort"`
+	Prompt          string     `json:"prompt,omitempty"`
 	// Preset provenance is a snapshot: "builtin" refs a shipped key, "custom" refs a
 	// quality_test_prompts id; an empty kind means the prompt was typed by hand.
 	PresetKind  string     `json:"preset_kind"`
@@ -53,6 +55,8 @@ type QualityTestJob struct {
 // ReasoningEffort filters on the stored value, so "" cannot be expressed here;
 // HasEffort marks an explicit effort filter (including the model default "").
 type QualityTestFilter struct {
+	Latest          bool
+	Channel         string
 	PlanType        string
 	Model           string
 	ReasoningEffort string
@@ -97,6 +101,9 @@ func (f QualityTestFilter) where() (string, []any) {
 	add := func(column string, value any) {
 		args = append(args, value)
 		clauses = append(clauses, fmt.Sprintf("%s=$%d", column, len(args)))
+	}
+	if f.Channel != "" {
+		add("channel", f.Channel)
 	}
 	if f.PlanType != "" {
 		add("plan_type", f.PlanType)
@@ -158,6 +165,9 @@ func (db *DB) ensureQualityTestSchema(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := db.ensureQualityTestQueueSchema(ctx); err != nil {
+		return err
+	}
 	return db.ensureQualityTestPromptSchema(ctx)
 }
 
@@ -202,13 +212,13 @@ func (db *DB) ExpireQualityTests(ctx context.Context, now time.Time) error {
 	return err
 }
 
-const qualityTestColumns = `id,account_id,account_name,plan_type,channel,model,reasoning_effort,status,metrics_json,error,created_at,updated_at,completed_at,deadline_at,preset_kind,preset_ref,preset_name`
+const qualityTestColumns = `id,account_id,account_name,plan_type,channel,model,reasoning_effort,status,metrics_json,error,created_at,updated_at,completed_at,deadline_at,preset_kind,preset_ref,preset_name,batch_id,started_at`
 
 func scanQualityTestJob(scanner interface{ Scan(...any) error }, detail bool) (*QualityTestJob, error) {
 	var job QualityTestJob
 	var metrics string
-	var created, updated, completed, deadline any
-	args := []any{&job.ID, &job.AccountID, &job.AccountName, &job.PlanType, &job.Channel, &job.Model, &job.ReasoningEffort, &job.Status, &metrics, &job.Error, &created, &updated, &completed, &deadline, &job.PresetKind, &job.PresetRef, &job.PresetName}
+	var created, updated, completed, deadline, started any
+	args := []any{&job.ID, &job.AccountID, &job.AccountName, &job.PlanType, &job.Channel, &job.Model, &job.ReasoningEffort, &job.Status, &metrics, &job.Error, &created, &updated, &completed, &deadline, &job.PresetKind, &job.PresetRef, &job.PresetName, &job.BatchID, &started}
 	if detail {
 		args = append(args, &job.Prompt, &job.Output)
 	}
@@ -235,8 +245,17 @@ func scanQualityTestJob(scanner interface{ Scan(...any) error }, detail bool) (*
 	if value.Valid {
 		job.CompletedAt = &value.Time
 	}
+	if value, err := parseDBNullTimeValue(started); err != nil {
+		return nil, err
+	} else if value.Valid {
+		job.StartedAt = &value.Time
+	}
 	if job.Status == "running" || job.Status == "cancelling" {
-		job.DurationMS = max(0, time.Since(job.CreatedAt).Milliseconds())
+		start := job.CreatedAt
+		if job.StartedAt != nil {
+			start = *job.StartedAt
+		}
+		job.DurationMS = max(0, time.Since(start).Milliseconds())
 	}
 	return &job, nil
 }
@@ -252,6 +271,9 @@ func (db *DB) ListQualityTests(ctx context.Context, page, pageSize int, filter Q
 	page, pageSize = normalizePage(page, pageSize)
 	result := &QualityTestPage{Jobs: []QualityTestJob{}, ActiveJobs: []QualityTestJob{}, Limit: QualityTestConcurrency}
 	where, args := filter.where()
+	if filter.Latest {
+		where = " WHERE id IN (SELECT MAX(id) FROM quality_test_jobs" + where + " GROUP BY account_id)"
+	}
 	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM quality_test_jobs`+where, args...).Scan(&result.Total); err != nil {
 		return nil, err
 	}
@@ -364,6 +386,6 @@ func (db *DB) FinishQualityTest(ctx context.Context, job QualityTestJob) error {
 }
 
 func (db *DB) CancelQualityTest(ctx context.Context, id int64) error {
-	_, err := db.conn.ExecContext(ctx, `UPDATE quality_test_jobs SET status='cancelling',updated_at=$1 WHERE id=$2 AND status='running'`, db.timeArg(time.Now()), id)
+	_, err := db.conn.ExecContext(ctx, `UPDATE quality_test_jobs SET status=CASE WHEN status='queued' THEN 'stopped' ELSE 'cancelling' END,completed_at=CASE WHEN status='queued' THEN $1 ELSE completed_at END,updated_at=$1 WHERE id=$2 AND status IN ('queued','running')`, db.timeArg(time.Now()), id)
 	return err
 }

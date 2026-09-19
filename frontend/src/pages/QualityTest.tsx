@@ -23,6 +23,8 @@ import { useHighlightedHtml } from '../hooks/useHighlighter'
 import { formatQualitySource } from '../lib/qualityTestFormat'
 import { formatBeijingTime } from '../utils/time'
 import Pagination from '../components/Pagination'
+import QualityTestGallery from './QualityTestGallery'
+import QualityTestBatchPanel, { QualityTestBatchProgress } from './QualityTestBatch'
 import './quality-test.css'
 
 function PlanBadge({ plan }: { plan: string }) {
@@ -286,14 +288,16 @@ export default function QualityTest() {
   const presetValue = activePreset ? String(activePreset.id) : activeBuiltin ? `builtin:${activeBuiltin.key}` : 'custom'
   const [searchParams, setSearchParams] = useSearchParams()
   const requestedPane = searchParams.get('view')
-  const pane: 'studio' | 'presets' | 'history' = requestedPane === 'history' ? 'history' : requestedPane === 'presets' ? 'presets' : 'studio'
+  const pane: 'gallery' | 'studio' | 'presets' | 'history' = requestedPane === 'history' ? 'history' : requestedPane === 'presets' ? 'presets' : requestedPane === 'studio' || searchParams.has('job') ? 'studio' : 'gallery'
+  const [batchOpen, setBatchOpen] = useState(false)
+  const [batchID, setBatchID] = useState(() => { try { return localStorage.getItem('quality-test-batch') ?? '' } catch { return '' } })
   const [recordPage, setRecordPage] = useState(1)
   const [recordFilter, setRecordFilter] = useState<QualityTestJobsFilter>({})
-  const filterActive = Boolean(recordFilter.plan || recordFilter.model || recordFilter.effort || recordFilter.account_id || recordFilter.preset)
+  const filterActive = Boolean(recordFilter.channel || recordFilter.plan || recordFilter.model || recordFilter.effort || recordFilter.account_id || recordFilter.preset)
   const updateFilter = (patch: QualityTestJobsFilter) => { setRecordFilter((current) => ({ ...current, ...patch })); setRecordPage(1) }
   const [modalID, setModalID] = useState<number>()
   const [revision, setRevision] = useState(0)
-  const records = useQualityTestJobs(recordPage, revision, recordFilter)
+  const records = useQualityTestJobs(recordPage, revision, { ...recordFilter, latest: pane === 'gallery' })
   const facets = records.facets ?? EMPTY_QUALITY_TEST_FACETS
   const requestedID = Number(searchParams.get('job'))
   // 结果面板只跟随显式选中(URL job 参数)或正在运行的任务;不回退到历史第一条,
@@ -310,7 +314,6 @@ export default function QualityTest() {
   const [narrowPreview, setNarrowPreview] = useState(false)
   const mountedRef = useRef(true)
   const running = isQualityTestActive(run)
-  const slotsFull = records.active_jobs.length >= records.concurrency_limit
   const accountBusy = records.active_jobs.some((job) => job.account_id === account?.id)
   const promptBytes = new TextEncoder().encode(prompt).length
   const html = useMemo(() => run && !isQualityTestActive(run) ? extractQualityTestHTML(run.output ?? '') : '', [run])
@@ -370,7 +373,7 @@ export default function QualityTest() {
     return () => controller.abort()
   }, [accountID, reload])
 
-  function goToPane(nextPane: 'studio' | 'presets' | 'history') {
+  function goToPane(nextPane: 'gallery' | 'studio' | 'presets' | 'history') {
     setSearchParams((previous) => { const next = new URLSearchParams(previous); next.set('view', nextPane); return next })
   }
 
@@ -423,7 +426,7 @@ export default function QualityTest() {
   }
 
   async function startTest() {
-    if (submittingRef.current || !account || !model || !prompt.trim() || promptBytes > 16000 || slotsFull || accountBusy) return
+    if (submittingRef.current || !account || !model || !prompt.trim() || promptBytes > 16000 || accountBusy) return
     submittingRef.current = true
     setSubmitting(true)
     try {
@@ -464,10 +467,13 @@ export default function QualityTest() {
       <PageHeader title={t('qualityTest.title')} description={t('qualityTest.subtitle')}
         titleAdornment={<span className="quality-test-tag"><FlaskConical className="size-3.5" /> HTML / SVG</span>}
         actionMeta={<span className="quality-test-capacity"><span className={records.active_jobs.length ? 'is-active' : ''} />{t('qualityTest.capacity', { count: records.active_jobs.length, limit: records.concurrency_limit })}</span>}
-        actions={<SegmentedPillGroup value={pane} label={t('qualityTest.title')} onChange={(value) => setSearchParams((previous) => { const next = new URLSearchParams(previous); next.set('view', value); return next })}
-          options={[{ value: 'studio', label: t('qualityTest.studioTab'), icon: <FlaskConical className="size-4" /> }, { value: 'presets', label: t('qualityTest.presetsTab'), icon: <BookmarkPlus className="size-4" /> }, { value: 'history', label: t('qualityTest.recordsTab'), icon: <History className="size-4" /> }]} />} />
+        actions={<SegmentedPillGroup value={pane} label={t('qualityTest.title')} onChange={(value) => setSearchParams((previous) => { const next = new URLSearchParams(previous); next.set('view', value); next.delete('job'); setRecordPage(1); return next })}
+          options={[{ value: 'gallery', label: t('qualityTest.gallery.title'), icon: <FileImage className="size-4" /> }, { value: 'studio', label: t('qualityTest.studioTab'), icon: <FlaskConical className="size-4" /> }, { value: 'presets', label: t('qualityTest.presetsTab'), icon: <BookmarkPlus className="size-4" /> }, { value: 'history', label: t('qualityTest.recordsTab'), icon: <History className="size-4" /> }]} />} />
+      <div className="quality-test-gallery-toolbar"><p>{t('qualityTest.batch.shortHint')}</p><Button onClick={() => setBatchOpen(true)}><Plus className="size-4" />{t('qualityTest.batch.title')}</Button></div>
+      {batchID ? <QualityTestBatchProgress id={batchID} onChanged={() => setRevision(value => value + 1)} /> : null}
+      <QualityTestBatchPanel open={batchOpen} channels={shownChannels} presets={presets} onClose={() => setBatchOpen(false)} onCreated={batch => { setBatchID(batch.id); try { localStorage.setItem('quality-test-batch', batch.id) } catch { /* Storage can be disabled. */ } setRecordPage(1); setRevision(value => value + 1); setSearchParams({ view: 'gallery' }) }} />
       {records.error || detail.error ? <div role="alert" className="quality-test-error">{records.error || detail.error}<Button size="sm" variant="outline" onClick={() => setRevision((value) => value + 1)}>{t('common.retry')}</Button></div> : null}
-      {records.active_jobs.length > 0 ? <section className="quality-test-active" aria-label={t('qualityTest.activeTasks')}>
+      {pane !== 'gallery' && records.active_jobs.length > 0 ? <section className="quality-test-active" aria-label={t('qualityTest.activeTasks')}>
         <div className="quality-test-active-heading"><span><RefreshCw className="size-3.5 animate-spin" />{t('qualityTest.activeTasks')}</span><p>{t('qualityTest.backgroundHint')}</p></div>
         <div className="quality-test-active-list">{records.active_jobs.map((job) => <Button variant="outline" key={job.id} className="quality-test-active-card" aria-pressed={selectedID === job.id} onClick={() => selectJob(job.id, 'studio')}>
           <span className="quality-test-active-account"><span>{job.account_name}</span><PlanBadge plan={job.plan_type} /></span>
@@ -495,12 +501,13 @@ export default function QualityTest() {
           {presets.map((preset) => <PresetCard key={preset.id} preset={preset} onUse={() => { setPrompt(preset.prompt); goToPane('studio') }} onEdit={() => setPresetDraft({ id: preset.id, name: preset.name, prompt: preset.prompt })} onDelete={() => void deletePreset(preset)} />)}
           {!presetsLoading && presets.length === 0 ? <button type="button" className="quality-test-preset-add" onClick={() => setPresetDraft({ name: '', prompt: '' })}><span><Plus className="size-5" /></span><strong>{t('qualityTest.presets.empty')}</strong><small>{t('qualityTest.presets.emptyHint')}</small></button> : null}
         </div>
-      </section> : pane === 'history' ? <section className="quality-test-records" aria-labelledby="quality-records-title">
+      </section> : pane === 'history' || pane === 'gallery' ? <section className="quality-test-records" aria-labelledby="quality-records-title">
         <div className="quality-test-records-heading">
-          <div><h3 id="quality-records-title">{t('qualityTest.recordsTab')}</h3><p>{t('qualityTest.recordsHint')}</p></div>
+          <div><h3 id="quality-records-title">{t(pane === 'gallery' ? 'qualityTest.gallery.title' : 'qualityTest.recordsTab')}</h3><p>{t(pane === 'gallery' ? 'qualityTest.gallery.hint' : 'qualityTest.recordsHint')}</p></div>
           <div className="quality-test-records-tools">{records.total > 0 ? <span className="quality-test-records-count">{records.total}</span> : null}<Button variant="outline" size="sm" onClick={() => setRevision((value) => value + 1)}><RefreshCw className={records.loading ? 'animate-spin' : ''} />{t('common.refresh')}</Button></div>
         </div>
         <div className="quality-test-filters" role="group" aria-label={t('qualityTest.filters.title')}>
+          <Select aria-label={t('qualityTest.channel')} compact value={recordFilter.channel ?? ''} onValueChange={channel => updateFilter({ channel })} options={[{ value: '', label: t('qualityTest.gallery.allChannels') }, ...shownChannels.map(value => ({ value, label: channelNames[value] }))]} />
           <span className="quality-test-filters-label"><Filter className="size-3.5" />{t('qualityTest.filters.title')}</span>
           <Select aria-label={t('qualityTest.filters.plan')} compact value={recordFilter.plan ?? ''} onValueChange={(value) => updateFilter({ plan: value })} options={[{ value: '', label: t('qualityTest.filters.allPlans') }, ...facets.plans.map((plan) => ({ value: plan, label: plan || '—', content: <PlanBadge plan={plan} /> }))]} />
           <Select aria-label={t('qualityTest.filters.account')} compact value={recordFilter.account_id ? String(recordFilter.account_id) : ''} onValueChange={(value) => updateFilter({ account_id: Number(value) || undefined })} options={[{ value: '', label: t('qualityTest.filters.allAccounts') }, ...facets.accounts.map((item) => ({ value: String(item.id), label: `${item.name} · #${item.id}` }))]} />
@@ -509,7 +516,7 @@ export default function QualityTest() {
           <Select aria-label={t('qualityTest.filters.preset')} compact value={recordFilter.preset ?? ''} onValueChange={(value) => updateFilter({ preset: value })} options={[{ value: '', label: t('qualityTest.filters.allPresets') }, { value: 'none', label: t('qualityTest.presets.handwritten') }, ...facets.presets.map((item) => ({ value: `${item.kind}:${item.ref}`, label: item.kind === 'builtin' ? t(`qualityTest.presets.builtins.${item.ref}`, { defaultValue: item.name || item.ref }) : item.name, content: <PresetLabel job={{ preset_kind: item.kind, preset_ref: item.ref, preset_name: item.name }} /> }))]} />
           {filterActive ? <Button size="sm" variant="ghost" onClick={() => { setRecordFilter({}); setRecordPage(1) }}><FilterX className="size-3.5" />{t('qualityTest.filters.clear')}</Button> : null}
         </div>
-        {records.jobs.length === 0 ? <div className="quality-test-records-empty"><History className="size-9" /><h4>{t(records.loading ? 'qualityTest.loadingRecords' : filterActive ? 'qualityTest.filters.noMatch' : 'qualityTest.emptyRecords')}</h4><p>{t(filterActive && !records.loading ? 'qualityTest.filters.noMatchHint' : 'qualityTest.emptyRecordsHint')}</p></div> : <div className="quality-test-records-scroll"><table>
+        {records.jobs.length === 0 ? <div className="quality-test-records-empty"><History className="size-9" /><h4>{t(records.loading ? 'qualityTest.loadingRecords' : filterActive ? 'qualityTest.filters.noMatch' : 'qualityTest.emptyRecords')}</h4><p>{t(filterActive && !records.loading ? 'qualityTest.filters.noMatchHint' : 'qualityTest.emptyRecordsHint')}</p></div> : pane === 'gallery' ? <QualityTestGallery jobs={records.jobs} onOpen={openRecord} onHistory={id => { setRecordFilter({ account_id: id }); setRecordPage(1); setSearchParams({ view: 'history' }) }} onChanged={() => setRevision(value => value + 1)} /> : <div className="quality-test-records-scroll"><table>
           <thead><tr><th>{t('qualityTest.recordID')}</th><th>{t('qualityTest.account')}</th><th>{t('qualityTest.model')}</th><th>{t('qualityTest.effort')}</th><th>{t('qualityTest.filters.preset')}</th><th>{t('qualityTest.testTime')}</th><th>{t('qualityTest.recordStatus')}</th><th className="is-numeric">{t('qualityTest.duration')}</th><th className="is-numeric" title={t('qualityTest.firstContentHint')}>{t('qualityTest.firstContent')}</th><th className="is-numeric">{t('qualityTest.outputTokens')}</th><th><span className="sr-only">{t('qualityTest.viewResult')}</span></th></tr></thead>
           <tbody>{records.jobs.map((job) => <tr key={job.id} className={modalID === job.id ? 'is-selected' : ''} onClick={() => openRecord(job.id)}>
             <td className="quality-test-record-id">#{job.id}</td>
@@ -551,9 +558,9 @@ export default function QualityTest() {
             <p className="quality-test-hint">{t('qualityTest.promptHint')}</p>
             {promptBytes > 16000 ? <p role="alert" className="text-sm text-destructive">{t('qualityTest.promptTooLong')}</p> : null}
           </fieldset>
-          <Button size="lg" className="w-full" onClick={() => void startTest()} disabled={submitting || !account || !model || optionsLoading || !prompt.trim() || promptBytes > 16000 || slotsFull || accountBusy}>
+          <Button size="lg" className="w-full" onClick={() => void startTest()} disabled={submitting || !account || !model || optionsLoading || !prompt.trim() || promptBytes > 16000 || accountBusy}>
             {submitting ? <RefreshCw className="size-4 animate-spin" /> : <Play className="size-4" />}
-            {t(submitting ? 'qualityTest.submitting' : accountBusy ? 'qualityTest.accountBusy' : slotsFull ? 'qualityTest.slotsFull' : 'qualityTest.start')}
+            {t(submitting ? 'qualityTest.submitting' : accountBusy ? 'qualityTest.accountBusy' : 'qualityTest.start')}
           </Button>
           <p className="quality-test-hint quality-test-footnote">{t('qualityTest.runHint')}</p>
         </section>

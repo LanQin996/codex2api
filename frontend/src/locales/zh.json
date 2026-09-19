@@ -131,7 +131,8 @@
       "running": "生成中",
       "completed": "已完成",
       "error": "测试失败",
-      "stopped": "已停止"
+      "stopped": "已停止",
+      "queued": "等待执行"
     },
     "readyHint": "等待一次新的灵感与推理",
     "emptyTitle": "还没有生成结果。",
@@ -179,7 +180,31 @@
     "streamUnsupported": "当前浏览器不支持流式响应。",
     "outputTooLarge": "输出超过预览上限，已停止接收。",
     "failed": "上游测试失败。",
-    "streamInterrupted": "流已中断，未收到成功完成事件。"
+    "streamInterrupted": "流已中断，未收到成功完成事件。",
+    "gallery": {
+      "title": "最近检测",
+      "hint": "每个账号展示筛选条件下的最新一次检测，直接对比生成效果。",
+      "allChannels": "全部渠道",
+      "preview": "{{account}} 的检测预览",
+      "loadFailed": "预览加载失败",
+      "cancel": "取消检测",
+      "retest": "重新检测"
+    },
+    "batch": {
+      "title": "批量检测",
+      "hint": "选择同渠道账号，统一配置后在后台排队执行。关闭页面不影响任务，每批最多 1000 个账号。",
+      "progress": "最近批次",
+      "cancelRemaining": "取消本批剩余任务",
+      "rejected": "{{count}} 个账号未接收",
+      "search": "搜索账号名称或邮箱",
+      "selectPage": "全选当前页",
+      "clear": "清空选择",
+      "selected": "已选 {{count}} 个",
+      "noCommon": "所选账号没有共同支持的模型或思考强度，请调整选择。",
+      "summary": "将检测 {{count}} 个账号 · {{channel}} · {{model}} · {{effort}}，使用上方同一提示词。",
+      "submit": "确认并加入后台队列",
+      "shortHint": "选择多个账号，一次配置，后台持续检测。"
+    }
   },
   "nav": {
     "qualityTest": "降智检测",

@@ -131,7 +131,8 @@
       "running": "產生中",
       "completed": "已完成",
       "error": "測試失敗",
-      "stopped": "已停止"
+      "stopped": "已停止",
+      "queued": "等待執行"
     },
     "readyHint": "等待一次新的靈感與推理",
     "emptyTitle": "還沒有產生結果。",
@@ -179,7 +180,31 @@
     "streamUnsupported": "目前瀏覽器不支援串流回應。",
     "outputTooLarge": "輸出超過預覽上限，已停止接收。",
     "failed": "上游測試失敗。",
-    "streamInterrupted": "串流已中斷，未收到成功完成事件。"
+    "streamInterrupted": "串流已中斷，未收到成功完成事件。",
+    "gallery": {
+      "title": "最近檢測",
+      "hint": "每個帳號顯示篩選條件下的最新一次檢測，直接比較生成效果。",
+      "allChannels": "全部渠道",
+      "preview": "{{account}} 的檢測預覽",
+      "loadFailed": "預覽載入失敗",
+      "cancel": "取消檢測",
+      "retest": "重新檢測"
+    },
+    "batch": {
+      "title": "批次檢測",
+      "hint": "選擇同渠道帳號，統一設定後在背景排隊執行。關閉頁面不影響任務，每批最多 1000 個帳號。",
+      "progress": "最近批次",
+      "cancelRemaining": "取消本批剩餘任務",
+      "rejected": "{{count}} 個帳號未接收",
+      "search": "搜尋帳號名稱或信箱",
+      "selectPage": "全選目前頁面",
+      "clear": "清空選擇",
+      "selected": "已選 {{count}} 個",
+      "noCommon": "所選帳號沒有共同支援的模型或思考強度，請調整選擇。",
+      "summary": "將檢測 {{count}} 個帳號 · {{channel}} · {{model}} · {{effort}}，使用上方同一提示詞。",
+      "submit": "確認並加入背景佇列",
+      "shortHint": "選擇多個帳號，一次設定，背景持續檢測。"
+    }
   },
   "nav": {
     "qualityTest": "降智檢測"

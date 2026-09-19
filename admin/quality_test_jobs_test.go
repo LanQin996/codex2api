@@ -79,8 +79,9 @@ func TestQualityTestJobsSurviveRequestCancellationAndLimitThreeAccounts(t *testi
 			t.Fatal("detached job did not reach upstream")
 		}
 	}
-	if response, _ := create(ids[3]); response.Code != http.StatusConflict {
-		t.Fatalf("fourth task accepted: %d", response.Code)
+	response4, queued := create(ids[3])
+	if response4.Code != http.StatusAccepted || queued.Status != "queued" {
+		t.Fatalf("fourth task not queued: %d %+v", response4.Code, queued)
 	}
 	if response, _ := create(ids[0]); response.Code != http.StatusConflict {
 		t.Fatalf("duplicate account accepted: %d", response.Code)
@@ -117,9 +118,7 @@ func TestQualityTestJobsSurviveRequestCancellationAndLimitThreeAccounts(t *testi
 		t.Fatal(response.Body.String())
 	}
 	waitStatus(jobs[0].ID, "stopped")
-	if response, _ := create(ids[3]); response.Code != http.StatusAccepted {
-		t.Fatalf("released slot unavailable: %d %s", response.Code, response.Body.String())
-	}
+	waitStatus(queued.ID, "running")
 	close(release)
 	for _, job := range jobs[1:] {
 		waitStatus(job.ID, "completed")

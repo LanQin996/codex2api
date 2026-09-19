@@ -59,3 +59,13 @@ test('history filter query only carries the active filters and keeps the model-d
   assert.equal(qualityTestFilterQuery(1, { plan: 'pro', model: 'gpt-5.5', effort: 'default', account_id: 7, preset: 'builtin:clock' }), 'page=1&page_size=20&plan=pro&model=gpt-5.5&effort=default&account_id=7&preset=builtin%3Aclock')
   assert.equal(qualityTestFilterQuery(1, { plan: '', model: '', effort: '', account_id: 0 }), 'page=1&page_size=20')
 })
+
+test('queued jobs remain cancellable and latest-account queries carry channel filters', () => {
+  assert.equal(isQualityTestActive({ status: 'queued' }), true)
+  assert.equal(isQualityTestActive({ status: 'stopped' }), false)
+  const params = new URLSearchParams(qualityTestFilterQuery(2, { latest: true, channel: 'codex', model: 'gpt-5.5' }))
+  assert.equal(params.get('latest'), 'true')
+  assert.equal(params.get('channel'), 'codex')
+  assert.equal(params.get('page'), '2')
+  assert.equal(params.get('page_size'), '20')
+})

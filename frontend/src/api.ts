@@ -1,4 +1,4 @@
-import { qualityTestFilterQuery, type QualityTestJob, type QualityTestJobsFilter, type QualityTestJobsResponse, type QualityTestPrompt } from './lib/qualityTest.ts'
+import { qualityTestFilterQuery, type QualityTestBatch, type QualityTestJob, type QualityTestJobsFilter, type QualityTestJobsResponse, type QualityTestPrompt } from './lib/qualityTest.ts'
 import type {
   AccountEventTrendPoint,
   AccountPortalAuthURLResponse,
@@ -1472,6 +1472,13 @@ export const api = {
   dismissPromptIntelligenceCandidate: (id: number) =>
     request<import('./types').PromptIntelligenceCandidate>(`/prompt-filter/intelligence/candidates/${id}/dismiss`, { method: 'POST' }),
   getModels: () => request<ModelsResponse>('/models'),
+  getQualityTestBatchOptions: (account_ids: number[], signal?: AbortSignal) =>
+    request<{ models: string[]; reasoning_efforts: string[] }>('/quality-test-batches/options', { method: 'POST', body: JSON.stringify({ account_ids }), signal }),
+  createQualityTestBatch: (body: { account_ids: number[]; channel: string; request_id: string; model: string; reasoning_effort: string; prompt: string; prompt_id?: number; preset_key?: string; preset_name?: string }) =>
+    request<QualityTestBatch>('/quality-test-batches', { method: 'POST', body: JSON.stringify(body) }),
+  getQualityTestBatch: (id: string, signal?: AbortSignal) => request<QualityTestBatch>(`/quality-test-batches/${encodeURIComponent(id)}`, { signal }),
+  cancelQualityTestBatch: (id: string) => request<QualityTestBatch>(`/quality-test-batches/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
+  retryQualityTest: (id: number) => request<{ job: QualityTestJob }>(`/quality-tests/${id}/retry`, { method: 'POST' }),
   getQualityTestOptions: (id: number, signal?: AbortSignal) =>
     request<{ models: string[]; reasoning_efforts: string[] }>(`/accounts/${id}/quality-test/options`, { signal }),
   getQualityTestPrompts: (signal?: AbortSignal) =>

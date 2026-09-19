@@ -32,7 +32,9 @@ export interface QualityTestJob {
   reasoning_effort: string
   prompt?: string
   output?: string
-  status: 'running' | 'cancelling' | 'completed' | 'error' | 'stopped' | 'interrupted'
+  batch_id?: string
+  started_at?: string
+  status: 'queued' | 'running' | 'cancelling' | 'completed' | 'error' | 'stopped' | 'interrupted'
   preset_kind?: '' | 'builtin' | 'custom'
   preset_ref?: string
   preset_name?: string
@@ -76,12 +78,14 @@ export interface QualityTestJobsResponse {
 
 // Filter values are the raw stored strings; effort "default" selects runs that used the model default.
 // preset: 'none' | 'builtin:<key>' | 'custom:<id>'
-export interface QualityTestJobsFilter { plan?: string; model?: string; effort?: string; account_id?: number; preset?: string }
+export interface QualityTestJobsFilter { latest?: boolean; channel?: string; plan?: string; model?: string; effort?: string; account_id?: number; preset?: string }
 
 export const EMPTY_QUALITY_TEST_FACETS: QualityTestFacets = { plans: [], models: [], efforts: [], accounts: [], presets: [] }
 
 export function qualityTestFilterQuery(page: number, filter: QualityTestJobsFilter = {}): string {
   const params = new URLSearchParams({ page: String(page), page_size: '20' })
+  if (filter.latest) params.set('latest', 'true')
+  if (filter.channel) params.set('channel', filter.channel)
   if (filter.plan) params.set('plan', filter.plan)
   if (filter.model) params.set('model', filter.model)
   if (filter.effort) params.set('effort', filter.effort)
@@ -91,7 +95,7 @@ export function qualityTestFilterQuery(page: number, filter: QualityTestJobsFilt
 }
 
 export function isQualityTestActive(job?: Pick<QualityTestJob, 'status'> | null): boolean {
-  return job?.status === 'running' || job?.status === 'cancelling'
+  return job?.status === 'queued' || job?.status === 'running' || job?.status === 'cancelling'
 }
 
 export function qualityTestPlanTone(plan: string): string {
@@ -142,3 +146,5 @@ export function clampQualityTestFrameHeight(value: unknown): number | undefined 
   if (!Number.isFinite(height) || height <= 0) return undefined
   return Math.round(Math.min(QUALITY_TEST_FRAME_MAX, Math.max(QUALITY_TEST_FRAME_MIN, height)))
 }
+
+export interface QualityTestBatch { id: string; job_ids: number[]; rejected: { account_id: number; error: string }[]; counts?: Record<string, number> }

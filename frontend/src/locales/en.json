@@ -131,7 +131,8 @@
       "running": "Generating",
       "completed": "Completed",
       "error": "Failed",
-      "stopped": "Stopped"
+      "stopped": "Stopped",
+      "queued": "Queued"
     },
     "readyHint": "Ready for a new creative challenge",
     "emptyTitle": "No result yet.",
@@ -179,7 +180,31 @@
     "streamUnsupported": "This browser does not support streaming responses.",
     "outputTooLarge": "The output exceeded the preview limit. Reception stopped.",
     "failed": "The upstream test failed.",
-    "streamInterrupted": "The stream ended without a successful completion event."
+    "streamInterrupted": "The stream ended without a successful completion event.",
+    "gallery": {
+      "title": "Recent tests",
+      "hint": "Compare the latest matching test for each account.",
+      "allChannels": "All channels",
+      "preview": "Test preview for {{account}}",
+      "loadFailed": "Preview failed to load",
+      "cancel": "Cancel test",
+      "retest": "Test again"
+    },
+    "batch": {
+      "title": "Batch test",
+      "hint": "Select accounts from one channel. Tests run in the background even after you leave. Maximum 1,000 accounts per batch.",
+      "progress": "Latest batch",
+      "cancelRemaining": "Cancel remaining tasks",
+      "rejected": "{{count}} accounts not accepted",
+      "search": "Search account name or email",
+      "selectPage": "Select this page",
+      "clear": "Clear selection",
+      "selected": "{{count}} selected",
+      "noCommon": "No common model or reasoning effort. Adjust the selected accounts.",
+      "summary": "Test {{count}} accounts · {{channel}} · {{model}} · {{effort}}, using the same prompt shown above.",
+      "submit": "Confirm and queue tests",
+      "shortHint": "Select multiple accounts, configure once, and test in the background."
+    }
   },
   "nav": {
     "qualityTest": "Quality check",

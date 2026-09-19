@@ -18,11 +18,46 @@ import (
 )
 
 // Called before accepting HTTP requests. Shutdown cancels work before closing stores.
-func (h *Handler) StartQualityTests(ctx context.Context) { h.qualityTestContext = ctx }
-func (h *Handler) WaitQualityTests()                     { h.qualityTestWG.Wait() }
+func (h *Handler) StartQualityTests(ctx context.Context) {
+	h.qualityTestContext = ctx
+	h.qualityTestWG.Add(1)
+	go func() {
+		defer h.qualityTestWG.Done()
+		ticker := time.NewTicker(300 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if h.db == nil {
+					continue
+				}
+				for i := 0; i < database.QualityTestConcurrency; i++ {
+					job, err := h.db.ClaimQualityTest(ctx)
+					if err != nil {
+						if ctx.Err() == nil {
+							log.Printf("[quality-test] claim: %v", err)
+						}
+						break
+					}
+					if job == nil {
+						break
+					}
+					h.qualityTestWG.Add(1)
+					go func(job database.QualityTestJob) {
+						defer h.qualityTestWG.Done()
+						h.runQualityTestJob(ctx, job, qualityTestRequest{Model: job.Model, ReasoningEffort: job.ReasoningEffort, Prompt: job.Prompt})
+					}(*job)
+				}
+			}
+		}
+	}()
+}
+func (h *Handler) WaitQualityTests() { h.qualityTestWG.Wait() }
 
 func (h *Handler) CreateQualityTestJob(c *gin.Context) {
-	if h.db == nil || (h.qualityTestContext != nil && h.qualityTestContext.Err() != nil) {
+	if h.db == nil || h.qualityTestContext == nil || h.qualityTestContext.Err() != nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "检测任务服务不可用"})
 		return
 	}
@@ -80,28 +115,18 @@ func (h *Handler) CreateQualityTestJob(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	presetKind, presetRef, presetName := h.resolveQualityTestPreset(ctx, req)
-	job, err := h.db.CreateQualityTestJob(ctx, database.QualityTestJob{AccountID: id, AccountName: name, PlanType: plan, Channel: channel, Model: req.Model, ReasoningEffort: req.ReasoningEffort, Prompt: req.Prompt, PresetKind: presetKind, PresetRef: presetRef, PresetName: presetName})
+	batch, err := h.db.EnqueueQualityTestBatch(ctx, newQualityBatchID(), "single", []database.QualityTestJob{{AccountID: id, AccountName: name, PlanType: plan, Channel: channel, Model: req.Model, ReasoningEffort: req.ReasoningEffort, Prompt: req.Prompt, PresetKind: presetKind, PresetRef: presetRef, PresetName: presetName}}, nil)
 	if err != nil {
-		if errors.Is(err, database.ErrQualityTestCapacity) || errors.Is(err, database.ErrQualityTestAccountBusy) {
-			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
-			return
-		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存检测任务失败"})
 		return
 	}
-	if presetKind == "custom" {
-		if err := h.db.IncrementQualityTestPromptUsage(ctx, req.PromptID); err != nil {
-			log.Printf("[quality-test] job=%d preset=%d usage bookkeeping failed: %v", job.ID, req.PromptID, err)
-		}
+	if len(batch.JobIDs) == 0 {
+		c.JSON(http.StatusConflict, gin.H{"error": database.ErrQualityTestAccountBusy.Error()})
+		return
 	}
-	h.qualityTestWG.Add(1)
-	if !h.startDBBackgroundTaskWithParent(h.qualityTestContext, func(parent context.Context) { defer h.qualityTestWG.Done(); h.runQualityTestJob(parent, *job, req) }) {
-		h.qualityTestWG.Done()
-		job.Status, job.Error = "interrupted", "服务正在关闭，请重新发起检测"
-		if err := h.db.FinishQualityTest(ctx, *job); err != nil {
-			log.Printf("[quality-test] job=%d admission finalization failed: %v", job.ID, err)
-		}
-		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "检测任务服务正在关闭"})
+	job, err := h.db.GetQualityTestJob(ctx, batch.JobIDs[0])
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "读取检测任务失败"})
 		return
 	}
 	c.JSON(http.StatusAccepted, gin.H{"job": job})
@@ -113,7 +138,7 @@ func (h *Handler) ListQualityTests(c *gin.Context) {
 	if size < 1 || size > 50 {
 		size = 20
 	}
-	filter := database.QualityTestFilter{PlanType: strings.TrimSpace(c.Query("plan")), Model: strings.TrimSpace(c.Query("model"))}
+	filter := database.QualityTestFilter{Latest: c.Query("latest") == "true", Channel: strings.TrimSpace(c.Query("channel")), PlanType: strings.TrimSpace(c.Query("plan")), Model: strings.TrimSpace(c.Query("model"))}
 	if effort, ok := c.GetQuery("effort"); ok {
 		// "default" selects runs that used the model default (stored as "").
 		filter.HasEffort = true
@@ -204,6 +229,10 @@ func (w *qualityJobWriter) Write(body []byte) (int, error) {
 }
 
 func (h *Handler) runQualityTestJob(parent context.Context, job database.QualityTestJob, req qualityTestRequest) {
+	startedAt := job.CreatedAt
+	if job.StartedAt != nil {
+		startedAt = *job.StartedAt
+	}
 	ctx, cancel := context.WithDeadline(parent, job.DeadlineAt)
 	defer cancel()
 	var mu sync.Mutex
@@ -221,7 +250,7 @@ func (h *Handler) runQualityTestJob(parent context.Context, job database.Quality
 			}
 			job.Output += event.Text
 			if job.FirstContentMS == nil && event.Text != "" {
-				value := time.Since(job.CreatedAt).Milliseconds()
+				value := time.Since(startedAt).Milliseconds()
 				job.FirstContentMS = &value
 			}
 		case "error":
@@ -300,7 +329,7 @@ func (h *Handler) runQualityTestJob(parent context.Context, job database.Quality
 		}
 		close(done)
 		<-watched
-		job.DurationMS = time.Since(job.CreatedAt).Milliseconds()
+		job.DurationMS = time.Since(startedAt).Milliseconds()
 		switch {
 		case parent.Err() != nil:
 			job.Status = "interrupted"
@@ -324,6 +353,24 @@ func (h *Handler) runQualityTestJob(parent context.Context, job database.Quality
 			log.Printf("[quality-test] job=%d finalization failed: %v", job.ID, err)
 		}
 	}()
+	status, err := h.db.QualityTestStatus(ctx, job.ID)
+	if err != nil {
+		job.Error = "读取检测任务状态失败"
+		return
+	}
+	if status != "running" {
+		cancel()
+		return
+	}
+	account := h.store.FindByID(job.AccountID)
+	if account == nil {
+		job.Error = "账号不在运行时池中"
+		return
+	}
+	if err := h.validateQualityTestForAccount(ctx, account, req); err != nil {
+		job.Error = err.Error()
+		return
+	}
 	writer := &qualityJobWriter{header: make(http.Header), emit: emit}
 	router := gin.New()
 	router.POST("/accounts/:id/test", func(c *gin.Context) { h.testConnection(c, &req) })
