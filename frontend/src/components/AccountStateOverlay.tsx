@@ -234,6 +234,9 @@ export function renderAccountStateOverlay(
   } = {},
 ) {
   const kind = resolveAccountOverlayKind(account);
+  if (!kind && isResponsesRateLimitedAccount(account) && options.onRecover) {
+    return <AccountRateLimitRecovery onRecover={options.onRecover} label={t("accounts.rateLimitRecover")} hint={t("accounts.rateLimitRecoverHint")} />;
+  }
   if (!kind) return null;
   return (
     <AccountStateOverlay
@@ -270,4 +273,16 @@ export function renderDisabledAccountOverlay(
       label={t("accounts.disabledOverlay")}
     />
   );
+}
+
+function AccountRateLimitRecovery({ onRecover, label, hint }: { onRecover: () => void | Promise<void>; label: string; hint: string }) {
+ const [busy, setBusy] = useState(false);
+ return <button type="button" disabled={busy} title={hint} className="pointer-events-auto inline-flex items-center gap-1 rounded-md border border-orange-300 px-2 py-1 text-xs text-orange-700 disabled:opacity-50" onClick={async event => {
+  event.preventDefault(); event.stopPropagation();
+  if (busy || !window.confirm(hint)) return;
+  setBusy(true);
+  try { await onRecover(); } finally { setBusy(false); }
+ }}>
+  {busy ? <Loader2 className="size-3 animate-spin" /> : <RotateCcw className="size-3" />}{label}
+ </button>;
 }

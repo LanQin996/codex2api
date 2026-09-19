@@ -46,3 +46,8 @@ export function disabledAccountTableRowClass(account: AccountRow): string {
     ? accountStateTableRowClassForKind("disabled")
     : "";
 }
+
+export function isResponsesRateLimitedAccount(account: AccountRow): boolean {
+ const reasons = new Set(["responses_rate_limited", "rate_limited", "rate_limited_5h", "rate_limited_7d"]);
+ return reasons.has(account.status) || reasons.has(account.cooldown_reason ?? "");
+}

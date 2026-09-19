@@ -314,3 +314,30 @@ func TestCodexTurnStateRejects356ForConfigured292And332(t *testing.T) {
 		})
 	}
 }
+
+func TestCodexTurnStatePerAccountSlots(t *testing.T) {
+	h, _ := ticketHarvesterFixture(t)
+	cfg := *CurrentCodexTurnStateTicketConfig()
+	cfg.Concurrency = 2
+	SetCodexTurnStateTicketConfig(&cfg)
+	ctx := context.Background()
+	for _, id := range []int64{10, 10, 20, 20} {
+		if err := h.acquireProbeSlot(ctx, id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if h.active.Load() != 4 {
+		t.Fatal("accounts still share a global limit")
+	}
+	timeout, cancel := context.WithTimeout(ctx, 20*time.Millisecond)
+	defer cancel()
+	if err := h.acquireProbeSlot(timeout, 10); err == nil {
+		t.Fatal("same account exceeded limit")
+	}
+	for _, id := range []int64{10, 10, 20, 20} {
+		h.releaseProbeSlot(id)
+	}
+	if h.active.Load() != 0 || len(h.accountActive) != 0 {
+		t.Fatal("slots leaked")
+	}
+}
