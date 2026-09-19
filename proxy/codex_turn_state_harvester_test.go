@@ -282,3 +282,35 @@ func TestCodexTurnStateRefreshDeadlineBeforeScan(t *testing.T) {
 		t.Fatalf("past deadline caused spin: %s", got)
 	}
 }
+
+func TestCodexTurnStateRejects356ForConfigured292And332(t *testing.T) {
+	for _, length := range []int{292, 332} {
+		t.Run(fmt.Sprint(length), func(t *testing.T) {
+			h, account := ticketHarvesterFixture(t)
+			cfg := *CurrentCodexTurnStateTicketConfig()
+			cfg.TargetLength = length
+			SetCodexTurnStateTicketConfig(&cfg)
+			bad := "gAAAAA" + strings.Repeat("x", 350)
+			if auth.ValidCodexTurnStateTicketValue(bad, length) {
+				t.Fatal("356 accepted")
+			}
+			h.recordTicket(account, "gpt-test", bad, "probe", true)
+			if len(account.CodexTurnStateTickets) != 0 {
+				t.Fatal("356 persisted")
+			}
+			account.CodexTurnStateTickets["gpt-test"] = auth.CodexTurnStateTicket{State: bad, Length: 356, ExpiresAt: time.Now().Add(time.Hour)}
+			if account.CodexTurnStateTicketInjection("gpt-test", length, time.Now()) != "" {
+				t.Fatal("stored 356 injected")
+			}
+			h.refresh(context.Background())
+			if _, ok := account.CodexTurnStateTickets["gpt-test"]; ok {
+				t.Fatal("stored 356 not pruned")
+			}
+			select {
+			case <-h.tasks:
+			default:
+				t.Fatal("replacement not scheduled")
+			}
+		})
+	}
+}
