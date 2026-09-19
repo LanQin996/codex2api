@@ -5471,13 +5471,35 @@ export default function Settings() {
                       </p>
                     </div>
                     <div className={SETTINGS_FIELD_GRID}>
-                      <div className="col-span-full rounded-xl border p-3 space-y-3">
- <p className="font-semibold">{t('settings.responsesCooldownTitle')}</p>
- <p className="text-xs text-muted-foreground">{t('settings.responsesCooldownHint')}</p>
- <SegmentedPillGroup value={settingsForm.responses_cooldown_mode} onChange={(value) => autoSaveStringField('responses_cooldown_mode', value)} options={modelCooldownModeOptions} />
- <DraftNumberInput min={1} max={1800} disabled={settingsForm.responses_cooldown_mode === 'off'} value={settingsForm.responses_cooldown_seconds} onValueChange={(value) => setSettingsForm(f => ({...f, responses_cooldown_seconds: value}))} onValueCommit={(value) => void autoSaveSettingsPatch({responses_cooldown_seconds: value})} />
- </div>
- <SettingField label={t('settings.modelCooldownMode')} description={t('settings.modelCooldownModeDesc')}>
+                      <div className="col-span-full space-y-3 rounded-xl border p-3">
+                        <p className="text-sm font-semibold">{t('settings.responsesCooldownTitle')}</p>
+                        <p className="text-xs leading-relaxed text-muted-foreground">{t('settings.responsesCooldownHint')}</p>
+                        <div className={SETTINGS_FIELD_GRID}>
+                          <SettingField label={t('settings.modelCooldownMode')} description={t('settings.responsesCooldownHint')}>
+                            <SegmentedPillGroup
+                              value={settingsForm.responses_cooldown_mode}
+                              onChange={(value) => autoSaveStringField('responses_cooldown_mode', value)}
+                              options={modelCooldownModeOptions}
+                            />
+                          </SettingField>
+                          <SettingField
+                            label={t('settings.modelCooldownSeconds')}
+                            description={t('settings.responsesCooldownHint')}
+                            suffix={t('settings.unit.sec')}
+                            className={cn(settingsForm.responses_cooldown_mode === 'off' && 'opacity-60')}
+                          >
+                            <DraftNumberInput
+                              min={1}
+                              max={1800}
+                              disabled={settingsForm.responses_cooldown_mode === 'off'}
+                              value={settingsForm.responses_cooldown_seconds}
+                              onValueChange={(value) => setSettingsForm(f => ({ ...f, responses_cooldown_seconds: value }))}
+                              onValueCommit={(value) => void autoSaveSettingsPatch({ responses_cooldown_seconds: value })}
+                            />
+                          </SettingField>
+                        </div>
+                      </div>
+                      <SettingField label={t('settings.modelCooldownMode')} description={t('settings.modelCooldownModeDesc')}>
                         <SegmentedPillGroup
                           value={settingsForm.relay_model_cooldown_mode}
                           onChange={(value) => autoSaveStringField('relay_model_cooldown_mode', value)}
