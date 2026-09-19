@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/codex2api/cache"
+	"github.com/codex2api/database"
 )
 
 const (
@@ -55,6 +56,7 @@ func (s *Store) MarkTransientRateLimited(acc *Account, retryAfter time.Duration)
 	if s == nil || acc == nil {
 		return nextTransientRateLimitCooldown(0, retryAfter)
 	}
+	policy := s.GetModelCooldownSettings()
 	now := time.Now()
 	acc.mu.Lock()
 	until := acc.CooldownUtil
@@ -78,11 +80,15 @@ func (s *Store) MarkTransientRateLimited(acc *Account, retryAfter time.Duration)
 			acc.mu.Unlock()
 			return nextTransientRateLimitCooldown(0, retryAfter)
 		}
-		cooldown := nextTransientRateLimitCooldown(acc.transientRateLimitBackoff, retryAfter)
+		cooldown := configuredResponsesCooldown(policy, acc.transientRateLimitBackoff, retryAfter)
+		if cooldown <= 0 {
+			acc.mu.Unlock()
+			return 0
+		}
 		until = now.Add(cooldown)
 		// An upstream hint at the cap must not prevent this new window from
 		// advancing the local ladder; hints and backoff are separate inputs.
-		if nextTransientRateLimitCooldown(acc.transientRateLimitBackoff, 0) < TransientRateLimitBackoffMax {
+		if policy.ResponsesMode == database.ModelCooldownModeAdaptive && configuredResponsesCooldown(policy, acc.transientRateLimitBackoff, 0) < TransientRateLimitBackoffMax {
 			acc.transientRateLimitBackoff++
 		}
 		acc.LastFailureAt = now
@@ -207,4 +213,20 @@ func (a *Account) TransientRateLimitBackoff() int {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 	return a.transientRateLimitBackoff
+}
+
+func configuredResponsesCooldown(policy database.ModelCooldownSettings, level int, retryAfter time.Duration) time.Duration {
+	policy = database.NormalizeModelCooldownSettings(policy)
+	duration := time.Duration(policy.ResponsesSeconds) * time.Second
+	switch policy.ResponsesMode {
+	case database.ModelCooldownModeOff:
+		duration = 0
+	case database.ModelCooldownModeAdaptive:
+		for i := 0; i < level && duration < TransientRateLimitBackoffMax; i++ {
+			duration *= 2
+		}
+		duration = min(duration, TransientRateLimitBackoffMax)
+	}
+	// Explicit upstream waits are independent of locally configured backoff.
+	return max(duration, retryAfter)
 }

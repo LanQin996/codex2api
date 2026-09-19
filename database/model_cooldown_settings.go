@@ -22,6 +22,8 @@ const (
 // cooldowns because an isolated upstream 429 is normal load-shedding, not an
 // account health failure.
 type ModelCooldownSettings struct {
+	ResponsesMode       string
+	ResponsesSeconds    int
 	RelayMode           string
 	RelaySeconds        int
 	RelayBackoffEnabled bool
@@ -31,6 +33,8 @@ type ModelCooldownSettings struct {
 }
 
 type ModelCooldownSettingsUpdate struct {
+	ResponsesMode       *string
+	ResponsesSeconds    *int
 	RelayMode           *string
 	RelaySeconds        *int
 	RelayBackoffEnabled *bool
@@ -41,6 +45,7 @@ type ModelCooldownSettingsUpdate struct {
 
 func DefaultModelCooldownSettings() ModelCooldownSettings {
 	return ModelCooldownSettings{
+		ResponsesMode: ModelCooldownModeAdaptive, ResponsesSeconds: 15,
 		RelayMode:           ModelCooldownModeOff,
 		RelaySeconds:        DefaultRelayModelCooldownSeconds,
 		RelayBackoffEnabled: false,
@@ -95,6 +100,11 @@ func NormalizeModelCooldownSeconds(value, fallback int) int {
 
 func NormalizeModelCooldownSettings(value ModelCooldownSettings) ModelCooldownSettings {
 	defaults := DefaultModelCooldownSettings()
+	value.ResponsesMode = NormalizeModelCooldownMode(value.ResponsesMode, defaults.ResponsesMode)
+	if value.ResponsesSeconds <= 0 {
+		value.ResponsesSeconds = 15
+	}
+	value.ResponsesSeconds = NormalizeModelCooldownSeconds(value.ResponsesSeconds, 15)
 	value.RelayMode = NormalizeModelCooldownMode(value.RelayMode, defaults.RelayMode)
 	if value.RelaySeconds <= 0 {
 		value.RelaySeconds = defaults.RelaySeconds
@@ -118,7 +128,7 @@ func (db *DB) GetModelCooldownSettings(ctx context.Context) (ModelCooldownSettin
 			COALESCE(relay_model_cooldown_backoff_enabled, $3),
 			COALESCE(NULLIF(TRIM(oauth_model_cooldown_mode), ''), $4),
 			COALESCE(oauth_model_cooldown_seconds, $5),
-			COALESCE(oauth_model_cooldown_backoff_enabled, $6)
+			COALESCE(oauth_model_cooldown_backoff_enabled, $6), responses_cooldown_mode, responses_cooldown_seconds
 		FROM system_settings
 		WHERE id = 1
 	`, defaults.RelayMode, defaults.RelaySeconds, defaults.RelayBackoffEnabled,
@@ -129,7 +139,7 @@ func (db *DB) GetModelCooldownSettings(ctx context.Context) (ModelCooldownSettin
 		&value.RelayBackoffEnabled,
 		&value.OAuthMode,
 		&value.OAuthSeconds,
-		&value.OAuthBackoffEnabled,
+		&value.OAuthBackoffEnabled, &value.ResponsesMode, &value.ResponsesSeconds,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -163,6 +173,12 @@ func (db *DB) UpdateModelCooldownSettings(ctx context.Context, update ModelCoold
 	if update.OAuthBackoffEnabled != nil {
 		current.OAuthBackoffEnabled = *update.OAuthBackoffEnabled
 	}
+	if update.ResponsesMode != nil {
+		current.ResponsesMode = *update.ResponsesMode
+	}
+	if update.ResponsesSeconds != nil {
+		current.ResponsesSeconds = *update.ResponsesSeconds
+	}
 	current = NormalizeModelCooldownSettings(current)
 
 	if _, err := db.conn.ExecContext(ctx, `INSERT INTO system_settings (id) VALUES (1) ON CONFLICT(id) DO NOTHING`); err != nil {
@@ -175,10 +191,10 @@ func (db *DB) UpdateModelCooldownSettings(ctx context.Context, update ModelCoold
 			relay_model_cooldown_backoff_enabled = $3,
 			oauth_model_cooldown_mode = $4,
 			oauth_model_cooldown_seconds = $5,
-			oauth_model_cooldown_backoff_enabled = $6
+			oauth_model_cooldown_backoff_enabled = $6, responses_cooldown_mode = $7, responses_cooldown_seconds = $8
 		WHERE id = 1
 	`, current.RelayMode, current.RelaySeconds, current.RelayBackoffEnabled,
-		current.OAuthMode, current.OAuthSeconds, current.OAuthBackoffEnabled,
+		current.OAuthMode, current.OAuthSeconds, current.OAuthBackoffEnabled, current.ResponsesMode, current.ResponsesSeconds,
 	)
 	if err != nil {
 		return ModelCooldownSettings{}, fmt.Errorf("保存模型冷却设置失败: %w", err)

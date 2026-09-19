@@ -709,6 +709,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"system_settings", "relay_model_cooldown_mode", "TEXT NOT NULL DEFAULT 'off'"},
 		{"system_settings", "relay_model_cooldown_seconds", "INTEGER NOT NULL DEFAULT 2"},
 		{"system_settings", "relay_model_cooldown_backoff_enabled", "INTEGER NOT NULL DEFAULT 0"},
+		{"system_settings", "responses_cooldown_mode", "TEXT NOT NULL DEFAULT 'adaptive'"},
+		{"system_settings", "responses_cooldown_seconds", "INTEGER NOT NULL DEFAULT 15"},
 		{"system_settings", "oauth_model_cooldown_mode", "TEXT NOT NULL DEFAULT 'adaptive'"},
 		{"system_settings", "oauth_model_cooldown_seconds", "INTEGER NOT NULL DEFAULT 300"},
 		{"system_settings", "oauth_model_cooldown_backoff_enabled", "INTEGER NOT NULL DEFAULT 1"},

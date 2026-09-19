@@ -9160,6 +9160,8 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 // ==================== Settings ====================
 
 type settingsResponse struct {
+	ResponsesCooldownMode               string   `json:"responses_cooldown_mode"`
+	ResponsesCooldownSeconds            int      `json:"responses_cooldown_seconds"`
 	CodexTurnStateAutoEnabled           bool     `json:"codex_turn_state_auto_enabled"`
 	CodexTurnStateHarvestProxyURL       string   `json:"codex_turn_state_harvest_proxy_url"`
 	CodexTurnStateManagedModels         []string `json:"codex_turn_state_managed_models"`
@@ -9375,6 +9377,8 @@ func maskCodexTurnStateProxyURL(raw string) string {
 }
 
 type updateSettingsReq struct {
+	ResponsesCooldownMode               *string                          `json:"responses_cooldown_mode"`
+	ResponsesCooldownSeconds            *int                             `json:"responses_cooldown_seconds"`
 	CodexTurnStateAutoEnabled           *bool                            `json:"codex_turn_state_auto_enabled"`
 	CodexTurnStateHarvestProxyURL       *string                          `json:"codex_turn_state_harvest_proxy_url"`
 	CodexTurnStateManagedModels         *[]string                        `json:"codex_turn_state_managed_models"`
@@ -10243,6 +10247,8 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		RelayModelCooldownMode:              modelCooldownSettings.RelayMode,
 		RelayModelCooldownSeconds:           modelCooldownSettings.RelaySeconds,
 		RelayModelCooldownBackoffEnabled:    modelCooldownSettings.RelayBackoffEnabled,
+		ResponsesCooldownMode:               modelCooldownSettings.ResponsesMode,
+		ResponsesCooldownSeconds:            modelCooldownSettings.ResponsesSeconds,
 		OAuthModelCooldownMode:              modelCooldownSettings.OAuthMode,
 		OAuthModelCooldownSeconds:           modelCooldownSettings.OAuthSeconds,
 		OAuthModelCooldownBackoffEnabled:    modelCooldownSettings.OAuthBackoffEnabled,
@@ -10533,7 +10539,11 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		req.RelayModelCooldownBackoffEnabled != nil ||
 		req.OAuthModelCooldownMode != nil ||
 		req.OAuthModelCooldownSeconds != nil ||
-		req.OAuthModelCooldownBackoffEnabled != nil
+		req.OAuthModelCooldownBackoffEnabled != nil || req.ResponsesCooldownMode != nil || req.ResponsesCooldownSeconds != nil
+	if req.ResponsesCooldownMode != nil && !database.IsValidModelCooldownMode(*req.ResponsesCooldownMode) {
+		writeError(c, http.StatusBadRequest, "responses_cooldown_mode 必须是 off、fixed 或 adaptive")
+		return
+	}
 	if req.RelayModelCooldownMode != nil && !database.IsValidModelCooldownMode(*req.RelayModelCooldownMode) {
 		writeError(c, http.StatusBadRequest, "relay_model_cooldown_mode 必须是 off、fixed 或 adaptive")
 		return
@@ -10543,6 +10553,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		return
 	}
 	for field, value := range map[string]*int{
+		"responses_cooldown_seconds":   req.ResponsesCooldownSeconds,
 		"relay_model_cooldown_seconds": req.RelayModelCooldownSeconds,
 		"oauth_model_cooldown_seconds": req.OAuthModelCooldownSeconds,
 	} {
@@ -12136,6 +12147,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			RelayMode:           req.RelayModelCooldownMode,
 			RelaySeconds:        req.RelayModelCooldownSeconds,
 			RelayBackoffEnabled: req.RelayModelCooldownBackoffEnabled,
+			ResponsesMode:       req.ResponsesCooldownMode, ResponsesSeconds: req.ResponsesCooldownSeconds,
 			OAuthMode:           req.OAuthModelCooldownMode,
 			OAuthSeconds:        req.OAuthModelCooldownSeconds,
 			OAuthBackoffEnabled: req.OAuthModelCooldownBackoffEnabled,
@@ -12219,6 +12231,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		RelayModelCooldownMode:              modelCooldownSettings.RelayMode,
 		RelayModelCooldownSeconds:           modelCooldownSettings.RelaySeconds,
 		RelayModelCooldownBackoffEnabled:    modelCooldownSettings.RelayBackoffEnabled,
+		ResponsesCooldownMode:               modelCooldownSettings.ResponsesMode,
+		ResponsesCooldownSeconds:            modelCooldownSettings.ResponsesSeconds,
 		OAuthModelCooldownMode:              modelCooldownSettings.OAuthMode,
 		OAuthModelCooldownSeconds:           modelCooldownSettings.OAuthSeconds,
 		OAuthModelCooldownBackoffEnabled:    modelCooldownSettings.OAuthBackoffEnabled,

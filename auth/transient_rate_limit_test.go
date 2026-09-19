@@ -368,3 +368,21 @@ func TestTransientRateLimitRemainingIgnoresQuotaCooldown(t *testing.T) {
 		t.Fatal("MarkResponsesRateLimited cooldown must not be reported as transient")
 	}
 }
+
+func TestConfiguredResponsesCooldown(t *testing.T) {
+	for _, tc := range []struct {
+		mode  string
+		level int
+		hint  time.Duration
+		want  time.Duration
+	}{
+		{"fixed", 6, 0, 10 * time.Second}, {"off", 6, 0, 0}, {"off", 0, 30 * time.Second, 30 * time.Second}, {"fixed", 6, 30 * time.Second, 30 * time.Second}, {"adaptive", 2, 0, 40 * time.Second},
+	} {
+		p := database.DefaultModelCooldownSettings()
+		p.ResponsesMode = tc.mode
+		p.ResponsesSeconds = 10
+		if got := configuredResponsesCooldown(p, tc.level, tc.hint); got != tc.want {
+			t.Fatalf("%s got %s want %s", tc.mode, got, tc.want)
+		}
+	}
+}

@@ -2036,6 +2036,8 @@ export interface CodexEgressSummary {
 }
 
 export interface SystemSettings {
+ responses_cooldown_mode: string
+ responses_cooldown_seconds: number
   site_name: string
   site_logo: string
   background_image: string

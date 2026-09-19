@@ -2278,6 +2278,8 @@ export default function Settings() {
     relay_model_cooldown_mode: 'off',
     relay_model_cooldown_seconds: 2,
     relay_model_cooldown_backoff_enabled: false,
+    responses_cooldown_mode: 'adaptive',
+    responses_cooldown_seconds: 15,
     oauth_model_cooldown_mode: 'adaptive',
     oauth_model_cooldown_seconds: 300,
     oauth_model_cooldown_backoff_enabled: true,
@@ -5469,7 +5471,13 @@ export default function Settings() {
                       </p>
                     </div>
                     <div className={SETTINGS_FIELD_GRID}>
-                      <SettingField label={t('settings.modelCooldownMode')} description={t('settings.modelCooldownModeDesc')}>
+                      <div className="col-span-full rounded-xl border p-3 space-y-3">
+ <p className="font-semibold">{t('settings.responsesCooldownTitle')}</p>
+ <p className="text-xs text-muted-foreground">{t('settings.responsesCooldownHint')}</p>
+ <SegmentedPillGroup value={settingsForm.responses_cooldown_mode} onChange={(value) => autoSaveStringField('responses_cooldown_mode', value)} options={modelCooldownModeOptions} />
+ <DraftNumberInput min={1} max={1800} disabled={settingsForm.responses_cooldown_mode === 'off'} value={settingsForm.responses_cooldown_seconds} onValueChange={(value) => setSettingsForm(f => ({...f, responses_cooldown_seconds: value}))} onValueCommit={(value) => void autoSaveSettingsPatch({responses_cooldown_seconds: value})} />
+ </div>
+ <SettingField label={t('settings.modelCooldownMode')} description={t('settings.modelCooldownModeDesc')}>
                         <SegmentedPillGroup
                           value={settingsForm.relay_model_cooldown_mode}
                           onChange={(value) => autoSaveStringField('relay_model_cooldown_mode', value)}
