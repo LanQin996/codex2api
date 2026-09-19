@@ -156,34 +156,13 @@ func TestCodexTurnStateProbeSkipsUnavailableAccounts(t *testing.T) {
 	}
 }
 
-func TestCodexTurnStateDiagnosticsProtectCredentials(t *testing.T) {
-	h, account := ticketHarvesterFixture(t)
-	key := codexTurnStateProbeKey{accountID: account.ID(), model: "gpt-test"}
-	h.states[key] = &codexTurnStateProbeStatus{Failures: 1, NextAttempt: time.Now().Add(time.Minute), LastError: "probe returned status=403 length=0"}
-	got := CodexTurnStateProbeDiagnostics(account.ID())[key.model]
-	if got.LastError == "" || got.NextAttempt.IsZero() {
-		t.Fatal("missing diagnostics")
+func TestCodexTurnStateProbeErrorPreservesOriginal(t *testing.T) {
+	original := "CONNECT rejected: 502 Bad Gateway; proxy http://test-user:test-password@proxy.example:3010"
+	err := &codexTurnStateStageError{stage: "proxy/upstream_request", err: fmt.Errorf("%s", original)}
+	if got := codexTurnStateProbeError(err); got != "proxy/upstream_request: "+original {
+		t.Fatalf("error detail changed: %s", got)
 	}
-	secret := "socks5://user:secret@example.com:1234"
-	if strings.Contains(codexTurnStateProbeError(fmt.Errorf("connect %s failed", secret)), "secret") {
-		t.Fatal("proxy credential leaked")
-	}
-}
-
-func TestCodexTurnStateProbeErrorCategories(t *testing.T) {
-	for _, tc := range []struct{ message, want string }{
-		{"proxyconnect tcp: 407 Proxy Authentication Required", "proxy authentication failed"},
-		{"dial tcp: connection refused", "connection refused"},
-		{"tls: certificate verify failed", "TLS handshake/certificate failed"},
-		{"unexpected EOF", "EOF"},
-	} {
-		got := codexTurnStateProbeError(&codexTurnStateStageError{stage: "proxy/upstream_request", err: fmt.Errorf("%s", tc.message)})
-		if !strings.Contains(got, tc.want) || !strings.HasPrefix(got, "proxy/upstream_request:") {
-			t.Fatalf("unexpected diagnosis: %s", got)
-		}
-	}
-	got := codexTurnStateProbeError(&codexTurnStateStageError{stage: "token_refresh", err: fmt.Errorf("invalid_grant secret-token")})
-	if !strings.Contains(got, "token_refresh:") || strings.Contains(got, "secret-token") {
-		t.Fatalf("unsafe or missing stage: %s", got)
+	if got := codexTurnStateProbeError(nil); got != "" {
+		t.Fatal("nil error must be empty")
 	}
 }

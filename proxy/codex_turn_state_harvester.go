@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
-	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -918,7 +917,7 @@ func CodexTurnStateProbeDiagnostics(accountID int64) map[string]struct {
 	return result
 }
 
-// Do not expose transport URLs, proxy credentials or token-refresh response bodies.
+// Attach the failing operation to the original diagnostic.
 type codexTurnStateStageError struct {
 	stage string
 	err   error
@@ -927,42 +926,11 @@ type codexTurnStateStageError struct {
 func (e *codexTurnStateStageError) Error() string { return e.stage + ": " + e.err.Error() }
 func (e *codexTurnStateStageError) Unwrap() error { return e.err }
 
+// Return the original diagnostic for this private deployment. It may contain
+// credentials; operators must not share these messages without reviewing them.
 func codexTurnStateProbeError(err error) string {
-	stage := "probe"
-	var staged *codexTurnStateStageError
-	if errors.As(err, &staged) {
-		stage = staged.stage
+	if err == nil {
+		return ""
 	}
-	reason := "unclassified failure (raw message withheld)"
-	message := strings.ToLower(err.Error())
-	var dns *net.DNSError
-	var op *net.OpError
-	var netErr net.Error
-	switch {
-	case errors.Is(err, context.Canceled):
-		reason = "canceled"
-	case errors.Is(err, context.DeadlineExceeded):
-		reason = "timeout"
-	case errors.As(err, &dns):
-		reason = "DNS lookup failed"
-	case errors.As(err, &netErr) && netErr.Timeout():
-		reason = "network timeout"
-	case strings.Contains(message, "407") || strings.Contains(message, "authentication failed") || strings.Contains(message, "username/password authentication"):
-		reason = "proxy authentication failed; check protocol, username and password"
-	case strings.Contains(message, "connection refused"):
-		reason = "connection refused; check proxy host and port"
-	case strings.Contains(message, "socks"):
-		reason = "SOCKS handshake/connect failed; check proxy protocol and credentials"
-	case strings.Contains(message, "tls") || strings.Contains(message, "certificate"):
-		reason = "TLS handshake/certificate failed"
-	case strings.Contains(message, "eof"):
-		reason = "connection closed by proxy/upstream (EOF)"
-	case strings.Contains(message, "invalid_grant"):
-		reason = "refresh token rejected (invalid_grant)"
-	case errors.As(err, &op):
-		reason = "network operation failed: " + op.Op
-	case strings.HasPrefix(message, "probe returned status=") || message == "missing access token":
-		reason = err.Error()
-	}
-	return stage + ": " + reason
+	return err.Error()
 }

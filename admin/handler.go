@@ -10209,7 +10209,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	continuousRetryPolicy := h.store.GetContinuousRetryPolicy()
 	c.JSON(http.StatusOK, settingsResponse{
 		CodexTurnStateAutoEnabled:           ticketSettings.Enabled,
-		CodexTurnStateHarvestProxyURL:       maskCodexTurnStateProxyURL(ticketSettings.HarvestProxyURL),
+		CodexTurnStateHarvestProxyURL:       ticketSettings.HarvestProxyURL,
 		CodexTurnStateManagedModels:         ticketSettings.Models,
 		CodexTurnStateProbeModels:           ticketSettings.ProbeModels,
 		CodexTurnStateTargetLength:          ticketSettings.TargetLength,
@@ -12186,7 +12186,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 
 	c.JSON(http.StatusOK, settingsResponse{
 		CodexTurnStateAutoEnabled:           ticketSettings.Enabled,
-		CodexTurnStateHarvestProxyURL:       maskCodexTurnStateProxyURL(ticketSettings.HarvestProxyURL),
+		CodexTurnStateHarvestProxyURL:       ticketSettings.HarvestProxyURL,
 		CodexTurnStateManagedModels:         ticketSettings.Models,
 		CodexTurnStateTargetLength:          ticketSettings.TargetLength,
 		CodexTurnStateTTLSeconds:            ticketSettings.TTLSeconds,
