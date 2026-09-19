@@ -34,3 +34,10 @@ docker-compose.yml
 *.so
 *.dylib
 codex2api
+
+# Repository metadata, documentation and local browser artifacts
+.github/
+docs/
+/*.md
+.playwright-mcp/
+/docker-compose*.yml
