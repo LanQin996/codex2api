@@ -5,6 +5,7 @@ import { cn } from "@/lib/utils";
 import type { AccountRow } from "../types";
 import { formatBeijingTime } from "../utils/time";
 import {
+  isResponsesRateLimitedAccount,
   isDisabledAccountOverlayAccount,
   resolveAccountOverlayKind,
 } from "../lib/accountStateOverlay";
