@@ -9371,7 +9371,7 @@ func maskCodexTurnStateProxyURL(raw string) string {
 	if parsed.User != nil {
 		parsed.User = url.UserPassword(parsed.User.Username(), "***")
 	}
-	return parsed.String()
+	return strings.Replace(parsed.String(), ":%2A%2A%2A@", ":***@", 1)
 }
 
 type updateSettingsReq struct {
@@ -10693,15 +10693,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		return
 	}
 	if req.CodexTurnStateHarvestProxyURL != nil {
-		proxyURL := strings.TrimSpace(*req.CodexTurnStateHarvestProxyURL)
-		if proxyURL == "***" || strings.HasSuffix(proxyURL, ":***@") || strings.Contains(proxyURL, ":***@") {
-			proxyURL = ticketSettings.HarvestProxyURL
-		}
-		if proxyURL != "" {
-			if _, err := security.ParseProxyURL(proxyURL); err != nil {
-				writeError(c, http.StatusBadRequest, "Codex Turn State 采集代理无效："+err.Error())
-				return
-			}
+		proxyURL, err := normalizeCodexTurnStateProxyUpdate(*req.CodexTurnStateHarvestProxyURL, ticketSettings.HarvestProxyURL)
+		if err != nil {
+			writeError(c, http.StatusBadRequest, err.Error())
+			return
 		}
 		ticketSettings.HarvestProxyURL = proxyURL
 	}

@@ -3738,6 +3738,12 @@ export default function Settings() {
                       <SettingField label={t('settings.codexTurnStateRefreshBefore')} suffix={t('settings.unit.sec')}>
                         <DraftNumberInput min={0} max={86399} value={settingsForm.codex_turn_state_refresh_before_seconds} onValueChange={(value) => setSettingsForm((form) => ({ ...form, codex_turn_state_refresh_before_seconds: value }))} onValueCommit={(value) => void autoSaveSettingsPatch({ codex_turn_state_refresh_before_seconds: value })} />
                       </SettingField>
+                      <SettingField label={t('settings.codexTurnStateProbeInterval')} description={t('settings.codexTurnStateProbeIntervalDesc')} suffix={t('settings.unit.sec')}>
+                        <DraftNumberInput min={1} max={3600} value={settingsForm.codex_turn_state_probe_interval_seconds} onValueChange={(value) => setSettingsForm((form) => ({ ...form, codex_turn_state_probe_interval_seconds: value }))} onValueCommit={(value) => void autoSaveSettingsPatch({ codex_turn_state_probe_interval_seconds: value })} />
+                      </SettingField>
+                      <SettingField label={t('settings.codexTurnStateAttemptTimeout')} description={t('settings.codexTurnStateAttemptTimeoutDesc')} suffix={t('settings.unit.sec')}>
+                        <DraftNumberInput min={1} max={300} value={settingsForm.codex_turn_state_attempt_timeout_seconds} onValueChange={(value) => setSettingsForm((form) => ({ ...form, codex_turn_state_attempt_timeout_seconds: value }))} onValueCommit={(value) => void autoSaveSettingsPatch({ codex_turn_state_attempt_timeout_seconds: value })} />
+                      </SettingField>
                       <SettingField label={t('settings.codexTurnStateConcurrency')} suffix={t('settings.unit.concurrency')}>
                         <DraftNumberInput min={1} max={64} value={settingsForm.codex_turn_state_concurrency} onValueChange={(value) => setSettingsForm((form) => ({ ...form, codex_turn_state_concurrency: value }))} onValueCommit={(value) => void autoSaveSettingsPatch({ codex_turn_state_concurrency: value })} />
                       </SettingField>

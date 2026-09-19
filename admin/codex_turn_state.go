@@ -1,6 +1,8 @@
 package admin
 
 import (
+	"fmt"
+	"github.com/codex2api/security"
 	"net/http"
 	"strings"
 	"time"
@@ -48,4 +50,29 @@ func (h *Handler) ProbeCodexTurnState(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusAccepted, gin.H{"queued": queued})
+}
+
+func normalizeCodexTurnStateProxyUpdate(raw, existing string) (string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "", nil
+	}
+	if raw == "***" {
+		return existing, nil
+	}
+	parsed, err := security.ParseProxyURL(raw)
+	if err != nil {
+		return "", fmt.Errorf("采集代理格式无效：请填写 http:// 或 socks5:// 开头的完整地址，账号密码与地址之间使用 @，不要使用转义反斜杠")
+	}
+	if parsed.User != nil {
+		password, _ := parsed.User.Password()
+		if password == "***" {
+			old, oldErr := security.ParseProxyURL(existing)
+			if oldErr == nil && old.User != nil && old.Scheme == parsed.Scheme && old.Host == parsed.Host && old.User.Username() == parsed.User.Username() {
+				return existing, nil
+			}
+			return "", fmt.Errorf("修改代理地址或用户名后，请重新填写真实密码；不能使用脱敏占位符 ***")
+		}
+	}
+	return parsed.String(), nil
 }

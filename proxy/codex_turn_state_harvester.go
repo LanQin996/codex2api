@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -653,8 +654,7 @@ func (h *CodexTurnStateHarvester) probe(ctx context.Context, account *auth.Accou
 	account.Mu().RUnlock()
 	if token == "" || (!expires.IsZero() && time.Until(expires) < 2*time.Minute) {
 		if err := h.store.RefreshSingle(ctx, account.DBID); err != nil {
-			log.Printf("[codex-turn-state] 账号 %d 刷新 token 失败: %v", account.DBID, err)
-			return err
+			return &codexTurnStateStageError{stage: "token_refresh", err: err}
 		}
 		account.Mu().RLock()
 		token = strings.TrimSpace(account.AccessToken)
@@ -876,7 +876,7 @@ func (h *CodexTurnStateHarvester) fireProbe(ctx context.Context, account *auth.A
 	applyCodexTurnStateHarvestIdentity(req.Header, model)
 	resp, err := NewUTLSHttpClient(cfg.HarvestProxyURL).Do(req)
 	if err != nil {
-		return "", 0, err
+		return "", 0, &codexTurnStateStageError{stage: "proxy/upstream_request", err: err}
 	}
 	defer resp.Body.Close()
 	return strings.TrimSpace(resp.Header.Get(codexTurnStateHeader)), resp.StatusCode, nil
@@ -919,16 +919,50 @@ func CodexTurnStateProbeDiagnostics(accountID int64) map[string]struct {
 }
 
 // Do not expose transport URLs, proxy credentials or token-refresh response bodies.
+type codexTurnStateStageError struct {
+	stage string
+	err   error
+}
+
+func (e *codexTurnStateStageError) Error() string { return e.stage + ": " + e.err.Error() }
+func (e *codexTurnStateStageError) Unwrap() error { return e.err }
+
 func codexTurnStateProbeError(err error) string {
-	if errors.Is(err, context.DeadlineExceeded) {
-		return "probe timeout"
+	stage := "probe"
+	var staged *codexTurnStateStageError
+	if errors.As(err, &staged) {
+		stage = staged.stage
 	}
-	if errors.Is(err, context.Canceled) {
-		return "probe canceled"
+	reason := "unclassified failure (raw message withheld)"
+	message := strings.ToLower(err.Error())
+	var dns *net.DNSError
+	var op *net.OpError
+	var netErr net.Error
+	switch {
+	case errors.Is(err, context.Canceled):
+		reason = "canceled"
+	case errors.Is(err, context.DeadlineExceeded):
+		reason = "timeout"
+	case errors.As(err, &dns):
+		reason = "DNS lookup failed"
+	case errors.As(err, &netErr) && netErr.Timeout():
+		reason = "network timeout"
+	case strings.Contains(message, "407") || strings.Contains(message, "authentication failed") || strings.Contains(message, "username/password authentication"):
+		reason = "proxy authentication failed; check protocol, username and password"
+	case strings.Contains(message, "connection refused"):
+		reason = "connection refused; check proxy host and port"
+	case strings.Contains(message, "socks"):
+		reason = "SOCKS handshake/connect failed; check proxy protocol and credentials"
+	case strings.Contains(message, "tls") || strings.Contains(message, "certificate"):
+		reason = "TLS handshake/certificate failed"
+	case strings.Contains(message, "eof"):
+		reason = "connection closed by proxy/upstream (EOF)"
+	case strings.Contains(message, "invalid_grant"):
+		reason = "refresh token rejected (invalid_grant)"
+	case errors.As(err, &op):
+		reason = "network operation failed: " + op.Op
+	case strings.HasPrefix(message, "probe returned status=") || message == "missing access token":
+		reason = err.Error()
 	}
-	message := err.Error()
-	if strings.HasPrefix(message, "probe returned status=") || message == "missing access token" {
-		return message
-	}
-	return "proxy/network or token refresh failed (details suppressed to protect credentials)"
+	return stage + ": " + reason
 }

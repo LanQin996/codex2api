@@ -82,3 +82,19 @@ func TestRefineCodexTurnStateSetAt(t *testing.T) {
 		t.Fatal("legacy row without set_at must be backfilled on re-save")
 	}
 }
+
+func TestCodexTurnStateMaskedProxyRoundTrip(t *testing.T) {
+	original := "socks5://user-sid-test:real-password@proxy.example:3010"
+	for _, masked := range []string{maskCodexTurnStateProxyURL(original), "socks5://user-sid-test:%2A%2A%2A@proxy.example:3010"} {
+		got, err := normalizeCodexTurnStateProxyUpdate(masked, original)
+		if err != nil || got != original {
+			t.Fatalf("masked round trip failed: %v", err)
+		}
+	}
+	if _, err := normalizeCodexTurnStateProxyUpdate("http://other:***@proxy.example:3010", original); err == nil {
+		t.Fatal("modified masked URL accepted")
+	}
+	if _, err := normalizeCodexTurnStateProxyUpdate("user:pass@proxy.example:3010", original); err == nil {
+		t.Fatal("missing scheme accepted")
+	}
+}

@@ -169,3 +169,21 @@ func TestCodexTurnStateDiagnosticsProtectCredentials(t *testing.T) {
 		t.Fatal("proxy credential leaked")
 	}
 }
+
+func TestCodexTurnStateProbeErrorCategories(t *testing.T) {
+	for _, tc := range []struct{ message, want string }{
+		{"proxyconnect tcp: 407 Proxy Authentication Required", "proxy authentication failed"},
+		{"dial tcp: connection refused", "connection refused"},
+		{"tls: certificate verify failed", "TLS handshake/certificate failed"},
+		{"unexpected EOF", "EOF"},
+	} {
+		got := codexTurnStateProbeError(&codexTurnStateStageError{stage: "proxy/upstream_request", err: fmt.Errorf("%s", tc.message)})
+		if !strings.Contains(got, tc.want) || !strings.HasPrefix(got, "proxy/upstream_request:") {
+			t.Fatalf("unexpected diagnosis: %s", got)
+		}
+	}
+	got := codexTurnStateProbeError(&codexTurnStateStageError{stage: "token_refresh", err: fmt.Errorf("invalid_grant secret-token")})
+	if !strings.Contains(got, "token_refresh:") || strings.Contains(got, "secret-token") {
+		t.Fatalf("unsafe or missing stage: %s", got)
+	}
+}
