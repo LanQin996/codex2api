@@ -590,6 +590,8 @@ export const api = {
   },
   deletePortalImageAsset: (apiKey: string, id: number) =>
     requestImageStudioPortal<MessageResponse>(`/assets/${id}`, apiKey, { method: 'DELETE' }),
+  reacquireCodexTurnState: (accountID: number, model: string) =>
+    request<{ queued: number }>('/settings/codex-turn-state/probe', { method: 'POST', body: JSON.stringify({ account_id: accountID, model }) }),
   getStats: () => request<StatsResponse>('/stats'),
   // channel is a first-class upstream provider filter; omit for all accounts.
   // view: 'lite' — 只返回身份/绑定字段,跳过用量富化(代理绑定弹窗等场景)。

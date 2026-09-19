@@ -2266,6 +2266,20 @@ export default function Accounts() {
   );
 
   // Turn State 时效:只在编辑弹窗打开且该账号已保存注入值时每秒重算;弹窗关闭清掉 interval。
+  const [reacquiringTurnState, setReacquiringTurnState] = useState<string | null>(null);
+  const reacquireTurnState = async (accountID: number, model: string) => {
+    const key = accountID + ':' + model;
+    setReacquiringTurnState(key);
+    try {
+      await api.reacquireCodexTurnState(accountID, model);
+      showToast(t('accounts.turnStateReacquireQueued'));
+      await reload();
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : String(error));
+    } finally {
+      setReacquiringTurnState(null);
+    }
+  };
   const savedCodexTurnState = editingAccount?.codex_turn_state ?? "";
   const turnStateTtlVisible =
     editingAccount !== null &&
@@ -9953,6 +9967,9 @@ export default function Accounts() {
                               <CodexTurnStateTicketBadge account={editingAccount} />
                               {(editingAccount.codex_turn_state_tickets ?? []).map(ticket => (
                                 <div key={ticket.model} className="rounded border p-2 break-words">
+                                  <Button type="button" variant="outline" size="sm" className="float-right ml-2" disabled={reacquiringTurnState !== null || ticket.state === 'refreshing'} onClick={() => void reacquireTurnState(editingAccount.id, ticket.model)}>
+                                    {t('accounts.turnStateReacquire')}
+                                  </Button>
                                   <strong>{ticket.model}</strong>: {t("accounts.turnStatePhase." + ticket.state, { defaultValue: ticket.state })}
                                   {ticket.last_error && <p className="text-red-600">{ticket.last_error}</p>}
                                   {ticket.last_attempt && !ticket.last_attempt.startsWith("0001") && <p>{t("accounts.turnStateLastAttempt")}: {new Date(ticket.last_attempt).toLocaleString()}</p>}

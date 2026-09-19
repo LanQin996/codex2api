@@ -1743,6 +1743,8 @@
     "turnStateLastAttempt": "Last attempt",
     "turnStateNextAttempt": "Next retry",
     "turnStatePhase": {"ready":"Ready","expired":"Expired","missing":"Waiting","queued":"Queued","refreshing":"Probing","failed":"Failed"},
+    "turnStateReacquire": "Get a new ticket",
+    "turnStateReacquireQueued": "Refresh queued. The existing ticket is replaced only on success. Reopen the account later to see results.",
     "codexTurnStateStatus": "Automatic ticket status",
     "codexTurnStateBadge": "Tickets {{ready}}/{{total}}",
     "codexTurnStateNoTickets": "No automatic ticket is ready",
