@@ -38,7 +38,7 @@ type CodexTurnStateTicket struct {
 func ValidCodexTurnStateTicketValue(state string, targetLength int) bool {
 	state = strings.TrimSpace(state)
 	length := len(state)
-	return (length == 292 || length == 332 || (targetLength > 0 && length == targetLength)) &&
+	return (length == 292 || length == 332 || length == 356 || (targetLength > 0 && length == targetLength)) &&
 		strings.HasPrefix(state, "gAAAAA") && ValidateCodexTurnState(state) == nil
 }
 

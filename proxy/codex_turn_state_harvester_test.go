@@ -166,3 +166,72 @@ func TestCodexTurnStateProbeErrorPreservesOriginal(t *testing.T) {
 		t.Fatal("nil error must be empty")
 	}
 }
+
+func TestCodexTurnStateRetryIntervalUsesConfiguredDelay(t *testing.T) {
+	for _, seconds := range []int{1, 6, 30, 3600} {
+		cfg := &CodexTurnStateTicketConfig{ProbeIntervalSeconds: seconds}
+		if got := codexTurnStateRetryInterval(cfg); got != time.Duration(seconds)*time.Second {
+			t.Fatalf("delay=%s for config=%d", got, seconds)
+		}
+	}
+	if codexTurnStateRetryInterval(nil) != 6*time.Second {
+		t.Fatal("wrong default interval")
+	}
+}
+
+func TestCodexTurnStateSingleAccountParallelRace(t *testing.T) {
+	h, _ := ticketHarvesterFixture(t)
+	cfg := *CurrentCodexTurnStateTicketConfig()
+	cfg.Concurrency = 5
+	SetCodexTurnStateTicketConfig(&cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	started := make(chan struct{}, 5)
+	release := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		state, err := h.raceProbes(ctx, 5, func(ctx context.Context) (string, error) {
+			started <- struct{}{}
+			select {
+			case <-release:
+				return "winner", nil
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		})
+		if err == nil && state != "winner" {
+			err = fmt.Errorf("wrong winner")
+		}
+		done <- err
+	}()
+	for i := 0; i < 5; i++ {
+		select {
+		case <-started:
+		case <-ctx.Done():
+			t.Fatal("single account did not reach five concurrent attempts")
+		}
+	}
+	if h.active.Load() != 5 {
+		t.Fatalf("active=%d", h.active.Load())
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if h.active.Load() != 0 {
+		t.Fatal("slots leaked")
+	}
+}
+
+func TestCodexTurnStateRaceCancelsLosers(t *testing.T) {
+	h, _ := ticketHarvesterFixture(t)
+	cfg := *CurrentCodexTurnStateTicketConfig()
+	cfg.Concurrency = 3
+	SetCodexTurnStateTicketConfig(&cfg)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	state, err := h.raceProbes(ctx, 3, func(ctx context.Context) (string, error) { return "winner", nil })
+	if err != nil || state != "winner" || h.active.Load() != 0 {
+		t.Fatalf("state=%s err=%v active=%d", state, err, h.active.Load())
+	}
+}

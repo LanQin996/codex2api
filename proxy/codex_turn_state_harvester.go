@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"log"
-	"math/rand"
 	"net/http"
 	"strings"
 	"sync"
@@ -150,18 +149,20 @@ type codexTurnStatePendingCapture struct {
 type codexTurnStatePendingContextKey struct{}
 
 type codexTurnStateRuntimeStatus struct {
-	Enabled         bool                          `json:"enabled"`
-	Active          bool                          `json:"active"`
-	PendingCaptures int                           `json:"pending_captures"`
-	QueuedProbes    int                           `json:"queued_probes"`
-	InFlightProbes  int                           `json:"in_flight_probes"`
-	TotalProbed     uint64                        `json:"total_probed"`
-	TotalSucceeded  uint64                        `json:"total_succeeded"`
-	TotalFailed     uint64                        `json:"total_failed"`
-	TotalCollected  uint64                        `json:"total_collected"`
-	TotalInjected   uint64                        `json:"total_injected"`
-	Truncated       bool                          `json:"truncated,omitempty"`
-	Accounts        []codexTurnStateAccountStatus `json:"accounts,omitempty"`
+	Enabled          bool                          `json:"enabled"`
+	Active           bool                          `json:"active"`
+	PendingCaptures  int                           `json:"pending_captures"`
+	QueuedProbes     int                           `json:"queued_probes"`
+	InFlightProbes   int                           `json:"in_flight_probes"`
+	ActiveRequests   int                           `json:"active_requests"`
+	ConcurrencyLimit int                           `json:"concurrency_limit"`
+	TotalProbed      uint64                        `json:"total_probed"`
+	TotalSucceeded   uint64                        `json:"total_succeeded"`
+	TotalFailed      uint64                        `json:"total_failed"`
+	TotalCollected   uint64                        `json:"total_collected"`
+	TotalInjected    uint64                        `json:"total_injected"`
+	Truncated        bool                          `json:"truncated,omitempty"`
+	Accounts         []codexTurnStateAccountStatus `json:"accounts,omitempty"`
 }
 
 type codexTurnStateAccountStatus struct {
@@ -577,7 +578,6 @@ func (h *CodexTurnStateHarvester) runProbeTask(ctx context.Context, key codexTur
 	state.Queued = false
 	state.InFlight = true
 	h.inflight[key] = true
-	state.LastAttempt = time.Now()
 	h.queueMu.Unlock()
 	defer func() {
 		h.queueMu.Lock()
@@ -586,27 +586,14 @@ func (h *CodexTurnStateHarvester) runProbeTask(ctx context.Context, key codexTur
 		h.queueMu.Unlock()
 	}()
 
-	for {
-		cfg := CurrentCodexTurnStateTicketConfig()
-		limit := max(1, cfg.Concurrency)
-		if h.active.Add(1) <= int64(limit) {
-			break
-		}
-		h.active.Add(-1)
-		timer := time.NewTimer(100 * time.Millisecond)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return
-		case <-timer.C:
-		}
-	}
-	defer h.active.Add(-1)
 	account := h.store.FindByID(key.accountID)
 	cfg := CurrentCodexTurnStateTicketConfig()
 	if account == nil || !cfg.Enabled || !h.probeEligible(key) {
 		return
 	}
+	h.queueMu.Lock()
+	state.LastAttempt = time.Now()
+	h.queueMu.Unlock()
 	h.probed.Add(1)
 	err := h.probe(ctx, account, key.model, cfg)
 	h.queueMu.Lock()
@@ -617,15 +604,7 @@ func (h *CodexTurnStateHarvester) runProbeTask(ctx context.Context, key codexTur
 		state.LastError = ""
 	} else {
 		state.Failures++
-		backoff := time.Duration(1<<min(state.Failures, 6)) * time.Second
-		if backoff < time.Duration(cfg.ProbeIntervalSeconds)*time.Second {
-			backoff = time.Duration(cfg.ProbeIntervalSeconds) * time.Second
-		}
-		if backoff > time.Hour {
-			backoff = time.Hour
-		}
-		jitter := time.Duration(rand.Int63n(int64(backoff/4) + 1))
-		state.NextAttempt = time.Now().Add(backoff + jitter)
+		state.NextAttempt = time.Now().Add(codexTurnStateRetryInterval(cfg))
 		state.LastError = codexTurnStateProbeError(err)
 		log.Printf("[codex-turn-state] account=%d model=%s failures=%d next_attempt=%s error=%s", key.accountID, key.model, state.Failures, state.NextAttempt.UTC().Format(time.RFC3339), state.LastError)
 	}
@@ -662,12 +641,18 @@ func (h *CodexTurnStateHarvester) probe(ctx context.Context, account *auth.Accou
 	if token == "" {
 		return errors.New("missing access token")
 	}
-	state, status, err := h.fireProbe(ctx, account, token, model, cfg)
-	if err != nil || status != http.StatusOK || !auth.ValidCodexTurnStateTicketValue(state, cfg.TargetLength) {
+	state, err := h.raceProbes(ctx, min(64, max(1, cfg.Concurrency)), func(attemptCtx context.Context) (string, error) {
+		state, status, err := h.fireProbe(attemptCtx, account, token, model, cfg)
 		if err != nil {
-			return err
+			return "", err
 		}
-		return fmt.Errorf("probe returned status=%d length=%d", status, len(state))
+		if status != http.StatusOK || !auth.ValidCodexTurnStateTicketValue(state, cfg.TargetLength) {
+			return "", fmt.Errorf("probe returned status=%d length=%d", status, len(state))
+		}
+		return state, nil
+	})
+	if err != nil {
+		return err
 	}
 	h.recordTicket(account, model, state, "probe", true)
 	return nil
@@ -746,6 +731,8 @@ func CodexTurnStateRuntimeStatus() any {
 	h.queueMu.Lock()
 	status.QueuedProbes = len(h.queued)
 	status.InFlightProbes = len(h.inflight)
+	status.ActiveRequests = int(h.active.Load())
+	status.ConcurrencyLimit = max(1, cfg.Concurrency)
 	h.queueMu.Unlock()
 	if h.store != nil {
 		now := time.Now()
@@ -933,4 +920,90 @@ func codexTurnStateProbeError(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+// Retry delay starts when the previous attempt finishes; concurrency queues and
+// the periodic scan may defer actual execution beyond this earliest time.
+func codexTurnStateRetryInterval(cfg *CodexTurnStateTicketConfig) time.Duration {
+	if cfg == nil || cfg.ProbeIntervalSeconds <= 0 {
+		return 6 * time.Second
+	}
+	return time.Duration(cfg.ProbeIntervalSeconds) * time.Second
+}
+
+// raceProbes fans out one account/model batch, sharing the global request budget.
+// Only the winner is published by the caller, after all losing attempts exit.
+func (h *CodexTurnStateHarvester) raceProbes(ctx context.Context, parallelism int, attempt func(context.Context) (string, error)) (string, error) {
+	batchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type result struct {
+		state string
+		err   error
+	}
+	count := min(64, max(1, parallelism))
+	results := make(chan result, count)
+	var workers sync.WaitGroup
+	for i := 0; i < count; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			if err := h.acquireProbeSlot(batchCtx); err != nil {
+				results <- result{err: err}
+				return
+			}
+			defer h.active.Add(-1)
+			if err := batchCtx.Err(); err != nil {
+				results <- result{err: err}
+				return
+			}
+			state, err := attempt(batchCtx)
+			results <- result{state: state, err: err}
+		}()
+	}
+	var winner string
+	var lastErr error
+	for i := 0; i < count; i++ {
+		r := <-results
+		if r.err == nil && r.state != "" && winner == "" {
+			winner = r.state
+			cancel()
+		}
+		if r.err != nil && !errors.Is(r.err, context.Canceled) {
+			lastErr = r.err
+		}
+	}
+	workers.Wait()
+	if winner != "" {
+		return winner, nil
+	}
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+	if lastErr == nil {
+		lastErr = errors.New("probe batch returned no ticket")
+	}
+	return "", lastErr
+}
+
+func (h *CodexTurnStateHarvester) acquireProbeSlot(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		cfg := CurrentCodexTurnStateTicketConfig()
+		if !cfg.Enabled {
+			return errors.New("ticket harvesting disabled")
+		}
+		active := h.active.Load()
+		if active < int64(min(64, max(1, cfg.Concurrency))) && h.active.CompareAndSwap(active, active+1) {
+			return nil
+		}
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
 }
