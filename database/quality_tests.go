@@ -272,6 +272,13 @@ func (db *DB) ListQualityTests(ctx context.Context, page, pageSize int, filter Q
 	result := &QualityTestPage{Jobs: []QualityTestJob{}, ActiveJobs: []QualityTestJob{}, Limit: QualityTestConcurrency}
 	where, args := filter.where()
 	if filter.Latest {
+		// Recent results belong to currently owned accounts, not deleted snapshots.
+		owned := "EXISTS (SELECT 1 FROM accounts a WHERE a.id=quality_test_jobs.account_id AND a.deleted_at IS NULL AND a.status<>'deleted')"
+		if where == "" {
+			where = " WHERE " + owned
+		} else {
+			where += " AND " + owned
+		}
 		where = " WHERE id IN (SELECT MAX(id) FROM quality_test_jobs" + where + " GROUP BY account_id)"
 	}
 	if err := db.conn.QueryRowContext(ctx, `SELECT COUNT(*) FROM quality_test_jobs`+where, args...).Scan(&result.Total); err != nil {
@@ -282,6 +289,26 @@ func (db *DB) ListQualityTests(ctx context.Context, page, pageSize int, filter Q
 		return nil, err
 	}
 	result.Facets = *facets
+	if filter.Latest {
+		rows, err := db.conn.QueryContext(ctx, `SELECT id, name FROM accounts WHERE deleted_at IS NULL AND status<>'deleted' AND id IN (SELECT account_id FROM quality_test_jobs) ORDER BY name, id`)
+		if err != nil {
+			return nil, err
+		}
+		result.Facets.Accounts = []QualityTestAccountFacet{}
+		for rows.Next() {
+			var account QualityTestAccountFacet
+			if err := rows.Scan(&account.ID, &account.Name); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			result.Facets.Accounts = append(result.Facets.Accounts, account)
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
+	}
 	read := func(query string, args ...any) ([]QualityTestJob, error) {
 		rows, err := db.conn.QueryContext(ctx, query, args...)
 		if err != nil {

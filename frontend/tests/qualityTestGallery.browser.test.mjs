@@ -76,6 +76,34 @@ test('default gallery lazy-loads isolated previews, supports history and narrow 
     await page.close()
   }
 })
+
+test('batch sheet stays inside the viewport with a fixed header and submit footer', async () => {
+  const page = await openPage()
+  try {
+    for (const viewport of [{ width: 1293, height: 822 }, { width: 860, height: 548 }, { width: 390, height: 640 }]) {
+      await page.setViewportSize(viewport)
+      await page.getByRole('button', { name: 'Batch test', exact: true }).click()
+      const panel = page.getByRole('dialog')
+      await panel.getByRole('checkbox').first().waitFor()
+      const submit = panel.getByRole('button', { name: 'Confirm and queue tests', exact: true })
+      const bounds = await panel.boundingBox()
+      assert.ok(bounds.x >= 0 && bounds.y >= 0)
+      assert.ok(bounds.x + bounds.width <= viewport.width + 1)
+      assert.ok(bounds.y + bounds.height <= viewport.height + 1)
+      const footerBefore = await submit.boundingBox()
+      assert.ok(footerBefore.y >= 0 && footerBefore.y + footerBefore.height <= viewport.height)
+      await panel.locator('[data-slot="sheet-body"]').evaluate(el => { el.scrollTop = el.scrollHeight })
+      const footerAfter = await submit.boundingBox()
+      assert.equal(footerBefore.y, footerAfter.y)
+      assert.ok(await panel.getByRole('heading', { name: 'Batch test' }).isVisible())
+      assert.ok(await panel.evaluate(el => el.scrollWidth <= el.clientWidth))
+      await page.keyboard.press('Escape')
+      await panel.waitFor({ state: 'hidden' })
+    }
+  } finally {
+    await page.close()
+  }
+})
 test('batch selection spans pages, queues once, survives reload and renders completed previews', async () => {
   const page = await openPage()
   try {

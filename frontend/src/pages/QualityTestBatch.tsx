@@ -6,12 +6,14 @@ import { Button } from '../components/ui/button'
 import { Input } from '../components/ui/input'
 import { Select } from '../components/ui/select'
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from '../components/ui/dialog'
+  Sheet,
+  SheetBody,
+  SheetContent,
+  SheetDescription,
+  SheetFooter,
+  SheetHeader,
+  SheetTitle,
+} from '../components/ui/sheet'
 import Pagination from '../components/Pagination'
 import {
   PELICAN_PROMPT,
@@ -268,13 +270,13 @@ export default function QualityTestBatchPanel({
     }
   }
   return (
-    <Dialog
+    <Sheet
       open={open}
       onOpenChange={(value) => {
         if (!value && !busy) onClose()
       }}
     >
-      <DialogContent
+      <SheetContent
         className="quality-test-batch-panel"
         showCloseButton={!busy}
         onEscapeKeyDown={(event) => {
@@ -284,10 +286,11 @@ export default function QualityTestBatchPanel({
           if (busy) event.preventDefault()
         }}
       >
-        <DialogHeader>
-          <DialogTitle>{t('qualityTest.batch.title')}</DialogTitle>
-          <DialogDescription>{t('qualityTest.batch.hint')}</DialogDescription>
-        </DialogHeader>
+        <SheetHeader>
+          <SheetTitle>{t('qualityTest.batch.title')}</SheetTitle>
+          <SheetDescription>{t('qualityTest.batch.hint')}</SheetDescription>
+        </SheetHeader>
+        <SheetBody>
         <fieldset disabled={busy} className="quality-test-batch-fields">
           <label>
             {t('qualityTest.channel')}
@@ -467,11 +470,14 @@ export default function QualityTestBatchPanel({
               </Button>
             </div>
           ) : null}
+        </fieldset>
+        </SheetBody>
+        <SheetFooter>
           <Button disabled={!valid || busy} onClick={() => void submit()}>
             {t(busy ? 'qualityTest.submitting' : 'qualityTest.batch.submit')}
           </Button>
-        </fieldset>
-      </DialogContent>
-    </Dialog>
+        </SheetFooter>
+      </SheetContent>
+    </Sheet>
   )
 }

@@ -115,8 +115,16 @@ func TestQualityTestLatestFiltersBeforeDedupAndPagination(t *testing.T) {
 	}
 	defer db.Close()
 	ctx := context.Background()
+	accountIDs := []int64{}
+	for i := 0; i < 25; i++ {
+		id, err := db.InsertAccount(ctx, "owned account", "fixture-token", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		accountIDs = append(accountIDs, id)
+	}
 	for round := 0; round < 2; round++ {
-		for id := int64(1); id <= 25; id++ {
+		for _, id := range accountIDs {
 			model := "old"
 			if round == 1 {
 				model = "new"
@@ -147,6 +155,25 @@ func TestQualityTestLatestFiltersBeforeDedupAndPagination(t *testing.T) {
 	page, err = db.ListQualityTests(ctx, 1, 20, QualityTestFilter{})
 	if err != nil || page.Total != 50 {
 		t.Fatalf("history: %+v %v", page, err)
+	}
+	if err := db.SoftDeleteAccount(ctx, accountIDs[0]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.conn.ExecContext(ctx, "DELETE FROM accounts WHERE id=$1", accountIDs[1]); err != nil {
+		t.Fatal(err)
+	}
+	page, err = db.ListQualityTests(ctx, 2, 20, QualityTestFilter{Latest: true})
+	if err != nil || page.Total != 23 || len(page.Jobs) != 3 || len(page.Facets.Accounts) != 23 {
+		t.Fatalf("deleted accounts must not affect recent cards, count or choices: %+v %v", page, err)
+	}
+	for _, job := range page.Jobs {
+		if job.AccountID == accountIDs[0] || job.AccountID == accountIDs[1] {
+			t.Fatalf("deleted account visible: %+v", job)
+		}
+	}
+	page, err = db.ListQualityTests(ctx, 1, 20, QualityTestFilter{})
+	if err != nil || page.Total != 50 || len(page.Facets.Accounts) != 25 {
+		t.Fatalf("full history must remain available: %+v %v", page, err)
 	}
 }
 
