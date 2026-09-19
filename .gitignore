@@ -58,3 +58,4 @@ diagrams/
 /codex2api_local
 /server.log
 .playwright-mcp
+.cache

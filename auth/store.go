@@ -4254,6 +4254,8 @@ func NewStore(db *database.DB, tc cache.TokenCache, settings *database.SystemSet
 	s.githubToken.Store(strings.TrimSpace(settings.GithubToken))
 	s.githubProxyURL.Store(strings.TrimSpace(settings.GithubProxyURL))
 	s.SetModelCooldownSettings(database.ModelCooldownSettings{
+		ResponsesMode:       settings.ResponsesCooldownMode,
+		ResponsesSeconds:    settings.ResponsesCooldownSeconds,
 		RelayMode:           settings.RelayModelCooldownMode,
 		RelaySeconds:        settings.RelayModelCooldownSeconds,
 		RelayBackoffEnabled: settings.RelayModelCooldownBackoffEnabled,

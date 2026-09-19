@@ -2479,6 +2479,8 @@ type SystemSettings struct {
 	ModelPricingOverrides string
 	// ModelPricingSyncURL 是「从 JSON URL 同步定价」的来源地址，空时用内置默认。
 	ModelPricingSyncURL              string
+	ResponsesCooldownMode            string
+	ResponsesCooldownSeconds         int
 	RelayModelCooldownMode           string
 	RelayModelCooldownSeconds        int
 	RelayModelCooldownBackoffEnabled bool

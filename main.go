@@ -198,6 +198,8 @@ func main() {
 		log.Printf("警告: 读取模型冷却设置失败，将采用安全默认值: %v", modelCooldownErr)
 		modelCooldownSettings = database.DefaultModelCooldownSettings()
 	}
+	settings.ResponsesCooldownMode = modelCooldownSettings.ResponsesMode
+	settings.ResponsesCooldownSeconds = modelCooldownSettings.ResponsesSeconds
 	settings.RelayModelCooldownMode = modelCooldownSettings.RelayMode
 	settings.RelayModelCooldownSeconds = modelCooldownSettings.RelaySeconds
 	settings.RelayModelCooldownBackoffEnabled = modelCooldownSettings.RelayBackoffEnabled

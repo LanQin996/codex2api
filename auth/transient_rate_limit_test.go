@@ -15,6 +15,33 @@ type delayedTransientCooldownCache struct {
 	entered, resume chan struct{}
 }
 
+func TestResponsesCooldownSettingsSurviveStoreInitialization(t *testing.T) {
+	for _, mode := range []string{database.ModelCooldownModeFixed, database.ModelCooldownModeOff} {
+		t.Run(mode, func(t *testing.T) {
+			s := NewStore(nil, nil, &database.SystemSettings{
+				ResponsesCooldownMode:    mode,
+				ResponsesCooldownSeconds: 1,
+			})
+			defer s.Stop()
+			policy := s.GetModelCooldownSettings()
+			if policy.ResponsesMode != mode || policy.ResponsesSeconds != 1 {
+				t.Fatalf("startup lost Responses settings: %+v", policy)
+			}
+			acc := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 4)
+			// An old backoff level must not turn fixed 1s into adaptive 30s.
+			acc.transientRateLimitBackoff = 1
+			got := s.MarkTransientRateLimited(acc, 0)
+			if mode == database.ModelCooldownModeOff {
+				if got != 0 {
+					t.Fatalf("off cooldown = %v, want 0", got)
+				}
+			} else if got <= 0 || got > time.Second {
+				t.Fatalf("fixed cooldown = %v, want at most 1s", got)
+			}
+		})
+	}
+}
+
 func (c *delayedTransientCooldownCache) MergeRuntimeCooldown(ctx context.Context, namespace, key string, record cache.RuntimeCooldown) (cache.RuntimeCooldown, error) {
 	if record.Kind == cache.CooldownKindTransient {
 		close(c.entered)
