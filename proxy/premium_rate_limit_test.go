@@ -325,3 +325,23 @@ func TestWebSocketResponseFailedUsageLimitStillBlocksWhenUsageStatusIgnored(t *t
 		t.Fatal("WebSocket response.failed usage_limit_reached must create an account cooldown")
 	}
 }
+
+func TestResponsesCooldownOffClearsDecisionDeadline(t *testing.T) {
+	store := newProxyPremiumTestStore()
+	defer store.Stop()
+	policy := database.DefaultModelCooldownSettings()
+	policy.ResponsesMode = "off"
+	store.SetModelCooldownSettings(policy)
+	acc := &auth.Account{DBID: 1, AccessToken: "token", PlanType: "pro", Status: auth.StatusReady}
+	body := []byte(`{"error":{"type":"rate_limit_error"}}`)
+	decision := Apply429Cooldown(store, acc, body, nil, "gpt-5.4")
+	if decision.Cooldown != 0 || !decision.ResetAt.IsZero() {
+		t.Fatalf("off retained deadline: %+v", decision)
+	}
+	resp := &http.Response{Header: make(http.Header)}
+	resp.Header.Set("Retry-After", "120")
+	decision = Apply429Cooldown(store, acc, body, resp, "gpt-5.4")
+	if decision.Cooldown < 119*time.Second {
+		t.Fatalf("upstream hint lost: %+v", decision)
+	}
+}

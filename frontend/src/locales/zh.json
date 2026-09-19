@@ -1473,8 +1473,6 @@
     "autoPauseThresholdPlaceholder": "留空或 0",
     "autoPauseThresholdHint": "留空或填 0 表示不启用该窗口阈值；达到阈值后只在调度时跳过账号。",
     "autoPauseThresholdRange": "请输入 0 到 100 之间的百分比。",
-    "responsesCooldownTitle": "Responses 账号级短期冷却",
- "responsesCooldownHint": "独立控制短期429冷却，时长单位为秒。固定模式不指数退避；关闭仅取消本地等待。上游明确的等待时间和5h/7d额度限制仍有效。修改仅影响后续冷却，已有冷却可在账号菜单重置。",
  "ignoreUsageLimitStatus": "忽略用量限流状态",
     "ignoreUsageLimitStatusHint": "开启后，仅允许携带 turn state 且已绑定账号的活跃 Codex 轮次在 5h/7d 用量达到 100% 后继续；新轮次仍会限流，Responses 实际返回 usage_limit_reached 时立即停止续传。不会绕过手动禁用、鉴权失败或自定义自动暂停阈值。",
     "ignoreUsageLimitStatusInherit": "跟随全局",
@@ -4186,6 +4184,8 @@
     }
   },
   "settings": {
+    "responsesCooldownTitle": "Responses 账号级短期冷却",
+    "responsesCooldownHint": "独立控制短期429冷却，时长单位为秒。固定模式不指数退避；关闭仅取消本地等待。上游明确的等待时间和5h/7d额度限制仍有效。修改仅影响后续冷却，已有冷却可在账号菜单重置。",
     "title": "系统设置",
     "description": "管理系统配置和运行参数。多数开关会即时自动保存。",
     "loadingTitle": "正在加载设置",

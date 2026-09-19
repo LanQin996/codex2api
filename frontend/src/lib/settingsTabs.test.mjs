@@ -179,3 +179,13 @@ test('provider visibility picker lives in general and keeps the fallback channel
     }
   }
 })
+
+test('responses cooldown translations resolve in the settings namespace', () => {
+  for (const locale of [zh, en]) {
+    for (const key of ['responsesCooldownTitle', 'responsesCooldownHint']) {
+      assert.equal(typeof locale.settings[key], 'string')
+      assert.ok(locale.settings[key].trim().length > 0)
+      assert.ok(settings.includes("t('settings." + key + "')"))
+    }
+  }
+})

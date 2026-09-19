@@ -1475,8 +1475,6 @@
     "autoPauseThresholdPlaceholder": "Blank or 0",
     "autoPauseThresholdHint": "Leave blank or enter 0 to disable this window threshold. Reaching it only skips scheduling.",
     "autoPauseThresholdRange": "Enter a percentage from 0 to 100.",
-    "responsesCooldownTitle": "Responses account throttle cooldown",
- "responsesCooldownHint": "Controls transient account-wide 429 cooldown in seconds. Fixed disables exponential backoff; off removes local delay only. Upstream waits and quota windows still apply. Existing cooldowns are unchanged.",
  "ignoreUsageLimitStatus": "Ignore Usage-Limit Status",
     "ignoreUsageLimitStatusHint": "When enabled, a bound active Codex turn carrying turn state may continue after 5h/7d usage reaches 100%. Fresh turns remain limited, and an actual Responses usage_limit_reached stops continuation. Manual disablement, auth failures, and configured auto-pause thresholds still apply.",
     "ignoreUsageLimitStatusInherit": "Follow Global",
@@ -4187,6 +4185,8 @@
     }
   },
   "settings": {
+    "responsesCooldownTitle": "Responses account throttle cooldown",
+    "responsesCooldownHint": "Controls transient account-wide 429 cooldown in seconds. Fixed disables exponential backoff; off removes local delay only. Upstream waits and quota windows still apply. Existing cooldowns are unchanged.",
     "codexOAuthKeepalive": "Keep Codex auth active in lazy mode",
     "codexTurnStateTitle": "Automatic Turn State",
     "codexTurnStateDesc": "Fetch and rotate X-Codex-Turn-State in the background for selected Codex models, while preserving manual injection on failure.",

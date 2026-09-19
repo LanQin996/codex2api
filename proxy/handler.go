@@ -8282,6 +8282,7 @@ func Apply429Cooldown(store *auth.Store, account *auth.Account, body []byte, res
 		// here would slide the same cooldown forward on every in-flight 429.
 		applied := store.MarkTransientRateLimited(account, transient429RetryAfter(body, resp, time.Now()))
 		decision.Cooldown = applied
+		decision.ResetAt = time.Time{}
 		if applied > 0 {
 			decision.ResetAt = time.Now().Add(applied)
 		}
