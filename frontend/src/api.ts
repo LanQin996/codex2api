@@ -857,6 +857,11 @@ export const api = {
     }),
   refreshAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}/refresh`, { method: 'POST' }),
+  refreshCodexTurnStateTickets: (id: number, model?: string) =>
+    request<{ queued: number }>('/settings/codex-turn-state/probe', {
+      method: 'POST',
+      body: JSON.stringify({ account_id: id, ...(model ? { model } : {}) }),
+    }),
   getAccount: (id: number, signal?: AbortSignal) =>
     request<AccountRow>(`/accounts/${id}`, { signal }),
   forceUsageProbe: () =>

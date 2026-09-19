@@ -9970,7 +9970,7 @@ export default function Accounts() {
                                   <Button type="button" variant="outline" size="sm" className="float-right ml-2" disabled={reacquiringTurnState !== null || ticket.state === 'refreshing'} onClick={() => void reacquireTurnState(editingAccount.id, ticket.model)}>
                                     {t('accounts.turnStateReacquire')}
                                   </Button>
-                                  <strong>{ticket.model}</strong>: {t("accounts.turnStatePhase." + ticket.state, { defaultValue: ticket.state })}
+                                  <strong>{ticket.model}</strong>: {t("accounts.turnStatePhase." + ticket.state, { defaultValue: ticket.state })} {ticket.length ? `(${ticket.length} ${t("accounts.turnStateLength")})` : ""}
                                   {ticket.last_error && <p className="text-red-600">{ticket.last_error}</p>}
                                   {ticket.last_attempt && !ticket.last_attempt.startsWith("0001") && <p>{t("accounts.turnStateLastAttempt")}: {new Date(ticket.last_attempt).toLocaleString()}</p>}
                                   {ticket.next_attempt && !ticket.next_attempt.startsWith("0001") && <p>{t("accounts.turnStateNextAttempt")}: {new Date(ticket.next_attempt).toLocaleString()}</p>}
@@ -13591,6 +13591,8 @@ function GroupChipList({
 
 function CodexTurnStateTicketBadge({ account }: { account: AccountRow }) {
   const { t } = useTranslation();
+  const { showToast } = useToast();
+  const [refreshing, setRefreshing] = useState(false);
   if (!account.codex_turn_state_auto_enabled || account.openai_responses_api || account.grok_api || account.claude_api || account.antigravity_api) {
     return null;
   }
@@ -13600,22 +13602,66 @@ function CodexTurnStateTicketBadge({ account }: { account: AccountRow }) {
   const complete = ready >= managed;
   const partial = ready > 0;
   const tickets = account.codex_turn_state_tickets ?? [];
+  const stateLabel = (state: string) => {
+    switch (state) {
+      case "ready": return t("accounts.codexTurnStateStateReady");
+      case "refreshing": return t("accounts.codexTurnStateStateRefreshing");
+      case "queued": return t("accounts.codexTurnStateStateQueued");
+      case "expired": return t("accounts.codexTurnStateStateExpired");
+      default: return t("accounts.codexTurnStateStateMissing");
+    }
+  };
   const detail = tickets.length > 0
-    ? tickets.map((ticket) => `${ticket.model}: ${t("accounts.turnStatePhase." + ticket.state, { defaultValue: ticket.state })}${ticket.last_error ? " — " + ticket.last_error : ""}${ticket.last_attempt && !ticket.last_attempt.startsWith("0001") ? " | " + t("accounts.turnStateLastAttempt") + ": " + new Date(ticket.last_attempt).toLocaleString() : ""}${ticket.next_attempt && !ticket.next_attempt.startsWith("0001") ? " | " + t("accounts.turnStateNextAttempt") + ": " + new Date(ticket.next_attempt).toLocaleString() : ""}`).join(" · ")
+    ? tickets.map((ticket) => {
+        const expiresAt = ticket.expires_at ? Date.parse(ticket.expires_at) : NaN;
+        const remaining = Number.isFinite(expiresAt) && expiresAt > Date.now()
+          ? formatCodexTurnStateCountdown(Math.max(0, expiresAt - Date.now()))
+          : "-";
+        const next = ticket.next_attempt ? formatBeijingTime(ticket.next_attempt) : "-";
+        const duration = ticket.last_duration_ms && ticket.last_duration_ms >= 1000
+          ? `${(ticket.last_duration_ms / 1000).toFixed(1)}s`
+          : ticket.last_duration_ms ? `${ticket.last_duration_ms}ms` : "-";
+        const attempts = ticket.attempts ?? 0;
+        return `${ticket.model}: ${stateLabel(ticket.state)} · ${t("accounts.codexTurnStateRemaining")} ${remaining} · ${t("accounts.codexTurnStateExpiresAt")} ${ticket.expires_at ? formatBeijingTime(ticket.expires_at) : "-"} · ${t("accounts.codexTurnStateAcquireDuration")} ${duration} · ${t("accounts.codexTurnStateNextAttempt")} ${next} · ${t("accounts.codexTurnStateAttemptsLabel")} ${attempts}${ticket.last_error ? ` · ${ticket.last_error}` : ""}`;
+      }).join("\n")
     : t("accounts.codexTurnStateNoTickets");
   const className = complete
     ? "bg-emerald-50 text-emerald-700 ring-emerald-200/80 dark:bg-emerald-950/40 dark:text-emerald-300 dark:ring-emerald-400/20"
     : partial
       ? "bg-amber-50 text-amber-700 ring-amber-200/80 dark:bg-amber-950/40 dark:text-amber-300 dark:ring-amber-400/20"
       : "bg-red-50 text-red-700 ring-red-200/80 dark:bg-red-950/40 dark:text-red-300 dark:ring-red-400/20";
+  const refreshTickets = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      const result = await api.refreshCodexTurnStateTickets(account.id);
+      showToast(t("accounts.codexTurnStateRefreshQueued", { count: result.queued }), "success");
+    } catch (error) {
+      showToast(t("accounts.codexTurnStateRefreshFailed", { error: getErrorMessage(error) }), "error");
+    } finally {
+      setRefreshing(false);
+    }
+  };
   return (
-    <span
-      className={`codex-account-card__flag inline-flex items-center gap-1 ring-1 ring-inset ${className}`}
-      title={`${t("accounts.codexTurnStateStatus")}: ${detail}`}
-    >
-      {complete ? <ShieldCheck className="size-3" /> : <ShieldAlert className="size-3" />}
-      {t("accounts.codexTurnStateBadge", { ready, total: managed })}
-    </span>
+    <>
+      <span
+        className={`codex-account-card__flag inline-flex items-center gap-1 ring-1 ring-inset ${className}`}
+        title={`${t("accounts.codexTurnStateStatus")}: ${detail}`}
+      >
+        {complete ? <ShieldCheck className="size-3" /> : <ShieldAlert className="size-3" />}
+        {t("accounts.codexTurnStateBadge", { ready, total: managed })}
+      </span>
+      <button
+        type="button"
+        className="codex-account-card__flag codex-account-card__flag--clickable"
+        disabled={refreshing}
+        onClick={() => void refreshTickets()}
+        title={t("accounts.codexTurnStateRefresh")}
+      >
+        <RefreshCw className={`size-3 ${refreshing ? "animate-spin" : ""}`} />
+        {t("accounts.codexTurnStateRefresh")}
+      </button>
+    </>
   );
 }
 

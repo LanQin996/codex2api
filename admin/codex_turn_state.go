@@ -13,6 +13,7 @@ import (
 
 type codexTurnStateTicketStatus struct {
 	Model            string    `json:"model"`
+	Length           int       `json:"length,omitempty"`
 	State            string    `json:"state"`
 	CapturedAt       time.Time `json:"captured_at,omitempty"`
 	ExpiresAt        time.Time `json:"expires_at,omitempty"`
@@ -20,6 +21,11 @@ type codexTurnStateTicketStatus struct {
 	LastAttempt      time.Time `json:"last_attempt,omitempty"`
 	LastSuccess      time.Time `json:"last_success,omitempty"`
 	NextAttempt      time.Time `json:"next_attempt,omitempty"`
+	Attempts         uint64    `json:"attempts"`
+	Failures         int       `json:"failures"`
+	LastDurationMs   int64     `json:"last_duration_ms"`
+	Queued           bool      `json:"queued,omitempty"`
+	InFlight         bool      `json:"in_flight,omitempty"`
 	LastError        string    `json:"last_error,omitempty"`
 }
 

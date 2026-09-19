@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -56,6 +57,7 @@ func SetCodexTurnStateTicketConfig(cfg *CodexTurnStateTicketConfig) {
 	}
 	copyCfg := *cfg
 	copyCfg.Models = append([]string(nil), cfg.Models...)
+	copyCfg.ProbeModels = append([]string(nil), cfg.ProbeModels...)
 	codexTurnStateTicketConfig.Store(&copyCfg)
 }
 
@@ -97,6 +99,7 @@ type CodexTurnStateHarvester struct {
 	db        *database.DB
 	cancel    context.CancelFunc
 	done      chan struct{}
+	wake      chan struct{}
 	start     sync.Once
 	stop      sync.Once
 	persistMu sync.Mutex
@@ -130,13 +133,29 @@ type codexTurnStateProbeKey struct {
 }
 
 type codexTurnStateProbeStatus struct {
-	Queued      bool
-	InFlight    bool
-	Failures    int
-	NextAttempt time.Time
-	LastAttempt time.Time
-	LastSuccess time.Time
-	LastError   string
+	Queued         bool
+	InFlight       bool
+	Attempts       uint64
+	Failures       int
+	NextAttempt    time.Time
+	LastAttempt    time.Time
+	LastSuccess    time.Time
+	LastDurationMs int64
+	LastError      string
+}
+
+// CodexTurnStateProbeSnapshot exposes metadata needed by the admin UI without
+// ever exposing the opaque ticket value or account credential.
+type CodexTurnStateProbeSnapshot struct {
+	Queued         bool
+	InFlight       bool
+	Attempts       uint64
+	Failures       int
+	NextAttempt    time.Time
+	LastAttempt    time.Time
+	LastSuccess    time.Time
+	LastDurationMs int64
+	LastError      string
 }
 
 type codexTurnStatePendingCapture struct {
@@ -174,6 +193,12 @@ type codexTurnStateAccountStatus struct {
 	RemainingSeconds int64     `json:"remaining_seconds"`
 	LastAttempt      time.Time `json:"last_attempt,omitempty"`
 	LastSuccess      time.Time `json:"last_success,omitempty"`
+	NextAttempt      time.Time `json:"next_attempt,omitempty"`
+	Attempts         uint64    `json:"attempts"`
+	Failures         int       `json:"failures"`
+	LastDurationMs   int64     `json:"last_duration_ms"`
+	Queued           bool      `json:"queued,omitempty"`
+	InFlight         bool      `json:"in_flight,omitempty"`
 	LastError        string    `json:"last_error,omitempty"`
 }
 
@@ -206,10 +231,23 @@ func NewCodexTurnStateHarvester(store *auth.Store, db *database.DB) *CodexTurnSt
 		db:       db,
 		tasks:    make(chan codexTurnStateProbeKey, 4096),
 		persist:  make(chan int64, 512),
+		wake:     make(chan struct{}, 1),
 		queued:   make(map[codexTurnStateProbeKey]bool),
 		inflight: make(map[codexTurnStateProbeKey]bool),
 		states:   make(map[codexTurnStateProbeKey]*codexTurnStateProbeStatus),
 		pending:  make(map[uint64]*codexTurnStatePendingCapture),
+	}
+}
+
+// WakeCodexTurnStateHarvester asks the running harvester to re-evaluate its
+// settings and expired tickets immediately. The signal is deliberately
+// non-blocking: settings writes must not wait for a probe worker or timer.
+func WakeCodexTurnStateHarvester() {
+	if h := activeCodexTurnStateHarvester.Load(); h != nil && h.wake != nil {
+		select {
+		case h.wake <- struct{}{}:
+		default:
+		}
 	}
 }
 
@@ -421,7 +459,7 @@ func (h *CodexTurnStateHarvester) loop(ctx context.Context) {
 		}
 		h.refresh(ctx)
 		cfg := CurrentCodexTurnStateTicketConfig()
-		interval := time.Duration(cfg.ProbeIntervalSeconds) * time.Second
+		interval := h.nextRefreshWait(cfg, time.Now(), time.Duration(cfg.ProbeIntervalSeconds)*time.Second)
 		if interval <= 0 {
 			interval = 6 * time.Second
 		}
@@ -430,9 +468,53 @@ func (h *CodexTurnStateHarvester) loop(ctx context.Context) {
 		case <-ctx.Done():
 			timer.Stop()
 			return
+		case <-h.wake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 		case <-timer.C:
 		}
 	}
+}
+
+// nextRefreshWait prevents a long probe interval from hiding an expiring
+// ticket. The regular interval remains the upper bound, while the nearest
+// managed ticket refresh deadline becomes an earlier wake-up point.
+func (h *CodexTurnStateHarvester) nextRefreshWait(cfg *CodexTurnStateTicketConfig, now time.Time, interval time.Duration) time.Duration {
+	if interval <= 0 {
+		interval = 6 * time.Second
+	}
+	if h == nil || h.store == nil || cfg == nil || !cfg.Enabled {
+		return interval
+	}
+	wait := interval
+	refreshBefore := time.Duration(max(0, cfg.RefreshBeforeSeconds)) * time.Second
+	for _, account := range h.store.Accounts() {
+		if account == nil || !isNativeCodexOAuth(account) {
+			continue
+		}
+		account.Mu().RLock()
+		for model, ticket := range account.CodexTurnStateTickets {
+			if !cfg.ModelManaged(model) || ticket.ExpiresAt.IsZero() {
+				continue
+			}
+			due := ticket.ExpiresAt.Add(-refreshBefore)
+			if !due.After(now) {
+				continue // Already queued or deferred; do not spin on a past deadline.
+			}
+			if candidate := due.Sub(now); candidate < wait {
+				wait = candidate
+			}
+		}
+		account.Mu().RUnlock()
+	}
+	if wait < 0 {
+		return 0
+	}
+	return wait
 }
 
 func (h *CodexTurnStateHarvester) refreshSettings(ctx context.Context) error {
@@ -463,10 +545,14 @@ func (h *CodexTurnStateHarvester) refresh(ctx context.Context) {
 		return
 	}
 	now := time.Now()
+	eligibleAccounts := 0
+	dueTickets := 0
+	queuedTickets := 0
 	for _, account := range h.store.Accounts() {
 		if !isNativeCodexOAuth(account) || !account.IsAvailable() {
 			continue
 		}
+		eligibleAccounts++
 		// Keep learned concrete models eligible even after their ticket expires.
 		models := append([]string(nil), cfg.ProbeModels...)
 		account.Mu().RLock()
@@ -490,8 +576,14 @@ func (h *CodexTurnStateHarvester) refresh(ctx context.Context) {
 			if ticket := account.CodexTurnStateTicketInjection(model, cfg.TargetLength, now); ticket != "" && !h.ticketNeedsRefresh(account, model, now, cfg) {
 				continue
 			}
-			h.enqueueProbe(codexTurnStateProbeKey{accountID: account.ID(), model: strings.ToLower(model)}, now)
+			dueTickets++
+			if h.enqueueProbe(codexTurnStateProbeKey{accountID: account.ID(), model: strings.ToLower(model)}, now) {
+				queuedTickets++
+			}
 		}
+	}
+	if dueTickets > 0 {
+		log.Printf("[codex-turn-state] 定时刷新扫描完成: eligible_accounts=%d probe_models=%d due=%d queued=%d deferred=%d", eligibleAccounts, len(cfg.ProbeModels), dueTickets, queuedTickets, dueTickets-queuedTickets)
 	}
 }
 
@@ -529,9 +621,9 @@ func (h *CodexTurnStateHarvester) probeEligible(key codexTurnStateProbeKey) bool
 	return true
 }
 
-func (h *CodexTurnStateHarvester) enqueueProbe(key codexTurnStateProbeKey, now time.Time) {
+func (h *CodexTurnStateHarvester) enqueueProbe(key codexTurnStateProbeKey, now time.Time) bool {
 	if key.accountID <= 0 || key.model == "" || !h.probeEligible(key) {
-		return
+		return false
 	}
 	h.queueMu.Lock()
 	state := h.states[key]
@@ -541,18 +633,20 @@ func (h *CodexTurnStateHarvester) enqueueProbe(key codexTurnStateProbeKey, now t
 	}
 	if h.queued[key] || h.inflight[key] || (!state.NextAttempt.IsZero() && now.Before(state.NextAttempt)) {
 		h.queueMu.Unlock()
-		return
+		return false
 	}
 	h.queued[key] = true
 	state.Queued = true
 	h.queueMu.Unlock()
 	select {
 	case h.tasks <- key:
+		return true
 	default:
 		h.queueMu.Lock()
 		delete(h.queued, key)
 		state.Queued = false
 		h.queueMu.Unlock()
+		return false
 	}
 }
 
@@ -577,6 +671,7 @@ func (h *CodexTurnStateHarvester) runProbeTask(ctx context.Context, key codexTur
 	}
 	state.Queued = false
 	state.InFlight = true
+	state.Attempts++
 	h.inflight[key] = true
 	h.queueMu.Unlock()
 	defer func() {
@@ -595,6 +690,7 @@ func (h *CodexTurnStateHarvester) runProbeTask(ctx context.Context, key codexTur
 	state.LastAttempt = time.Now()
 	h.queueMu.Unlock()
 	h.probed.Add(1)
+	startedAt := time.Now()
 	err := h.probe(ctx, account, key.model, cfg)
 	h.queueMu.Lock()
 	if err == nil {
@@ -608,11 +704,18 @@ func (h *CodexTurnStateHarvester) runProbeTask(ctx context.Context, key codexTur
 		state.LastError = codexTurnStateProbeError(err)
 		log.Printf("[codex-turn-state] account=%d model=%s failures=%d next_attempt=%s error=%s", key.accountID, key.model, state.Failures, state.NextAttempt.UTC().Format(time.RFC3339), state.LastError)
 	}
+	failures := state.Failures
+	nextAttempt := state.NextAttempt
+	state.LastDurationMs = time.Since(startedAt).Milliseconds()
+	attempts := state.Attempts
+	lastDurationMs := state.LastDurationMs
 	h.queueMu.Unlock()
 	if err == nil {
 		h.succeeded.Add(1)
+		log.Printf("[codex-turn-state] 票据刷新成功: account=%d model=%s attempt=%d elapsed_ms=%d expires_in=%ds", account.DBID, key.model, attempts, lastDurationMs, cfg.TTLSeconds)
 	} else {
 		h.failed.Add(1)
+		log.Printf("[codex-turn-state] 票据刷新失败: account=%d model=%s attempt=%d elapsed_ms=%d failures=%d next_attempt=%s error=%v", account.DBID, key.model, attempts, lastDurationMs, failures, nextAttempt.UTC().Format(time.RFC3339), err)
 	}
 }
 
@@ -679,7 +782,7 @@ func (h *CodexTurnStateHarvester) recordTicket(account *auth.Account, model, sta
 	}
 	// An echoed opaque value is not a newly minted ticket. Extending its TTL
 	// here indefinitely postpones proactive refresh on busy accounts.
-	if existing, ok := account.CodexTurnStateTickets[model]; ok && existing.State == state {
+	if existing, ok := account.CodexTurnStateTickets[model]; ok && existing.State == state && source != "probe" {
 		account.Mu().Unlock()
 		return
 	}
@@ -776,9 +879,13 @@ func CodexTurnStateRuntimeStatus() any {
 				}
 				h.queueMu.Lock()
 				if probeState := h.states[key]; probeState != nil {
-					item.LastAttempt, item.LastSuccess, item.LastError = probeState.LastAttempt, probeState.LastSuccess, probeState.LastError
+					item.LastAttempt, item.LastSuccess, item.NextAttempt = probeState.LastAttempt, probeState.LastSuccess, probeState.NextAttempt
+					item.Attempts, item.Failures, item.LastDurationMs = probeState.Attempts, probeState.Failures, probeState.LastDurationMs
+					item.Queued, item.InFlight, item.LastError = probeState.Queued, probeState.InFlight, probeState.LastError
 					if probeState.InFlight {
 						item.State = "refreshing"
+					} else if probeState.Queued && item.State != "ready" {
+						item.State = "queued"
 					}
 				}
 				h.queueMu.Unlock()
@@ -788,6 +895,29 @@ func CodexTurnStateRuntimeStatus() any {
 		}
 	}
 	return status
+}
+
+// CodexTurnStateProbeStatuses returns a copy of probe metadata for one account.
+// It is safe for the account response builder to call concurrently with probes.
+func CodexTurnStateProbeStatuses(accountID int64) map[string]CodexTurnStateProbeSnapshot {
+	result := make(map[string]CodexTurnStateProbeSnapshot)
+	h := activeCodexTurnStateHarvester.Load()
+	if h == nil || accountID <= 0 {
+		return result
+	}
+	h.queueMu.Lock()
+	defer h.queueMu.Unlock()
+	for key, state := range h.states {
+		if key.accountID != accountID || state == nil {
+			continue
+		}
+		result[key.model] = CodexTurnStateProbeSnapshot{
+			Queued: state.Queued, InFlight: state.InFlight, Attempts: state.Attempts,
+			Failures: state.Failures, NextAttempt: state.NextAttempt, LastAttempt: state.LastAttempt,
+			LastSuccess: state.LastSuccess, LastDurationMs: state.LastDurationMs, LastError: state.LastError,
+		}
+	}
+	return result
 }
 
 func TriggerCodexTurnStateProbe(accountID int64, model string) bool {
@@ -865,6 +995,10 @@ func (h *CodexTurnStateHarvester) fireProbe(ctx context.Context, account *auth.A
 		return "", 0, &codexTurnStateStageError{stage: "proxy/upstream_request", err: err}
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", resp.StatusCode, fmt.Errorf("upstream probe status=%d request_id=%s body=%q", resp.StatusCode, strings.TrimSpace(resp.Header.Get("x-request-id")), strings.TrimSpace(string(body)))
+	}
 	return strings.TrimSpace(resp.Header.Get(codexTurnStateHeader)), resp.StatusCode, nil
 }
 

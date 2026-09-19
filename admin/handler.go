@@ -12046,6 +12046,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 				ProbeIntervalSeconds: ticketSettings.ProbeIntervalSeconds, AttemptTimeoutSeconds: ticketSettings.AttemptTimeoutSeconds,
 				Concurrency: ticketSettings.Concurrency, PreserveExisting: ticketSettings.PreserveExisting, FailClosed: ticketSettings.FailClosed,
 			})
+			proxy.WakeCodexTurnStateHarvester()
 		}
 		if req.SessionSlotBufferSeconds != nil {
 			h.store.SetSessionSlotBuffer(time.Duration(sessionSlotBufferSeconds) * time.Second)

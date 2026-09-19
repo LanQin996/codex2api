@@ -31,54 +31,50 @@ func codexTurnStateTicketStatuses(row *database.AccountRow, runtimeAccount *auth
 		}
 		runtimeAccount.Mu().RUnlock()
 	}
-	diagnostics := proxy.CodexTurnStateProbeDiagnostics(row.ID)
-	for _, model := range cfg.ProbeModels {
-		model = strings.ToLower(strings.TrimSpace(model))
-		if cfg.ModelManaged(model) && !strings.Contains(model, "*") {
-			if tickets == nil {
-				tickets = make(map[string]auth.CodexTurnStateTicket)
-			}
-			if _, ok := tickets[model]; !ok {
-				tickets[model] = auth.CodexTurnStateTicket{}
-			}
-		}
-	}
-	for model := range diagnostics {
-		if cfg.ModelManaged(model) {
-			if tickets == nil {
-				tickets = make(map[string]auth.CodexTurnStateTicket)
-			}
-			if _, ok := tickets[model]; !ok {
-				tickets[model] = auth.CodexTurnStateTicket{}
-			}
-		}
-	}
+	probeStatuses := proxy.CodexTurnStateProbeStatuses(row.ID)
 	now := time.Now()
 	ready := 0
-	items := make([]codexTurnStateTicketStatus, 0, len(tickets))
-	for model, ticket := range tickets {
-		state := "expired"
-		if ticket.Valid(now, cfg.TargetLength) {
+	models := make(map[string]struct{}, len(tickets)+len(cfg.ProbeModels)+len(probeStatuses))
+	for model := range tickets {
+		models[strings.ToLower(strings.TrimSpace(model))] = struct{}{}
+	}
+	for _, model := range cfg.ProbeModels {
+		if model = strings.ToLower(strings.TrimSpace(model)); model != "" && cfg.ModelManaged(model) {
+			models[model] = struct{}{}
+		}
+	}
+	for model := range probeStatuses {
+		models[strings.ToLower(strings.TrimSpace(model))] = struct{}{}
+	}
+	items := make([]codexTurnStateTicketStatus, 0, len(models))
+	for model := range models {
+		ticket, hasTicket := tickets[model]
+		state := "missing"
+		if hasTicket && ticket.Valid(now, cfg.TargetLength) {
 			state = "ready"
 			ready++
+		} else if hasTicket {
+			state = "expired"
 		}
-		item := codexTurnStateTicketStatus{Model: model, State: state, CapturedAt: ticket.CapturedAt, ExpiresAt: ticket.ExpiresAt}
+		item := codexTurnStateTicketStatus{Model: model, State: state, Length: ticket.Length, CapturedAt: ticket.CapturedAt, ExpiresAt: ticket.ExpiresAt}
 		if state == "ready" {
 			item.RemainingSeconds = max(0, int64(time.Until(ticket.ExpiresAt).Seconds()))
+			item.NextAttempt = ticket.ExpiresAt.Add(-time.Duration(cfg.RefreshBeforeSeconds) * time.Second)
 		}
-		if ticket.State == "" {
-			item.State = "missing"
-		}
-		if diagnostic, ok := diagnostics[model]; ok {
-			item.LastAttempt, item.LastSuccess, item.NextAttempt, item.LastError = diagnostic.LastAttempt, diagnostic.LastSuccess, diagnostic.NextAttempt, diagnostic.LastError
-			if diagnostic.InFlight {
+		if probeState, ok := probeStatuses[model]; ok {
+			item.LastAttempt, item.LastSuccess = probeState.LastAttempt, probeState.LastSuccess
+			item.Attempts, item.Failures, item.LastDurationMs = probeState.Attempts, probeState.Failures, probeState.LastDurationMs
+			item.Queued, item.InFlight, item.LastError = probeState.Queued, probeState.InFlight, probeState.LastError
+			if !probeState.NextAttempt.IsZero() {
+				item.NextAttempt = probeState.NextAttempt
+			}
+			if probeState.InFlight {
 				item.State = "refreshing"
-			} else if diagnostic.Queued {
+			} else if probeState.Queued && item.State != "ready" {
 				item.State = "queued"
-			} else if diagnostic.LastError != "" && state != "ready" {
-				item.State = "failed"
 			}
 		}
+
 		items = append(items, item)
 	}
 	sort.Slice(items, func(i, j int) bool { return items[i].Model < items[j].Model })

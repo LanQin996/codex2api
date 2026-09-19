@@ -464,14 +464,20 @@ export interface AccountRow {
 }
 
 export interface CodexTurnStateTicketStatus {
-  next_attempt?: string
   model: string
+  length?: number
   state: 'ready' | 'expired' | 'refreshing' | 'missing' | string
   captured_at?: string
   expires_at?: string
   remaining_seconds?: number
   last_attempt?: string
   last_success?: string
+  next_attempt?: string
+  attempts?: number
+  failures?: number
+  last_duration_ms?: number
+  queued?: boolean
+  in_flight?: boolean
   last_error?: string
 }
 

@@ -44,6 +44,7 @@ import {
 } from "@/components/ui/sheet";
 import { formatBeijingTime, formatRelativeTime } from "../utils/time";
 import { formatLongUsageWindowLabel, getAccountStatusBadgeStatus } from "../lib/usageFormat";
+import { formatCodexTurnStateCountdown } from "../lib/codexTurnState";
 
 function isFutureTime(value?: string): boolean {
   if (!value) return false;
@@ -177,6 +178,74 @@ function MetricCard({
       </div>
       <div className="min-w-0 text-sm text-foreground">{children}</div>
     </div>
+  );
+}
+
+function CodexTurnStateTicketDetails({ account }: { account: AccountRow }) {
+  const { t } = useTranslation();
+  const [now, setNow] = useState(() => Date.now());
+  const tickets = account.codex_turn_state_tickets ?? [];
+
+  useEffect(() => {
+    if (!account.codex_turn_state_auto_enabled || tickets.length === 0) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [account.codex_turn_state_auto_enabled, tickets.length]);
+
+  if (!account.codex_turn_state_auto_enabled || tickets.length === 0) return null;
+  const stateLabel = (state: string) => {
+    switch (state) {
+      case "ready": return t("accounts.codexTurnStateStateReady");
+      case "refreshing": return t("accounts.codexTurnStateStateRefreshing");
+      case "queued": return t("accounts.codexTurnStateStateQueued");
+      case "expired": return t("accounts.codexTurnStateStateExpired");
+      default: return t("accounts.codexTurnStateStateMissing");
+    }
+  };
+  const durationLabel = (milliseconds?: number) => {
+    if (!milliseconds || milliseconds <= 0) return "-";
+    return milliseconds >= 1000
+      ? `${(milliseconds / 1000).toFixed(1)}s`
+      : `${milliseconds}ms`;
+  };
+
+  return (
+    <Section title={t("accounts.codexTurnStateStatus")}>
+      <div className="space-y-2 rounded-xl border border-border bg-card p-3">
+        {tickets.map((ticket) => {
+          const expiresAt = ticket.expires_at ? Date.parse(ticket.expires_at) : NaN;
+          const remainingSeconds = Number.isFinite(expiresAt)
+            ? Math.max(0, Math.ceil((expiresAt - now) / 1000))
+            : 0;
+          const remaining = Number.isFinite(expiresAt) && expiresAt > now
+            ? formatCodexTurnStateCountdown(remainingSeconds * 1000)
+            : "-";
+          return (
+            <div key={ticket.model} className="rounded-lg border border-border/70 bg-muted/20 px-2.5 py-2.5">
+              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                <span className="font-mono text-xs font-semibold">{ticket.model}</span>
+                <span className={`rounded-md px-1.5 py-0.5 text-[11px] font-medium ${ticket.state === "ready" ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300" : ticket.state === "refreshing" || ticket.state === "queued" ? "bg-amber-500/10 text-amber-700 dark:text-amber-300" : "bg-red-500/10 text-red-700 dark:text-red-300"}`}>
+                  {stateLabel(ticket.state)}{ticket.state === "refreshing" || ticket.state === "queued" ? ` · ${t("accounts.codexTurnStateAttempts", { count: ticket.attempts ?? 0 })}` : ""}
+                </span>
+              </div>
+              <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px] text-muted-foreground">
+                <span>{t("accounts.codexTurnStateExpiresAt")}</span>
+                <span className="text-right font-mono text-foreground">{ticket.expires_at ? formatBeijingTime(ticket.expires_at) : "-"}</span>
+                <span>{t("accounts.codexTurnStateRemaining")}</span>
+                <span className="text-right font-mono text-foreground">{remaining}</span>
+                <span>{t("accounts.codexTurnStateAcquireDuration")}</span>
+                <span className="text-right font-mono text-foreground">{durationLabel(ticket.last_duration_ms)}</span>
+                <span>{t("accounts.codexTurnStateNextAttempt")}</span>
+                <span className="text-right font-mono text-foreground">{ticket.next_attempt ? formatBeijingTime(ticket.next_attempt) : "-"}</span>
+                <span>{t("accounts.codexTurnStateAttemptsLabel")}</span>
+                <span className="text-right font-mono text-foreground">{ticket.attempts ?? 0}</span>
+              </div>
+              {ticket.last_error ? <div className="mt-2 break-words text-[11px] text-red-600 dark:text-red-300">{ticket.last_error}</div> : null}
+            </div>
+          );
+        })}
+      </div>
+    </Section>
   );
 }
 
@@ -524,6 +593,8 @@ export default function AccountDetailSheet({
             </Section>
 
             {providerSlot}
+
+            <CodexTurnStateTicketDetails account={account} />
 
             {!isGrok ? <Section
               title={t("accounts.modelCooldownPolicy")}

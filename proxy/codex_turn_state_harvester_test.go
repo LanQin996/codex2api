@@ -235,3 +235,50 @@ func TestCodexTurnStateRaceCancelsLosers(t *testing.T) {
 		t.Fatalf("state=%s err=%v active=%d", state, err, h.active.Load())
 	}
 }
+
+func TestCodexTurnStateProbeRenewsSameTicket(t *testing.T) {
+	h, account := ticketHarvesterFixture(t)
+	old := time.Now().Add(-time.Minute)
+	account.CodexTurnStateTickets["gpt-test"] = auth.CodexTurnStateTicket{State: "gAAAAAtest", Length: len("gAAAAAtest"), CapturedAt: old, ExpiresAt: old}
+	h.recordTicket(account, "gpt-test", "gAAAAAtest", "probe", true)
+	got := account.CodexTurnStateTickets["gpt-test"]
+	if !got.CapturedAt.After(old) || !got.ExpiresAt.After(time.Now()) {
+		t.Fatal("same probe ticket not renewed")
+	}
+	select {
+	case <-h.persist:
+	default:
+		t.Fatal("renewal not persisted")
+	}
+}
+
+func TestWakeCodexTurnStateHarvesterIsNonBlocking(t *testing.T) {
+	h := NewCodexTurnStateHarvester(nil, nil)
+	activeCodexTurnStateHarvester.Store(h)
+	t.Cleanup(func() { activeCodexTurnStateHarvester.CompareAndSwap(h, nil) })
+
+	WakeCodexTurnStateHarvester()
+	select {
+	case <-h.wake:
+	default:
+		t.Fatal("WakeCodexTurnStateHarvester did not deliver a wake signal")
+	}
+
+	// A second signal must not block when the harvester has not consumed the
+	// first one; the buffered channel coalesces settings updates.
+	WakeCodexTurnStateHarvester()
+}
+
+func TestCodexTurnStateRefreshDeadlineBeforeScan(t *testing.T) {
+	h, account := ticketHarvesterFixture(t)
+	now := time.Now()
+	cfg := CurrentCodexTurnStateTicketConfig()
+	account.CodexTurnStateTickets["gpt-test"] = auth.CodexTurnStateTicket{ExpiresAt: now.Add(610 * time.Second)}
+	if got := h.nextRefreshWait(cfg, now, time.Hour); got != 10*time.Second {
+		t.Fatalf("wait=%s", got)
+	}
+	account.CodexTurnStateTickets["gpt-test"] = auth.CodexTurnStateTicket{ExpiresAt: now.Add(599 * time.Second)}
+	if got := h.nextRefreshWait(cfg, now, 6*time.Second); got != 6*time.Second {
+		t.Fatalf("past deadline caused spin: %s", got)
+	}
+}
