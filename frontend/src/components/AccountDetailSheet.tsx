@@ -25,6 +25,7 @@ import {
 import { useTranslation } from "react-i18next";
 import type { AccountGroup, AccountHealthBucket, AccountRow } from "../types";
 import AccountHealthBar from "./AccountHealthBar";
+import AccountQuotaEstimate from "./AccountQuotaEstimate";
 import ChannelLogo from "./ChannelLogo";
 import ModelLogo from "./ModelLogo";
 import StatusBadge from "./StatusBadge";
@@ -772,6 +773,7 @@ export default function AccountDetailSheet({
                       <div>
                         {longWindowLabel}: {d7 !== null ? `$${d7}` : "—"}
                       </div>
+                      <AccountQuotaEstimate account={account} />
                     </div>
                   )}
                 </MetricCard>

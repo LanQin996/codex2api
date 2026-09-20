@@ -213,6 +213,7 @@ import {
 import { useTranslation } from "react-i18next";
 import AccountUsageModal from "../components/AccountUsageModal";
 import AccountHealthBar from "../components/AccountHealthBar";
+import AccountQuotaEstimate from "../components/AccountQuotaEstimate";
 import AccountDetailSheet from "../components/AccountDetailSheet";
 import RequestCountPills, {
   CountBreakdownTooltip,
@@ -14834,7 +14835,7 @@ function BilledCell({
       {showAPIBalance && <APIAccountBalanceBadge accountId={account.id} />}
       {(visibleH5 !== null || d7 !== null) && (
         <span
-          className="account-billed-gateway inline-flex items-center gap-1 whitespace-nowrap rounded-md bg-slate-500/10 px-1.5 py-0.5 font-mono text-[11px] tabular-nums text-slate-700 ring-1 ring-inset ring-slate-500/20 dark:text-slate-300"
+          className="account-billed-gateway inline-flex items-start gap-1 whitespace-nowrap rounded-md bg-slate-500/10 px-1.5 py-0.5 font-mono text-[11px] tabular-nums text-slate-700 ring-1 ring-inset ring-slate-500/20 dark:text-slate-300"
           title={t("accounts.billedGatewayHint")}
         >
           <Wallet className="size-3 shrink-0" aria-hidden />
@@ -14846,9 +14847,12 @@ function BilledCell({
           )}
           {visibleH5 !== null && d7 !== null && <span className="account-billed-divider"> / </span>}
           {d7 !== null && (
-            <span className="account-billed-window whitespace-nowrap">
-              <span className="account-billed-window__label">{longLabel}: </span>
-              <span className="account-billed-window__value">${d7}</span>
+            <span className="account-billed-period inline-flex min-w-0 max-w-full flex-col gap-1">
+              <span className="account-billed-window whitespace-nowrap">
+                <span className="account-billed-window__label">{longLabel}: </span>
+                <span className="account-billed-window__value">${d7}</span>
+              </span>
+              <AccountQuotaEstimate account={account} />
             </span>
           )}
         </span>

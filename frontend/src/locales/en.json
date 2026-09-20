@@ -1134,6 +1134,8 @@
     "searchPlaceholder": "Search email, domain, or name…",
     "usage5h": "5h",
     "usage7d": "7d",
+    "usageQuotaEstimate": "Est. total ${{amount}}",
+    "usageQuotaEstimateHint": "{{window}} full-quota estimate = current-cycle account cost ÷ used fraction. Based only on this gateway's records, not an official quota; less accurate at low usage.",
     "resetIn": "Reset: {{time}}",
     "usageReqUnit": "req",
     "usageTokUnit": "tok",

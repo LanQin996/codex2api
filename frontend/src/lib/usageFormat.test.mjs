@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  estimateLongUsageWindowUSD,
   getAccountStatusBadgeStatus,
   isOfficialCostHiddenAccount,
   isOfficialCostTooNew,
@@ -13,6 +14,72 @@ import {
   supportsOfficialUsage,
   isWorkspaceCreditHardStop,
 } from "./usageFormat.ts";
+
+const estimateNow = Date.parse("2026-09-20T12:00:00Z");
+const estimateAccount = {
+  usage_percent_7d: 14,
+  billed_7d: 87.59,
+  reset_7d_at: "2026-09-27T12:00:00Z",
+};
+
+test("long-window estimate extrapolates current-cycle account cost to full quota", () => {
+  assert.equal(estimateLongUsageWindowUSD(estimateAccount, estimateNow).toFixed(2), "625.64");
+  assert.equal(
+    estimateLongUsageWindowUSD({ ...estimateAccount, usage_percent_7d: 100 }, estimateNow),
+    87.59,
+  );
+  assert.equal(
+    estimateLongUsageWindowUSD({ ...estimateAccount, usage_percent_7d: 12.5, billed_7d: 10 }, estimateNow),
+    80,
+  );
+  assert.equal(
+    estimateLongUsageWindowUSD({
+      ...estimateAccount,
+      usage_7d_detail: { account_billed: 500, user_billed: 1000 },
+      official_usd: 999,
+      official_usd_7d: 999,
+    }, estimateNow).toFixed(2),
+    "625.64",
+  );
+});
+
+test("long-window estimate hides missing, zero, invalid and overflowing samples", () => {
+  assert.equal(estimateLongUsageWindowUSD({}, estimateNow), null);
+  for (const percent of [undefined, null, 0, -1, 101, NaN, Infinity, "14"]) {
+    assert.equal(
+      estimateLongUsageWindowUSD({ ...estimateAccount, usage_percent_7d: percent }, estimateNow),
+      null,
+    );
+  }
+  for (const billed of [undefined, null, 0, -1, NaN, Infinity, "87.59"]) {
+    assert.equal(
+      estimateLongUsageWindowUSD({ ...estimateAccount, billed_7d: billed }, estimateNow),
+      null,
+    );
+  }
+  assert.equal(
+    estimateLongUsageWindowUSD({ ...estimateAccount, billed_7d: Number.MAX_VALUE }, estimateNow),
+    null,
+  );
+});
+
+test("long-window estimate requires a current reset window and preserves monthly windows", () => {
+  for (const reset of [undefined, null, "", "invalid", "2026-09-19T12:00:00Z", "2026-09-20T12:00:00Z"]) {
+    assert.equal(
+      estimateLongUsageWindowUSD({ ...estimateAccount, reset_7d_at: reset }, estimateNow),
+      null,
+    );
+  }
+  assert.equal(
+    estimateLongUsageWindowUSD({
+      ...estimateAccount,
+      usage_window_7d_kind: "monthly",
+      usage_window_7d_seconds: 30 * 86400,
+      reset_7d_at: "2026-10-01T12:00:00Z",
+    }, estimateNow).toFixed(2),
+    "625.64",
+  );
+});
 
 test("usage reload accepts either optional usage window as sampled", () => {
   assert.equal(needsUsageReload({ status: "active" }), true);

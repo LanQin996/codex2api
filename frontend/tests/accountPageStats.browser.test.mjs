@@ -20,11 +20,18 @@ after(async () => {
   await server?.close()
 })
 
-async function openAccounts({ detailedRow = false } = {}) {
-  const page = await browser.newPage({ viewport: { width: 1440, height: 1000 } })
+async function openAccounts({
+  detailedRow = false,
+  billed = 7.11,
+  accountOverrides = {},
+  lang = 'en',
+  pageMode = 'personal',
+  viewport = { width: 1440, height: 1000 },
+} = {}) {
+  const page = await browser.newPage({ viewport })
   const errors = []
   page.on('pageerror', error => errors.push(error.message))
-  const state = { billed: 7.11, requests: 1, polls: 0, lists: 0, fail: false, hold: null, ids: [] }
+  const state = { billed, requests: 1, polls: 0, lists: 0, fail: false, hold: null, ids: [] }
   const account = {
     id: 1, name: 'Billing fixture', email: 'billing@example.test',
     plan_type: 'plus', status: 'active', enabled: true, locked: false,
@@ -33,6 +40,7 @@ async function openAccounts({ detailedRow = false } = {}) {
     created_at: '2026-09-01T12:00:00Z', updated_at: '2026-09-20T12:00:00Z',
     tags: [], groups: [], success_count: 1, error_count: 0,
     ...(detailedRow ? { billed_5h: 7.11, billed_7d: 7.11 } : {}),
+    ...accountOverrides,
   }
   await page.route('**/api/**', async route => {
     const url = new URL(route.request().url())
@@ -67,16 +75,16 @@ async function openAccounts({ detailedRow = false } = {}) {
     if (pathname === '/accounts/health-bars') return json({ buckets: {} })
     return json({})
   })
-  await page.addInitScript(() => {
-    localStorage.setItem('lang', 'en')
+  await page.addInitScript(({ lang, pageMode }) => {
+    localStorage.setItem('lang', lang)
     localStorage.setItem('admin_key', 'fixture-key')
     localStorage.setItem('codex2api:first_setup_review_done_v1', '1')
     localStorage.setItem('codex2api:accounts:analysis-visible', 'false')
-    localStorage.setItem('codex2api:accounts:page-mode', 'personal')
-  })
+    localStorage.setItem('codex2api:accounts:page-mode', pageMode)
+  }, { lang, pageMode })
   await page.clock.install({ time: new Date('2026-09-20T12:00:00Z') })
   await page.goto(baseURL + '/admin/accounts')
-  await page.locator('.account-billed-window__value').getByText('$7.11', { exact: true }).first().waitFor()
+  await page.locator('.account-billed-window__value').getByText(`$${billed.toFixed(2)}`, { exact: true }).first().waitFor()
   await page.clock.pauseAt(new Date('2026-09-20T12:01:00Z'))
   // Let any poll fired by pauseAt finish before changing the fixture.
   await page.waitForTimeout(100)
@@ -95,12 +103,15 @@ test('visible page refreshes costs without reloading the account list, including
   const { page, state, errors } = await openAccounts({ detailedRow: true })
   try {
     const lists = state.lists
+    assert.equal(await page.locator('.account-usage-estimate').textContent(), 'Est. total $35.55')
     state.billed = 9.42
     await page.clock.fastForward(10000)
     await expectCost(page, '$9.42')
+    assert.equal(await page.locator('.account-usage-estimate').textContent(), 'Est. total $47.10')
     state.billed = 0
     await page.clock.fastForward(10000)
     await expectCost(page, '$0.00')
+    assert.equal(await page.locator('.account-usage-estimate').count(), 0)
     assert.equal(state.lists, lists, 'cost refresh must not scan/reload the whole account pool')
     assert.ok(state.ids.every(ids => ids === '1'), 'only query visible account IDs')
     assert.deepEqual(errors, [])
@@ -160,9 +171,100 @@ test('open account details follow refreshed page stats rather than the old detai
     state.billed = 21.23
     await page.clock.fastForward(10000)
     await page.locator('[role="dialog"]').getByText('7d: $21.23', { exact: true }).waitFor()
+    const estimate = page.locator('[role="dialog"] .account-usage-estimate')
+    assert.equal(await estimate.textContent(), 'Est. total $106.15')
+    assert.equal(await estimate.locator('..').getByText('7d: $21.23', { exact: true }).count(), 1)
+    assert.equal(await page.locator('[role="dialog"] .account-usage-cell .account-usage-estimate').count(), 0)
     assert.deepEqual(errors, [])
   } finally {
     await page.close()
+  }
+})
+
+test('7d estimate sits beneath its cost, not the progress bar, on desktop and narrow cards', async () => {
+  const { page, errors } = await openAccounts({
+    billed: 87.59,
+    lang: 'zh',
+    viewport: { width: 393, height: 1000 },
+    accountOverrides: {
+      usage_percent_5h: null,
+      reset_5h_at: undefined,
+      usage_percent_7d: 14,
+      official_usd: 999,
+    },
+  })
+  try {
+    const estimate = page.locator('.account-usage-estimate')
+    assert.equal(await estimate.textContent(), '预计满额 $625.64')
+    assert.match(await estimate.getAttribute('title'), /7d.*本周期账号成本.*已用比例/)
+    const period = page.locator('.account-billed-period').filter({ has: estimate })
+    assert.equal(await period.getByText('7d:', { exact: true }).count(), 1)
+    assert.equal(await page.locator('.account-usage-cell .account-usage-estimate').count(), 0)
+    assert.equal(await page.getByRole('progressbar', { name: '7d', exact: true }).count(), 1)
+    for (const width of [1440, 393, 320]) {
+      await page.setViewportSize({ width, height: 1000 })
+      const estimateBox = await estimate.boundingBox()
+      const cellBox = await page.locator('.account-billed-cell').boundingBox()
+      const amountBox = await period.locator('.account-billed-window').boundingBox()
+      assert.ok(estimateBox.x >= cellBox.x - 1)
+      assert.ok(estimateBox.x + estimateBox.width <= cellBox.x + cellBox.width + 1)
+      assert.ok(estimateBox.y >= amountBox.y + amountBox.height - 1)
+    }
+    assert.deepEqual(errors, [])
+  } finally {
+    await page.close()
+  }
+})
+
+test('the table groups the long-window estimate with its cost and keeps usage bars unchanged', async () => {
+  const { page, errors } = await openAccounts({ pageMode: 'pool' })
+  try {
+    const estimate = page.locator('table .account-billed-cell .account-usage-estimate')
+    assert.equal(await estimate.textContent(), 'Est. total $35.55')
+    assert.equal(await estimate.locator('..').getByText('7d:', { exact: true }).count(), 1)
+    assert.equal(await page.locator('table .account-usage-cell .account-usage-estimate').count(), 0)
+    assert.equal(await page.locator('table').getByRole('progressbar', { name: '5h', exact: true }).count(), 1)
+    assert.equal(await page.locator('table').getByRole('progressbar', { name: '7d', exact: true }).count(), 1)
+    assert.deepEqual(errors, [])
+  } finally {
+    await page.close()
+  }
+})
+
+test('spark accounts preserve the monthly window label on the estimate', async () => {
+  const { page } = await openAccounts({
+    lang: 'zh-TW',
+    accountOverrides: {
+      plan_type: 'pro',
+      usage_percent_5h: null,
+      reset_5h_at: undefined,
+      usage_percent_spark: 5,
+      usage_window_7d_kind: 'monthly',
+      usage_window_7d_seconds: 30 * 86400,
+    },
+  })
+  try {
+    assert.equal(await page.getByRole('progressbar', { name: 'spark', exact: true }).count(), 1)
+    assert.equal(await page.getByRole('progressbar', { name: '30d', exact: true }).count(), 1)
+    assert.equal(await page.locator('.account-usage-estimate').textContent(), '預計滿額 $35.55')
+    assert.match(await page.locator('.account-usage-estimate').getAttribute('title'), /^30d /)
+  } finally {
+    await page.close()
+  }
+})
+
+test('zero or missing usage and expired windows do not show a misleading estimate', async () => {
+  for (const accountOverrides of [
+    { usage_percent_7d: 0 },
+    { usage_percent_7d: null },
+    { reset_7d_at: '2026-09-19T12:00:00Z' },
+  ]) {
+    const { page } = await openAccounts({ accountOverrides })
+    try {
+      assert.equal(await page.locator('.account-usage-estimate').count(), 0)
+    } finally {
+      await page.close()
+    }
   }
 })
 

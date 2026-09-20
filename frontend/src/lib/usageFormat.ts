@@ -16,6 +16,31 @@ export function formatLongUsageWindowLabel(account: {
   return '7d'
 }
 
+// billed_7d 按账号当前重置周期汇总；usage_7d_detail 是滚动七天，
+// official_usd 是累计结算，不能混用它们推算本周期满额成本。
+export function estimateLongUsageWindowUSD(
+  account: {
+    usage_percent_7d?: number | null
+    billed_7d?: number | null
+    reset_7d_at?: string | null
+  },
+  now = Date.now(),
+): number | null {
+  const percent = account.usage_percent_7d
+  const billed = account.billed_7d
+  const resetAt = account.reset_7d_at ? Date.parse(account.reset_7d_at) : NaN
+  if (
+    typeof percent !== 'number' || !Number.isFinite(percent) ||
+    percent <= 0 || percent > 100 ||
+    typeof billed !== 'number' || !Number.isFinite(billed) || billed <= 0 ||
+    !Number.isFinite(resetAt) || resetAt <= now
+  ) {
+    return null
+  }
+  const estimate = billed / (percent / 100)
+  return Number.isFinite(estimate) ? estimate : null
+}
+
 export function formatUsageNumber(
   value?: number | null,
   showFullNumbers = false,

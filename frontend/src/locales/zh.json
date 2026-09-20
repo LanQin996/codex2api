@@ -1132,6 +1132,8 @@
     "searchPlaceholder": "搜索邮箱、域名或名称…",
     "usage5h": "5h",
     "usage7d": "7d",
+    "usageQuotaEstimate": "预计满额 ${{amount}}",
+    "usageQuotaEstimateHint": "{{window}} 满额预计 = 本周期账号成本 ÷ 已用比例。仅基于本网关记录估算，非官方额度；低用量时误差较大。",
     "resetIn": "重置: {{time}}",
     "usageReqUnit": "req",
     "usageTokUnit": "tok",

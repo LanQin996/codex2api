@@ -353,6 +353,8 @@
     }
   },
   "accounts": {
+    "usageQuotaEstimate": "預計滿額 ${{amount}}",
+    "usageQuotaEstimateHint": "{{window}} 滿額預計 = 本週期帳號成本 ÷ 已用比例。僅依本閘道紀錄估算，非官方額度；低用量時誤差較大。",
     "refreshAllUsage": "一鍵重新整理用量",
     "refreshAllUsageHint": "查詢執行池中所有支援 WHAM 的 Codex 帳號，更新 5 小時和週用量進度條。",
     "batchUsageRefreshing": "正在重新整理用量",
