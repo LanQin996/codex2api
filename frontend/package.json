@@ -11,7 +11,8 @@
     "test:svg": "node --experimental-strip-types --test tests/qualityTestSVG.browser.test.mjs",
     "typecheck": "tsc --noEmit",
     "audit:ci": "node scripts/audit-gate.mjs",
-    "test:gallery": "node --experimental-strip-types --test tests/qualityTestGallery.browser.test.mjs"
+    "test:gallery": "node --experimental-strip-types --test tests/qualityTestGallery.browser.test.mjs",
+    "test:accounts": "node --experimental-strip-types --test tests/accountPageStats.browser.test.mjs"
   },
   "dependencies": {
     "@lobehub/icons-static-svg": "^1.91.0",

@@ -331,7 +331,15 @@ export default function AccountDetailSheet({
         account.model_cooldown_backoff_effective ??
         true,
     );
-  }, [account]);
+    // Live billing updates must not reset an unsaved cooldown policy draft.
+  }, [
+    account?.id,
+    account?.model_cooldown_mode_override,
+    account?.model_cooldown_seconds_override,
+    account?.model_cooldown_seconds_effective,
+    account?.model_cooldown_backoff_override,
+    account?.model_cooldown_backoff_effective,
+  ]);
 
   useEffect(() => {
     if (!open) return;

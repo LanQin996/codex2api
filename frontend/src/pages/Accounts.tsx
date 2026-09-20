@@ -81,6 +81,7 @@ import { SUBSCRIPTION_FILTER_OPTIONS } from "../types";
 import { getErrorMessage } from "../utils/error";
 import { formatRelativeTime, formatBeijingTime } from "../utils/time";
 import { buildBatchMetadataUpdate } from "../lib/accountBatchUpdate";
+import { mergeAccountPageStats } from "../lib/accountPageStats";
 import {
   collectAccountOperationResult,
   snapshotAccountOperationResults,
@@ -2711,6 +2712,9 @@ export default function Accounts() {
   const [pagedHealthBars, setPagedHealthBars] = useState<
     Record<string, AccountHealthBucket[]>
   >({});
+  // Keep stats separate: lightweight list/live refreshes must not erase them.
+  const [accountPageStats, setAccountPageStats] = useState<Record<string, AccountPageStatsItem>>({});
+  const [pageStatsReloadToken, setPageStatsReloadToken] = useState(0);
 
   const loadAccounts = useCallback(async (_options?: LoadOptions) => {
     accountPageAbortRef.current?.abort();
@@ -2737,6 +2741,9 @@ export default function Accounts() {
           : sortKey ?? undefined,
       order: sortDir,
     }, controller.signal);
+    // A manual/silent reload may return the same IDs and cached snapshot_at.
+    // Refresh the independent billing query even when neither key changes.
+    if (!controller.signal.aborted) setPageStatsReloadToken((token) => token + 1);
     return {
       accounts: accountsResponse.accounts ?? [],
       total: accountsResponse.total,
@@ -2865,6 +2872,7 @@ export default function Accounts() {
   const refreshAccountRow = useCallback(async (id: number) => {
     const account = await api.getAccount(id);
     setDetailAccountData((current) => current?.id === id ? account : current);
+    setPageStatsReloadToken((token) => token + 1);
     setData((current) => ({
       ...current,
       accounts: current.accounts.map((item) => item.id === id ? account : item),
@@ -2926,10 +2934,8 @@ export default function Accounts() {
   // page-stats 存独立 state 并在渲染时合并:分页基础行不含成本/用量明细,
   // 若把 stats 写回 data.accounts,任何静默列表刷新都会用基础行整体覆盖,
   // 成本列在 ID 不变时永久变 "-" (issue #499)。
-  const [accountPageStats, setAccountPageStats] = useState<Record<string, AccountPageStatsItem>>({});
   // 用量弹窗里手动刷新官方统计后 bump 一次,强制重拉本页 stats——
   // 否则官方成本胶囊要等翻页/改筛选才出现,看起来像刷新没生效。
-  const [pageStatsReloadToken, setPageStatsReloadToken] = useState(0);
   const handleOfficialUsageRefreshed = useCallback(
     (patch?: { accountId: number; officialUsd: number | null }) => {
       if (patch) {
@@ -2951,32 +2957,9 @@ export default function Accounts() {
   // （Grok 账号由顶部切换后的 Grok 页单独统计与管理）。
   const allAccounts = useMemo(
     () =>
-      data.accounts.map((account) => {
-        const stats = accountPageStats[String(account.id)];
-        if (!stats) return account;
-        // 行自身已带的字段优先(如 refreshAccountRow 拉回的完整详情比
-        // 本页 stats 快照更新),page-stats 只补基础行缺失的部分。
-        // 官方结算例外：点进官方统计刷新后必须以最新快照为准，
-        // 否则行上的旧额度会挡住这次同步时间点。
-        const merged = { ...account };
-        if (merged.billed_5h == null && stats.billed_5h != null) merged.billed_5h = stats.billed_5h;
-        if (merged.billed_7d == null && stats.billed_7d != null) merged.billed_7d = stats.billed_7d;
-        const officialUsd = stats.official_usd ?? stats.official_usd_7d;
-        if (officialUsd != null) {
-          merged.official_usd = officialUsd;
-          merged.official_usd_7d = officialUsd;
-        } else if (stats.official_usage_synced) {
-          merged.official_usd = undefined;
-          merged.official_usd_7d = undefined;
-        }
-        if (stats.official_usage_synced != null) {
-          merged.official_usage_synced = stats.official_usage_synced;
-        }
-        if (!merged.usage_5h_detail && stats.usage_5h_detail) merged.usage_5h_detail = stats.usage_5h_detail;
-        if (!merged.usage_7d_detail && stats.usage_7d_detail) merged.usage_7d_detail = stats.usage_7d_detail;
-        if (!merged.usage_today_detail && stats.usage_today_detail) merged.usage_today_detail = stats.usage_today_detail;
-        return merged;
-      }),
+      data.accounts.map((account) =>
+        mergeAccountPageStats(account, accountPageStats[String(account.id)]),
+      ),
     [data.accounts, accountPageStats],
   );
   const accounts = useMemo(
@@ -3008,24 +2991,47 @@ export default function Accounts() {
   }, [accountPageIDsKey]);
 
   useEffect(() => {
+    if (providerView !== "codex") return undefined;
     if (!accountPageIDsKey) {
       setAccountPageStats({});
       return undefined;
     }
-    const controller = new AbortController();
     const ids = accountPageIDsKey.split(",").map(Number);
-    void api.getAccountPageStats(ids, controller.signal)
-      .then((response) => {
-        if (controller.signal.aborted) return;
-        setAccountPageStats(response.stats ?? {});
-      })
-      .catch((err: unknown) => {
-        if (controller.signal.aborted) return;
-        // 该请求失败时成本/用量列会静默空白,必须留痕(issue #493)。
+    let stopped = false;
+    let timer: number | undefined;
+    let controller: AbortController | undefined;
+    const poll = async () => {
+      if (stopped || controller || document.hidden) return;
+      window.clearTimeout(timer);
+      controller = new AbortController();
+      try {
+        const response = await api.getAccountPageStats(ids, controller.signal);
+        if (!stopped && !controller.signal.aborted) {
+          setAccountPageStats(response.stats ?? {});
+        }
+      } catch (err: unknown) {
+        if (stopped || controller.signal.aborted) return;
+        // Keep the last successful values on transient errors; retry next tick.
         console.warn("account page stats load failed:", err);
-      });
-    return () => controller.abort();
-  }, [accountPageIDsKey, pageStatsReloadToken]);
+      } finally {
+        controller = undefined;
+        // Poll only the visible page, after completion, never overlapping scans.
+        if (!stopped && !document.hidden) timer = window.setTimeout(poll, 10000);
+      }
+    };
+    const onVisibilityChange = () => {
+      window.clearTimeout(timer);
+      if (!document.hidden) void poll();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    void poll();
+    return () => {
+      stopped = true;
+      controller?.abort();
+      window.clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
+  }, [accountPageIDsKey, pageStatsReloadToken, providerView]);
   const officialCostReloadAttemptsRef = useRef(0);
   const missingOfficialCostKey = useMemo(
     () =>
@@ -3281,10 +3287,12 @@ export default function Accounts() {
         : (accounts.find((account) => account.id === detailAccountId) ?? null),
     [accounts, detailAccountId],
   );
-  const detailAccount =
-    detailAccountData?.id === detailAccountId
-      ? detailAccountData
-      : detailListAccount;
+  const detailAccount = useMemo(
+    () => detailAccountData?.id === detailAccountId
+      ? mergeAccountPageStats(detailAccountData, accountPageStats[String(detailAccountId)])
+      : detailListAccount,
+    [detailAccountData, detailAccountId, accountPageStats, detailListAccount],
+  );
   const detailNavIndex = useMemo(() => {
     if (detailAccountId == null) return -1;
     return sortedAccounts.findIndex((account) => account.id === detailAccountId);

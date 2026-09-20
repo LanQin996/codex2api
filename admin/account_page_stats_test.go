@@ -65,6 +65,61 @@ func waitAccountDailyUsage(t *testing.T, db *database.DB, id int64) {
 	t.Fatalf("account %d snapshot did not appear", id)
 }
 
+func TestGetAccountPageStatsReadsFreshGatewayBilling(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestAdminDB(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	id, err := db.InsertAccountWithCredentials(ctx, "billing", map[string]interface{}{
+		"refresh_token":          "rt-billing",
+		"codex_5h_used_percent":  10,
+		"codex_7d_used_percent":  20,
+		"codex_5h_reset_at":      now.Add(time.Hour).Format(time.RFC3339),
+		"codex_7d_reset_at":      now.Add(24 * time.Hour).Format(time.RFC3339),
+		"codex_usage_updated_at": now.Format(time.RFC3339),
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := auth.NewStore(db, nil, nil)
+	store.SetLazyMode(true)
+	if err := store.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	handler := &Handler{db: db, store: store}
+	key := strconv.FormatInt(id, 10)
+	initial := invokeAccountPageStats(t, handler, []int64{id})[key]
+	if initial.Billed5h == nil || *initial.Billed5h != 0 || initial.Billed7d == nil || *initial.Billed7d != 0 {
+		t.Fatalf("initial billing = %+v, want explicit zeroes", initial)
+	}
+
+	db.SetUsageLogConfig(database.UsageLogModeFull, 200, 5)
+	var firstCost float64
+	for request := int64(1); request <= 2; request++ {
+		if err := db.InsertUsageLog(ctx, &database.UsageLogInput{
+			AccountID: id, Endpoint: "/v1/responses", Model: "gpt-5.4",
+			EffectiveModel: "gpt-5.4", StatusCode: http.StatusOK,
+			InputTokens: 1000, OutputTokens: 500, TotalTokens: 1500,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		db.FlushUsageLogs()
+		stats := invokeAccountPageStats(t, handler, []int64{id})[key]
+		if stats.Billed5h == nil || stats.Billed7d == nil || *stats.Billed7d <= 0 {
+			t.Fatalf("billing after request %d = %+v, want positive costs", request, stats)
+		}
+		if request == 1 {
+			firstCost = *stats.Billed7d
+		}
+		if *stats.Billed5h != firstCost*float64(request) || *stats.Billed7d != firstCost*float64(request) {
+			t.Fatalf("billing after request %d did not reflect newly flushed logs: %+v", request, stats)
+		}
+		if stats.Usage7dDetail == nil || stats.Usage7dDetail.Requests != request {
+			t.Fatalf("usage after request %d = %+v", request, stats.Usage7dDetail)
+		}
+	}
+}
+
 func TestGetAccountPageStatsBackfillsMissingOfficialUsage(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db := newTestAdminDB(t)

@@ -1037,7 +1037,7 @@
     "billedOfficialHint": "OpenAI billed cost from local snapshots, including official-client usage outside this gateway. Upstream keeps 7 days; older history is stored locally",
     "billedOfficialPending": "Fetching official billed cost",
     "billedOfficialNoData": "No official settlement data yet — official stats can lag; the gateway re-syncs periodically",
-    "billedGatewayHint": "Cost derived from this gateway's own request logs",
+    "billedGatewayHint": "Calculated from gateway request logs and configured prices within the account's current quota cycle; updates after requests finish and logs are saved. Excludes usage outside this gateway and is not a live official bill.",
     "usageOfficialTitle": "Official billed usage",
     "usageOfficialSource": "Source:",
     "usageOfficialRetentionHint": "Upstream can be queried back about {{days}} days; older history comes from local snapshots",

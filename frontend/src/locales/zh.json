@@ -1035,7 +1035,7 @@
     "billedOfficialHint": "OpenAI 官方结算累计成本，含用户直接使用官方客户端、未经本网关的消耗；上游只留 7 天，更早的来自本地快照",
     "billedOfficialPending": "正在拉取官方结算成本",
     "billedOfficialNoData": "官方结算暂无数据：官方统计存在滞后，后台会定期自动同步",
-    "billedGatewayHint": "按本网关自身的请求日志统计的成本",
+    "billedGatewayHint": "按账号当前额度周期内的网关请求日志和配置价格计算，请求结束并写入日志后更新；不含网关外消耗，不等同于官方实时账单",
     "usageOfficialTitle": "官方结算用量",
     "usageOfficialSource": "该数据统计来源于",
     "usageOfficialRetentionHint": "上游可回溯约 {{days}} 天，更早的历史来自本地快照",
