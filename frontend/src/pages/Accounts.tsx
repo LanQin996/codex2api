@@ -9982,7 +9982,9 @@ export default function Accounts() {
                                   <strong>{ticket.model}</strong>: {t("accounts.turnStatePhase." + ticket.state, { defaultValue: ticket.state })} {ticket.length ? `(${ticket.length} ${t("accounts.turnStateLength")}${ticket.fernet_blocks ? ` / ${ticket.fernet_blocks} blocks` : ""})` : ""}
                                   {ticket.proxy_sid && <p>sid: <span className="font-mono">{ticket.proxy_sid}</span></p>}
                                   {ticket.exit_ip && <p>exit: <span className="font-mono">{ticket.exit_ip}</span></p>}
+                                  {ticket.bound !== undefined && <p>bound: <span className="font-mono">{ticket.bound ? "已绑定出口" : "无绑定出口"}</span></p>}
                                   {ticket.verified_model && <p>verified model: <span className="font-mono">{ticket.verified_model}</span></p>}
+                                  {ticket.source && <p>source: <span className="font-mono">{ticket.source}</span></p>}
                                   {ticket.last_error && <p className="text-red-600">{ticket.last_error}</p>}
                                   {ticket.last_attempt && !ticket.last_attempt.startsWith("0001") && <p>{t("accounts.turnStateLastAttempt")}: {new Date(ticket.last_attempt).toLocaleString()}</p>}
                                   {ticket.next_attempt && !ticket.next_attempt.startsWith("0001") && <p>{t("accounts.turnStateNextAttempt")}: {new Date(ticket.next_attempt).toLocaleString()}</p>}

@@ -3,6 +3,7 @@ package wsrelay
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"io"
 	"net"
@@ -21,8 +22,9 @@ import (
 // 本文件验证票据绑定出口（X-Codex-Turn-State）在 WebSocket 侧的三条不变量：
 //  1) 拨号出口进了连接池键：绑定出口的请求与无绑定出口的请求绝不共用连接与会话；
 //  2) 发送失败后的重拨走本次尝试定稿的出口（票据绑定出口），而不是调用方入参出口；
-//  3) 续链亲和（previous_response_id）完全不看出口：票据绑定出口之外的连接照样会被
-//     交回给后续请求，绑定保证在这条路径上是漏的。
+//  3) 续链亲和（previous_response_id）让位于出口绑定：有票据绑定时只接受池键出口与
+//     绑定出口一致的连接，不符就回落到常规 acquire 在绑定出口新建连接（宁可丢续链）；
+//     没有票据绑定时照旧复用原连接，亲和行为一字不变。
 
 // ==================== 夹具 ====================
 
@@ -37,10 +39,14 @@ func turnStateTestTicketValue() string {
 	return base64.URLEncoding.EncodeToString(raw)
 }
 
+// newTurnStateTestWSServer 起一个 TLS 化的 WS 测试服务器。必须 TLS：执行器按
+// CodexBaseURL 生成 wss:// 地址，夹具的拨号器只是把落点改到本服务器，握手仍是 TLS ——
+// 明文服务器会以 "first record does not look like a TLS handshake" 拒绝，让"拨到哪条出口"
+// 之外的断言全部无法进行。
 func newTurnStateTestWSServer(t *testing.T, received chan<- string) *httptest.Server {
 	t.Helper()
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
@@ -65,22 +71,30 @@ func newTurnStateTestWSServer(t *testing.T, received chan<- string) *httptest.Se
 
 func dialTurnStateTestWSServer(t *testing.T, server *httptest.Server) *websocket.Conn {
 	t.Helper()
-	wsURL := "ws" + strings.TrimPrefix(server.URL, "http")
-	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	wsURL := "wss" + strings.TrimPrefix(server.URL, "https")
+	dialer := &websocket.Dialer{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}
+	conn, _, err := dialer.Dial(wsURL, nil)
 	if err != nil {
 		t.Fatalf("dial test websocket server: %v", err)
 	}
 	return conn
 }
 
-// seedTurnStateConnection 按"某条出口"手工造一条已在池中的连接。池键的代理段就是这条
-// 连接实际拨号用的出口，口径与 createConnection 一致（manager.go:1232）。
+// turnStateTestServerAddr 返回测试 WS 服务器的 host:port，即夹具拨号器的落点。
+func turnStateTestServerAddr(server *httptest.Server) string {
+	return strings.TrimPrefix(server.URL, "https://")
+}
+
+// seedTurnStateConnection 按"某条出口"手工造一条已在池中的连接。池键的代理段（以及
+// WsConnection 记录的池键出口）就是这条连接所属的出口，口径与 createConnection 一致
+// （manager.go:1262 一带：poolKey 第 4 段与 wc.poolKeyProxyURL 同源同值）。
 func seedTurnStateConnection(t *testing.T, manager *Manager, account *auth.Account, wsURL, sessionKey, egress string, conn *websocket.Conn) *WsConnection {
 	t.Helper()
 	session := NewSession(account.ID(), manager)
 	session.SetConnected(true)
 	wc := NewWsConnection(conn, session, wsURL)
 	wc.PoolKey = manager.poolKey(account.ID(), wsURL, sessionKey, egress)
+	wc.poolKeyProxyURL = strings.TrimSpace(egress)
 	manager.connections.Store(wc.PoolKey, wc)
 	manager.sessions.Store(wc.PoolKey, session)
 	return wc
@@ -101,6 +115,8 @@ func (d *turnStateTestDialer) install(manager *Manager) {
 	dialerCopy := *manager.dialer
 	dialerCopy.NetDialContext = d.dial
 	dialerCopy.HandshakeTimeout = 5 * time.Second
+	// 落点是自签证书的 TLS 测试服务器，握手必须放行它。只影响本夹具装出来的 dialer。
+	dialerCopy.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
 	manager.dialer = &dialerCopy
 }
 
@@ -212,7 +228,7 @@ func TestCodexTurnStateBoundEgressSeparatesWsPoolConnections(t *testing.T) {
 	server := newTurnStateTestWSServer(t, nil)
 	dialer := &turnStateTestDialer{
 		proxyAddr:  "bound-egress.test:3128",
-		serverAddr: strings.TrimPrefix(server.URL, "http://"),
+		serverAddr: turnStateTestServerAddr(server),
 	}
 	manager := NewManager()
 	t.Cleanup(manager.Stop)
@@ -220,7 +236,9 @@ func TestCodexTurnStateBoundEgressSeparatesWsPoolConnections(t *testing.T) {
 	manager.probeFunc = func(*WsConnection) bool { return true }
 
 	account := &auth.Account{DBID: 42, AccessToken: "token-123"}
-	wsURL := "ws://upstream.test/responses"
+	// wss:// 而非 ws://：落点是 TLS 测试服务器，明文握手会被它按 "HTTP request to an HTTPS
+	// server" 拒掉；拨号地址（代理/直连目标）与池键不因此改变。
+	wsURL := "wss://upstream.test/responses"
 	boundProxy := "http://" + dialer.proxyAddr
 	ctx := context.Background()
 
@@ -272,18 +290,18 @@ func TestCodexTurnStateBoundEgressSeparatesWsPoolConnections(t *testing.T) {
 // ==================== (a) 发送失败后的重拨出口 ====================
 
 // TestCodexTurnStateSendFailureReconnectKeepsTicketBoundEgress 验证：本次尝试被票据绑定到
-// boundProxy 时，首条连接发送失败后的重拨落在 boundProxy 的连接池键上（重拨拨的就是这条
-// 出口），而不是调用方入参出口，也不是续链亲和取回的那条旧出口连接。
+// boundProxy 时，续链亲和取回的连接首发失败后的重拨落在 boundProxy 上（重拨拨的就是这条
+// 出口），而不是调用方入参出口。（出口与绑定不符的续链连接根本不会被取回，见 (d) 的用例。）
 //
-// 夹具体现两个出口：续链亲和绑定的连接建在 egress-old 上（socket 已死 → 首发必失败），
-// 绑定出口池键下预置一条活连接。代码若在重拨处用错出口变量，就会去别的池键找连接 → 必然
-// 触发一次真实拨号（被 dialer 记录）→ 断言失败。
+// 夹具里续链亲和绑定的连接建在 boundProxy 上、socket 已死 → 首发必失败，池里没有可复用
+// 的活连接。代码若在重拨处用错出口变量，拨号就会落在 caller-egress 而不是 bound-egress，
+// 断言直接失败。
 func TestCodexTurnStateSendFailureReconnectKeepsTicketBoundEgress(t *testing.T) {
 	received := make(chan string, 4)
 	server := newTurnStateTestWSServer(t, received)
 	dialer := &turnStateTestDialer{
 		proxyAddr:  "bound-egress.test:3128",
-		serverAddr: strings.TrimPrefix(server.URL, "http://"),
+		serverAddr: turnStateTestServerAddr(server),
 	}
 
 	manager := NewManager()
@@ -300,19 +318,11 @@ func TestCodexTurnStateSendFailureReconnectKeepsTicketBoundEgress(t *testing.T) 
 		t.Fatalf("buildWebsocketURL: %v", err)
 	}
 
-	// 续链亲和绑定的连接：建在 egress-old 出口上，socket 已死。session.ID 与生产一致
-	// 等于自己的池槽号，重拨会以"实际槽位 + 本次定稿出口"重新取连。
-	oldEgress := "http://egress-old.test:8080"
-	deadConn := seedTurnStateConnection(t, manager, account, wsURL, "base#0", oldEgress, newClosedTestWebsocketConn(t))
+	// 续链亲和绑定的连接：建在票据绑定出口上（出口一致才会被取回），socket 已死。session.ID
+	// 与生产一致等于自己的池槽号，重拨会以"实际槽位 + 本次定稿出口"重新取连。
+	deadConn := seedTurnStateConnection(t, manager, account, wsURL, "base#0", boundProxy, newClosedTestWebsocketConn(t))
 	deadConn.session.ID = "base#0"
-	if deadConn.PoolKey == manager.poolKey(account.ID(), wsURL, "base#0", boundProxy) {
-		t.Fatal("fixture: 续链连接必须在与绑定出口不同的池键下")
-	}
 	manager.BindResponseConn("resp_chain", deadConn, "base#0", account.ID(), "key-A")
-
-	// 绑定出口池键（同一槽位 + 票据绑定出口）下的活连接：重拨应当落到这里复用。
-	liveConn := seedTurnStateConnection(t, manager, account, wsURL, "base#0", boundProxy, dialTurnStateTestWSServer(t, server))
-	liveKey := liveConn.PoolKey
 
 	headers := http.Header{}
 	headers.Set("X-Codex-Turn-State", state)
@@ -328,8 +338,12 @@ func TestCodexTurnStateSendFailureReconnectKeepsTicketBoundEgress(t *testing.T) 
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
-	if got := dialer.recorded(); len(got) != 0 {
-		t.Fatalf("重拨没有复用票据绑定出口池键下的连接，而是拨号到了 %v", got)
+	// 重拨必须拨本次尝试定稿的绑定出口：拨到 caller-egress 时记录到的地址就是另一个。
+	if got := dialer.recorded(); len(got) != 1 || got[0] != dialer.proxyAddr {
+		t.Fatalf("重拨 dials = %v, want exactly [%s]: 重拨必须走票据绑定出口", got, dialer.proxyAddr)
+	}
+	if wsResp.conn == deadConn {
+		t.Fatal("重拨复用了那条已死的续链连接")
 	}
 	select {
 	case payload := <-received:
@@ -337,28 +351,26 @@ func TestCodexTurnStateSendFailureReconnectKeepsTicketBoundEgress(t *testing.T) 
 			t.Fatalf("帧体 = %s, want previous_response_id 续链请求", payload)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("绑定出口池键下的连接没有收到任何帧")
+		t.Fatal("重拨出来的连接没有收到任何帧")
 	}
-	if _, ok := manager.connections.Load(deadConn.PoolKey); ok {
+	if current, ok := manager.connections.Load(deadConn.PoolKey); ok && current == deadConn {
 		t.Fatal("首发失败的续链连接应当已被丢弃")
-	}
-	if _, ok := manager.connections.Load(liveKey); !ok {
-		t.Fatal("绑定出口池键下的连接应当仍在池中")
 	}
 }
 
-// ==================== (d) 续链亲和不看出口 ====================
+// ==================== (d) 续链亲和必须让位于票据绑定出口 ====================
 
-// TestCodexTurnStatePreferredConnectionIgnoresTicketBoundEgress 验证续链亲和会绕过出口绑定：
+// TestCodexTurnStatePreferredConnectionRequiresBoundEgress 验证出口不符时续链亲和让位：
 // 本次尝试被票据绑定到 boundProxy，但 previous_response_id 指向的连接建在 egress-old 上，
-// AcquirePreferredConnection 按 (responseID, accountID, apiKey) 命中后直接返回它 —— 请求从
-// egress-old 出去，一个字节都没走 boundProxy（记录到的拨号数为 0）。
-func TestCodexTurnStatePreferredConnectionIgnoresTicketBoundEgress(t *testing.T) {
+// AcquirePreferredConnection 因出口不符拒回该连接 —— 请求回落到常规 acquire，在绑定出口
+// 池键上新建连接（记录到恰好一次到 boundProxy 的拨号），帧体仍带 previous_response_id
+// （让位丢的是"命中原连接"的机会，不是续链语义本身）。
+func TestCodexTurnStatePreferredConnectionRequiresBoundEgress(t *testing.T) {
 	received := make(chan string, 4)
 	server := newTurnStateTestWSServer(t, received)
 	dialer := &turnStateTestDialer{
 		proxyAddr:  "bound-egress.test:3128",
-		serverAddr: strings.TrimPrefix(server.URL, "http://"),
+		serverAddr: turnStateTestServerAddr(server),
 	}
 
 	manager := NewManager()
@@ -397,8 +409,86 @@ func TestCodexTurnStatePreferredConnectionIgnoresTicketBoundEgress(t *testing.T)
 	if err != nil {
 		t.Fatalf("request failed: %v", err)
 	}
+	// 出口不符 → 偏好连接被拒 → 必须在绑定出口上新建连接，且拨的就是绑定出口。
+	if got := dialer.recorded(); len(got) != 1 || got[0] != dialer.proxyAddr {
+		t.Fatalf("dials = %v, want exactly [%s]: 出口不符必须丢偏好连接、改建在绑定出口上的连接", got, dialer.proxyAddr)
+	}
+	if wsResp.conn == nil || wsResp.conn == oldConn {
+		t.Fatalf("请求仍落在 egress-old 那条连接上：出口绑定被偏好连接绕过")
+	}
+	if !strings.Contains(wsResp.conn.PoolKey, dialer.proxyAddr) {
+		t.Fatalf("请求落到的池键 = %q, want 含绑定出口 %s", wsResp.conn.PoolKey, dialer.proxyAddr)
+	}
+	if wsResp.conn.poolKeyProxyURL != boundProxy {
+		t.Fatalf("连接记录的池键出口 = %q, want %q", wsResp.conn.poolKeyProxyURL, boundProxy)
+	}
+	// 被拒的偏好连接原样留在池里：它仍能服务与它同出口的请求。
+	if current, ok := manager.connections.Load(oldConn.PoolKey); !ok || current != oldConn {
+		t.Fatal("出口不符被拒的偏好连接被连带销毁了")
+	}
+	// 续链 ID 照旧上送：让位的只是复用原连接，不是续链语义。
+	select {
+	case payload := <-received:
+		if !strings.Contains(payload, "resp_chain") {
+			t.Fatalf("帧体 = %s, want previous_response_id 续链请求", payload)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("绑定出口上的新连接没有收到任何帧")
+	}
+}
+
+// TestCodexTurnStatePreferredConnectionReusedWithoutTicketBinding 是本组断言的反证：没有
+// 票据绑定（requiredProxyURL 为空）时续链亲和一字不变 —— 原连接照旧被复用，拨号数为 0，
+// 请求仍从 egress-old 出去。出口判断不得成为常规续链的回归。
+func TestCodexTurnStatePreferredConnectionReusedWithoutTicketBinding(t *testing.T) {
+	received := make(chan string, 4)
+	server := newTurnStateTestWSServer(t, received)
+	dialer := &turnStateTestDialer{
+		proxyAddr:  "bound-egress.test:3128",
+		serverAddr: turnStateTestServerAddr(server),
+	}
+
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	dialer.install(manager)
+	manager.probeFunc = func(*WsConnection) bool { return true }
+
+	// 显式关掉票据注入：本用例走的是"没有绑定出口"的路径。
+	previous := proxy.CurrentCodexTurnStateTicketConfig()
+	t.Cleanup(func() { proxy.SetCodexTurnStateTicketConfig(previous) })
+	proxy.SetCodexTurnStateTicketConfig(&proxy.CodexTurnStateTicketConfig{
+		Enabled: false, PreserveExisting: false, RefreshBeforeSeconds: 600,
+	})
+
+	account := &auth.Account{DBID: 42, AccountID: "acct-42", AccessToken: "token-123"}
+
+	wsURL, err := buildWebsocketURL(proxy.CodexBaseURL + CodexWsEndpoint)
+	if err != nil {
+		t.Fatalf("buildWebsocketURL: %v", err)
+	}
+
+	// 产出 resp_chain 的连接仍然活着，且它记录的池键出口与入参出口不同。
+	oldEgress := "http://egress-old.test:8080"
+	oldConn := seedTurnStateConnection(t, manager, account, wsURL, "base#0", oldEgress, dialTurnStateTestWSServer(t, server))
+	manager.BindResponseConn("resp_chain", oldConn, "base#0", account.ID(), "key-A")
+
+	body := []byte(`{"model":"gpt-5.4","input":"hi","previous_response_id":"resp_chain"}`)
+
+	wsResp, boundInCtx, err := executeTurnStateRequest(t, manager, account, body, "session-1", "http://caller-egress.test:8080", "key-A", http.Header{})
+	if wsResp != nil {
+		defer wsResp.Close()
+	}
+	if boundInCtx != "" {
+		t.Fatalf("夹具没做到无票据绑定：注入侧定稿的绑定出口 = %q", boundInCtx)
+	}
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
 	if got := dialer.recorded(); len(got) != 0 {
-		t.Fatalf("dials = %v, want none: 续链亲和不该为绑定出口新建连接", got)
+		t.Fatalf("dials = %v, want none: 无票据绑定时续链亲和必须照旧复用原连接", got)
+	}
+	if wsResp.conn != oldConn {
+		t.Fatal("无票据绑定的续链请求没有复用产出连接")
 	}
 	select {
 	case payload := <-received:
@@ -407,9 +497,5 @@ func TestCodexTurnStatePreferredConnectionIgnoresTicketBoundEgress(t *testing.T)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("egress-old 上的续链连接没有收到帧")
-	}
-	boundKey := manager.poolKey(account.ID(), wsURL, "session-1", boundProxy)
-	if _, ok := manager.connections.Load(boundKey); ok {
-		t.Fatalf("绑定出口 %s 的池键下不该出现连接", boundProxy)
 	}
 }

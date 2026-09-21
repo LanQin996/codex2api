@@ -470,6 +470,8 @@ export interface CodexTurnStateTicketStatus {
   proxy_sid?: string
   exit_ip?: string
   verified_model?: string
+  source?: string
+  bound?: boolean
   state: 'ready' | 'expired' | 'refreshing' | 'missing' | string
   captured_at?: string
   expires_at?: string

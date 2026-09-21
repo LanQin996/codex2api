@@ -17,6 +17,7 @@ import (
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
+	"github.com/codex2api/internal/egressip"
 	"github.com/google/uuid"
 )
 
@@ -860,8 +861,31 @@ func (h *CodexTurnStateHarvester) probe(ctx context.Context, account *auth.Accou
 	if err != nil {
 		return err
 	}
-	h.recordTicketWithBinding(account, model, winner.state, "probe", true, winner.proxyURL, winner.sid, winner.verifiedModel, winner.exitIP)
+	h.publishProbeWinner(ctx, account, model, winner)
 	return nil
+}
+
+// publishProbeWinner 是探针的收尾：出口 IP 只在这里、只对验证通过的 winner 出口查一次
+// （64 个并发 attempt 共用同一个 winner，不会各自去打回显端点），查询失败一律忽略，绝不
+// 改变探针成败。proxyURL 含凭据，只用于拨号，绝不写进日志、用量日志或 admin JSON。
+func (h *CodexTurnStateHarvester) publishProbeWinner(ctx context.Context, account *auth.Account, model string, winner verifiedCodexTurnStateProbe) {
+	winner.exitIP = codexTurnStateExitIP(ctx, winner.proxyURL)
+	h.recordTicketWithBinding(account, model, winner.state, "probe", true, winner.proxyURL, winner.sid, winner.verifiedModel, winner.exitIP)
+}
+
+// codexTurnStateExitIP 在铸造票据的那条出口上查一次出口 IP：只有它允许离开本进程，
+// 代理 URL（含账号密码）不出现在返回值、日志或错误里。任何失败都只返回空串——票据本身
+// 已经铸造并验证成功，出口 IP 只是给运营者核对"是不是同一个 IP"的展示信息。
+func codexTurnStateExitIP(ctx context.Context, proxyURL string) string {
+	proxyURL = strings.TrimSpace(proxyURL)
+	if proxyURL == "" {
+		return ""
+	}
+	ip, err := egressip.Lookup(ctx, proxyURL)
+	if err != nil || ip == "" {
+		return ""
+	}
+	return ip
 }
 
 func responseModelMatches(requested, actual string) bool {

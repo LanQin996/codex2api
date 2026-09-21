@@ -53,6 +53,13 @@ type WsConnection struct {
 	// 连接池键
 	PoolKey string
 
+	// poolKeyProxyURL 是创建本连接时写进池键第 4 段的出口值（createConnection 里
+	// effectiveProxyURL(account, proxyOverride) 定稿的 proxyURL），用于续链亲和
+	// 判断"这条连接出自哪条出口"。刻意记录池键值而非拨号值：Resin 承担出站时
+	// proxy.CodexDialProxyURL 返回空、拨号直连反代地址，但池键仍保留该出口，
+	// 而续链亲和按池键口径比较，两者必须同源才可能一致。
+	poolKeyProxyURL string
+
 	// 连接状态
 	state atomic.Int32
 
@@ -1255,6 +1262,9 @@ func (m *Manager) createConnection(
 	wc := NewWsConnection(conn, session, wsURL)
 	wc.account = account
 	wc.PoolKey = poolKey
+	// 池键出口与池键一并冻结：后续任何请求想复用这条连接做续链，都要先证明
+	// 自己的出口与它一致（见 AcquirePreferredConnection）。
+	wc.poolKeyProxyURL = strings.TrimSpace(proxyURL)
 	wc.upstreamUserAgent = strings.TrimSpace(headers.Get("User-Agent"))
 	wc.upstreamUserAgentKnown = true
 	wc.httpResp = resp
@@ -1416,12 +1426,21 @@ func (m *Manager) lookupResponseConn(responseID string, accountID int64, apiKey 
 }
 
 // AcquirePreferredConnection 尝试独占 response_id 绑定的原连接（续链亲和）。
-// 成功返回 (连接, pendingRequest, 池内 sessionKey)；绑定失效或连接忙时返回 nil，
-// 调用方回退到常规 acquire 路径。忙时不等待：续链上下文虽在原连接，但排队会
+// 成功返回 (连接, pendingRequest, 池内 sessionKey)；绑定失效、连接忙或出口不符时
+// 返回 nil，调用方回退到常规 acquire 路径。忙时不等待：续链上下文虽在原连接，但排队会
 // 阻塞在前一个长响应后面，且该场景（同会话并发续链）极少，退化为缓存 miss 更稳。
-func (m *Manager) AcquirePreferredConnection(responseID string, accountID int64, apiKey string) (*WsConnection, *PendingRequest, string) {
+//
+// requiredProxyURL 是本次尝试被 X-Codex-Turn-State 绑定的出口（空串 = 没有票据绑定）。
+// 非空且与绑定连接的池键出口（WsConnection.poolKeyProxyURL）不等时直接放弃偏好连接：
+// 上游按铸造出口校验票据，换出口发同一张票据必被拒收，因此宁可丢续链（上游可能回
+// previous response not found），也不换出口。回退路径的池键本就含出口，会在绑定出口上
+// 新建连接。requiredProxyURL 为空时不做任何出口判断，续链亲和与既有行为完全一致。
+func (m *Manager) AcquirePreferredConnection(responseID string, accountID int64, apiKey string, requiredProxyURL string) (*WsConnection, *PendingRequest, string) {
 	wc, sessionKey := m.lookupResponseConn(responseID, accountID, apiKey)
 	if wc == nil {
+		return nil, nil, ""
+	}
+	if required := strings.TrimSpace(requiredProxyURL); required != "" && required != wc.poolKeyProxyURL {
 		return nil, nil, ""
 	}
 	accountLock, releaseAccountLock := m.accountLock(accountID)

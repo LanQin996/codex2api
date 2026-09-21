@@ -18,6 +18,8 @@ type codexTurnStateTicketStatus struct {
 	ProxySID         string    `json:"proxy_sid,omitempty"`
 	ExitIP           string    `json:"exit_ip,omitempty"`
 	VerifiedModel    string    `json:"verified_model,omitempty"`
+	Source           string    `json:"source,omitempty"`
+	Bound            bool      `json:"bound"`
 	State            string    `json:"state"`
 	CapturedAt       time.Time `json:"captured_at,omitempty"`
 	ExpiresAt        time.Time `json:"expires_at,omitempty"`

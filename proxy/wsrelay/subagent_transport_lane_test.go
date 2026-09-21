@@ -233,7 +233,7 @@ func TestSubagentTransportLaneKeepsPreviousResponseConnectionPriority(t *testing
 	manager.BindResponseConn("resp_parent", parent, parentLane, 7, "api-key")
 
 	poolSessionID := childLane
-	got, pending, slotKey := manager.AcquirePreferredConnection("resp_parent", 7, "api-key")
+	got, pending, slotKey := manager.AcquirePreferredConnection("resp_parent", 7, "api-key", "")
 	if got != nil {
 		poolSessionID = slotKey
 	}

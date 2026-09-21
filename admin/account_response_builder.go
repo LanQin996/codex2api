@@ -59,6 +59,7 @@ func codexTurnStateTicketStatuses(row *database.AccountRow, runtimeAccount *auth
 		item := codexTurnStateTicketStatus{
 			Model: model, State: state, Length: ticket.Length, FernetBlocks: ticket.FernetBlocks,
 			ProxySID: ticket.ProxySID, ExitIP: ticket.ExitIP, VerifiedModel: ticket.VerifiedModel,
+			Source: ticket.Source, Bound: strings.TrimSpace(ticket.ProxyURL) != "",
 			CapturedAt: ticket.CapturedAt, ExpiresAt: ticket.ExpiresAt,
 		}
 		if state == "ready" {

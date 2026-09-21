@@ -139,9 +139,11 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 
 	// 出口链路统一由 ResolveCodexWebsocketEgress 决定(Resin > 代理 > 直连):
 	// Resin 模式下 WS 地址改写为反代路径,拨号侧(createConnection)同样按它跳过代理。
+	// 票据绑定出口优先于调用方入参出口：注入侧已按票据铸造出口定稿，这里一律照办。
+	ticketBoundProxy := proxy.CodexTurnStateProxyFromContext(ctx)
 	effectiveProxyOverride := effectiveProxyURL(account, proxyOverride)
-	if boundProxy := proxy.CodexTurnStateProxyFromContext(ctx); boundProxy != "" {
-		effectiveProxyOverride = boundProxy
+	if ticketBoundProxy != "" {
+		effectiveProxyOverride = ticketBoundProxy
 	}
 	egress := proxy.ResolveCodexWebsocketEgress(account, wsURL, effectiveProxyOverride)
 	wsURL = egress.URL
@@ -178,6 +180,10 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	// 续链亲和：上游无服务端存储时，previous_response_id 的上下文只存活在产出
 	// 该响应的那条 WS 连接里。带续链 ID 的请求优先取回原连接（独占成功才用），
 	// 否则落到随机槽位会触发上游 "previous response not found"。
+	// 出口优先于此处的亲和：本次尝试被票据绑定出口时（ticketBoundProxy 非空），偏好
+	// 连接只在它与绑定出口一致时才可用；不一致就放弃亲和、回落到下面的常规 acquire，
+	// 在绑定出口上新建连接。运维决策是"保票据"——票据在别的出口必被上游拒收，而续链
+	// 丢了最多让上游回 previous response not found，代价更小。
 	// 同线程上的后台副请求（request_kind=memory、guardian 子代理）另成一道，
 	// 不与用户在飞轮次同键排队；Desktop 走 HTTP 时元数据只在请求体里。
 	poolSessionID := proxy.ResolveCodexWebsocketTransportSessionKeyWithBody(sessionID, ginHeaders, wsBody)
@@ -186,7 +192,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	var err2 error
 	acquireStart := time.Now()
 	if prevRespID := strings.TrimSpace(gjson.GetBytes(wsBody, "previous_response_id").String()); prevRespID != "" {
-		if pwc, ppr, slotKey := e.manager.AcquirePreferredConnection(prevRespID, account.ID(), apiKey); pwc != nil {
+		if pwc, ppr, slotKey := e.manager.AcquirePreferredConnection(prevRespID, account.ID(), apiKey, ticketBoundProxy); pwc != nil {
 			wc, pr, poolSessionID = pwc, ppr, slotKey
 		}
 	}
