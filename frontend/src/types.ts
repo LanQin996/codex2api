@@ -148,6 +148,14 @@ export type CodexClientMetadataMode = 'auto' | 'always' | 'off'
 export type CodexPassthroughMode = 'off' | 'auto' | 'always'
 /** Codex 官方出站请求的设备指纹收敛档位，默认 off（不收敛）。 */
 export type CodexFingerprintMode = 'off' | 'device' | 'session' | 'full'
+export interface AccountModelMismatch {
+  model: string
+  upstream_model: string
+  hit_count: number
+  first_seen_at?: ISODateString
+  last_seen_at?: ISODateString
+}
+
 export type ModelCooldownMode = 'off' | 'fixed' | 'adaptive'
 
 export type ResponseCacheWritePolicy = 'always' | 'on_demand'
@@ -443,6 +451,8 @@ export interface AccountRow {
     reset_at: ISODateString
     remaining_seconds: number
   }>
+  // 上游回显的 model 与实际发给上游的 model 不一致时的只读标记（仅供查看）。
+  model_mismatches?: AccountModelMismatch[]
   model_cooldown_mode_override?: ModelCooldownMode | null
   model_cooldown_seconds_override?: number | null
   model_cooldown_backoff_override?: boolean | null
@@ -3484,6 +3494,7 @@ export interface UsageLog {
   endpoint: string
   model: string
   effective_model: string
+  upstream_model?: string
   prompt_tokens: number
   completion_tokens: number
   total_tokens: number

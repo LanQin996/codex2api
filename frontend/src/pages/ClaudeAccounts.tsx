@@ -78,6 +78,7 @@ import ChannelLogo from "../components/ChannelLogo";
 import Modal from "../components/Modal";
 import PageHeader from "../components/PageHeader";
 import StatusBadge from "../components/StatusBadge";
+import { ModelMismatchBadge } from "../components/ModelMismatchBadge";
 import Pagination from "../components/Pagination";
 import AccountGroupFilterSelect, {
   EMPTY_ACCOUNT_GROUP_FILTER,
@@ -2484,6 +2485,7 @@ function ClaudeAccountRow({
             <div className="min-w-[168px] max-w-[240px] space-y-1.5">
               <div className="flex min-h-6 flex-wrap items-center gap-1.5">
                 <StatusBadge status={getAccountStatusBadgeStatus(acc)} errorMessage={acc.error_message} detail={cooldownReason} />
+                <ModelMismatchBadge account={acc} />
                 <LiveCountdown until={acc.cooldown_until} label={t("claude.resetIn")} />
                 <ClaudeConcurrencyBadge acc={acc} />
               </div>

@@ -1173,6 +1173,7 @@ func (h *Handler) Messages(c *gin.Context) {
 				InboundEndpoint: "/v1/messages", UpstreamEndpoint: upstreamEndpoint,
 				Stream: isStream, ViaWebsocket: false, AttemptIndex: attempt + 1,
 				PromptPolicyIncidentID: promptPolicyIncidentID,
+				UpstreamModel:          grokNativeUpstreamModel(c),
 			}
 			if usage != nil {
 				logInput.PromptTokens, logInput.CompletionTokens, logInput.TotalTokens = usage.PromptTokens, usage.CompletionTokens, usage.TotalTokens
@@ -1212,6 +1213,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		var firstTokenMs int
 		var usage *UsageInfo
 		var actualServiceTier string
+		var upstreamModel string
 		ttftRecorded := false
 		gotTerminal := false
 		deltaCharCount := 0
@@ -1283,6 +1285,7 @@ func (h *Handler) Messages(c *gin.Context) {
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
 					}
+					upstreamModel = keepUpstreamModel(upstreamModel, parsed)
 					gotTerminal = true
 					preContentErrorCandidate = nil
 				}
@@ -1442,6 +1445,7 @@ func (h *Handler) Messages(c *gin.Context) {
 					if tier := parsed.Get("response.service_tier").String(); tier != "" {
 						actualServiceTier = tier
 					}
+					upstreamModel = keepUpstreamModel(upstreamModel, parsed)
 					lastCompletedData = data
 					gotTerminal = true
 					return false
@@ -1613,6 +1617,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			Endpoint:               "/v1/messages",
 			Model:                  model,
 			EffectiveModel:         attemptEffectiveModel,
+			UpstreamModel:          upstreamModel,
 			StatusCode:             logStatusCode,
 			DurationMs:             totalDuration,
 			FirstTokenMs:           firstTokenMs,

@@ -174,6 +174,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			ws_acquire_ms INTEGER DEFAULT 0,
 			reasoning_effort TEXT DEFAULT '',
 			effective_model TEXT DEFAULT '',
+			upstream_model TEXT DEFAULT '',
 			inbound_endpoint TEXT DEFAULT '',
 			upstream_endpoint TEXT DEFAULT '',
 				stream INTEGER DEFAULT 0,
@@ -267,6 +268,15 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			reason TEXT DEFAULT '',
 			reset_at TIMESTAMP NOT NULL,
 			updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (account_id, model)
+		);`,
+		`CREATE TABLE IF NOT EXISTS account_model_mismatches (
+			account_id INTEGER NOT NULL,
+			model TEXT NOT NULL,
+			upstream_model TEXT NOT NULL DEFAULT '',
+			hit_count INTEGER NOT NULL DEFAULT 0,
+			first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 			PRIMARY KEY (account_id, model)
 		);`,
 		`CREATE TABLE IF NOT EXISTS system_settings (
@@ -566,6 +576,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"usage_logs", "ws_acquire_ms", "INTEGER DEFAULT 0"},
 		{"usage_logs", "reasoning_effort", "TEXT DEFAULT ''"},
 		{"usage_logs", "effective_model", "TEXT DEFAULT ''"},
+		{"usage_logs", "upstream_model", "TEXT DEFAULT ''"},
 		{"usage_logs", "inbound_endpoint", "TEXT DEFAULT ''"},
 		{"usage_logs", "upstream_endpoint", "TEXT DEFAULT ''"},
 		{"usage_logs", "stream", "INTEGER DEFAULT 0"},

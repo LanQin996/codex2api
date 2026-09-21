@@ -153,8 +153,9 @@ func TestUsageLogCompactionStatesRoundTripAndFilter(t *testing.T) {
 }
 
 func TestUsageLogInsertColumnCountIncludesCompactionHistory(t *testing.T) {
-	// 50 legacy + 2 cache-write + 4 trace + 3 image-token + 3 user image-billing + 1 ultra + 2 turn-state fields.
-	const want = 65
+	// 50 legacy + 2 cache-write + 4 trace + 3 image-token + 3 user image-billing
+	// + 1 ultra + 2 turn-state + 1 upstream-model fields.
+	const want = 66
 	if usageLogInsertColumnCount != want {
 		t.Fatalf("usageLogInsertColumnCount = %d, want %d", usageLogInsertColumnCount, want)
 	}

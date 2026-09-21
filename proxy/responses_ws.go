@@ -1111,6 +1111,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	outputBuffer := newWSPromptOutputBuffer(h.promptFilterConfigForRequest(c))
 	var usage *UsageInfo
 	var actualServiceTier string
+	var upstreamModel string
 	ttftRecorded := false
 	// contentTokenSeen 用严格判定（与宽松首字统计无关）。宽松口径下
 	// codex.rate_limits / metadata 会置位 ttftRecorded；本机 2004 还开了
@@ -1215,6 +1216,7 @@ func (h *Handler) streamResponsesWSUpstream(
 			if tier := parsed.Get("response.service_tier").String(); tier != "" {
 				actualServiceTier = tier
 			}
+			upstreamModel = keepUpstreamModel(upstreamModel, parsed)
 			if eventType == "response.completed" || eventType == "response.incomplete" {
 				completedResponsePayload = append([]byte(nil), data...)
 			}
@@ -1503,6 +1505,7 @@ func (h *Handler) streamResponsesWSUpstream(
 		Endpoint:               "/v1/responses",
 		Model:                  model,
 		EffectiveModel:         logEffectiveModel,
+		UpstreamModel:          upstreamModel,
 		StatusCode:             outcome.logStatusCode,
 		DurationMs:             totalDuration,
 		FirstTokenMs:           firstTokenMs,

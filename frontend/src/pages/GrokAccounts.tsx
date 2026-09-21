@@ -88,6 +88,7 @@ import Pagination from "../components/Pagination";
 import StateShell from "../components/StateShell";
 import ChannelLogo from "../components/ChannelLogo";
 import StatusBadge from "../components/StatusBadge";
+import { ModelMismatchBadge } from "../components/ModelMismatchBadge";
 import { mergeAccountLiveState, useAccountLiveState } from "../hooks/useAccountLiveState";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -4115,6 +4116,7 @@ function GrokAccountCard({
                 status={disabled ? "paused" : (account.status ?? "unknown")}
                 errorMessage={account.error_message}
               />
+              <ModelMismatchBadge account={account} />
               {(account.active_requests ?? 0) > 0 && (
                 <span
                   className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
@@ -4519,6 +4521,7 @@ function GrokAccountTableRow({
                 status={disabled ? "paused" : (account.status ?? "unknown")}
                 errorMessage={account.error_message}
               />
+              <ModelMismatchBadge account={account} />
               {(account.active_requests ?? 0) > 0 && (
                 <span
                   className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"

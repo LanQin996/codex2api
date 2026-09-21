@@ -939,6 +939,10 @@ export const api = {
     request<{ message: string; cleared: number }>(`/accounts/${id}/model-cooldowns`, {
       method: 'DELETE',
     }),
+  clearAccountModelMismatches: (id: number) =>
+    request<{ message: string; cleared: number }>(`/accounts/${id}/model-mismatches`, {
+      method: 'DELETE',
+    }),
   // usage_refreshed 表示重置后的用量探针是否在响应前跑完；false 时调用方应稍后补刷一次。
   resetCredits: (id: number) =>
     request<{

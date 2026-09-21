@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- **The model reported by the upstream response is parsed, logged and compared.** The `model` echoed in the upstream response body (`response.model` on Responses SSE/WebSocket terminal events, top-level `model` on non-stream bodies and chat chunks, `message.model` on Anthropic streams) is stored in the new `usage_logs.upstream_model` column and shown next to the model in the usage log. When it differs from the model actually sent upstream (after global/account mapping; dated snapshots such as `gpt-5` → `gpt-5-2025-08-07`, provider prefixes and `-latest` aliases count as the same model), the account's model gets a read-only mark in the new `account_model_mismatches` table (upstream model, hit count, first/last seen). The mark is visible in the account list, cards and detail sheet and can be cleared there; it never affects scheduling, cooldowns or billing. Both columns/tables are created automatically on startup.
+
 ## v2.9.8 - 2026-09-16
 
 ### Features

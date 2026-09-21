@@ -24,6 +24,7 @@ import { formatUsageNumber as formatTokens } from '../lib/usageFormat'
 import { buildModelShareData, formatSharePercent, type ModelShareMetric } from '../lib/usageInsights'
 import './usage-insights.css'
 import { getUsageTokenBreakdown } from '../lib/usageTokenDisplay'
+import { isUpstreamModelMismatch } from '../lib/upstreamModelMismatch'
 import { formatBeijingTime } from '../utils/time'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
@@ -37,7 +38,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { Activity, Box, Clock, Zap, Sparkles, AlertTriangle, Search, Brain, DatabaseZap, DatabaseBackup, X, Image as ImageIcon, Info, CircleDollarSign, BarChart3, KeyRound, Route, SlidersHorizontal, ShieldAlert, RefreshCw, ChevronDown, RotateCcw, PlugZap, FlaskConical } from 'lucide-react'
+import { Activity, Box, Clock, Zap, Sparkles, AlertTriangle, Search, Brain, DatabaseZap, DatabaseBackup, X, Image as ImageIcon, Info, CircleDollarSign, BarChart3, KeyRound, Route, SlidersHorizontal, ShieldAlert, RefreshCw, ChevronDown, RotateCcw, PlugZap, FlaskConical, Shuffle } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 
@@ -2746,6 +2747,21 @@ export default function Usage() {
                                 → {log.effective_model}
                               </Badge>
                             )}
+                            {log.upstream_model && (() => {
+                              const mismatch = isUpstreamModelMismatch(log.effective_model || log.model, log.upstream_model)
+                              return (
+                                <Badge
+                                  variant="outline"
+                                  title={t(mismatch ? 'usage.upstreamModelMismatchHint' : 'usage.upstreamModelHint', { model: log.upstream_model })}
+                                  className={mismatch
+                                    ? 'text-[11px] font-medium gap-0.5 border-transparent bg-fuchsia-500/12 text-fuchsia-700 dark:bg-fuchsia-500/20 dark:text-fuchsia-300'
+                                    : 'text-[11px] font-medium border-transparent bg-muted/60 text-muted-foreground'}
+                                >
+                                  {mismatch && <Shuffle className="size-3" />}
+                                  ⇠ {log.upstream_model}
+                                </Badge>
+                              )
+                            })()}
                             {log.reasoning_effort ? (
                               <ReasoningEffortBadge effort={log.reasoning_effort} />
                             ) : null}

@@ -1182,6 +1182,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/:id/reset-status", h.ResetAccountStatus)
 	api.PATCH("/accounts/:id/model-cooldown-policy", h.UpdateAccountModelCooldownPolicy)
 	api.DELETE("/accounts/:id/model-cooldowns", h.ClearAllAccountModelCooldowns)
+	api.DELETE("/accounts/:id/model-mismatches", h.ClearAccountModelMismatches)
 	api.DELETE("/accounts/:id/model-cooldowns/:model", h.ClearAccountModelCooldown)
 	api.POST("/accounts/:id/reset-credits", h.ResetCredits)
 	api.GET("/accounts/:id/reset-credits", h.GetResetCredits)
@@ -1776,6 +1777,7 @@ type accountResponse struct {
 	ModelCooldownModeEffective    string                       `json:"model_cooldown_mode_effective"`
 	ModelCooldownSecondsEffective int                          `json:"model_cooldown_seconds_effective"`
 	ModelCooldownBackoffEffective bool                         `json:"model_cooldown_backoff_effective"`
+	ModelMismatches               []modelMismatchResponse      `json:"model_mismatches,omitempty"`
 	Enabled                       bool                         `json:"enabled"`
 	Locked                        bool                         `json:"locked"`
 	AllowedAPIKeyIDs              []int64                      `json:"allowed_api_key_ids"`
@@ -1794,6 +1796,15 @@ type modelCooldownResponse struct {
 	Reason    string `json:"reason"`
 	ResetAt   string `json:"reset_at"`
 	Remaining int64  `json:"remaining_seconds"`
+}
+
+// modelMismatchResponse 是「上游回显模型与实际请求模型不一致」的只读标记，仅供查看。
+type modelMismatchResponse struct {
+	Model         string `json:"model"`
+	UpstreamModel string `json:"upstream_model"`
+	HitCount      int64  `json:"hit_count"`
+	FirstSeenAt   string `json:"first_seen_at,omitempty"`
+	LastSeenAt    string `json:"last_seen_at,omitempty"`
 }
 
 type accountUsageWindow struct {
@@ -1943,6 +1954,8 @@ func (h *Handler) ListAccounts(c *gin.Context) {
 		))
 	}
 
+	h.attachModelMismatches(ctx, accounts, view == "page")
+
 	if view != "page" {
 		billing5hWindows := make(map[int64]time.Time)
 		billing7dWindows := make(map[int64]time.Time)
@@ -2036,6 +2049,9 @@ func (h *Handler) GetAccount(c *gin.Context) {
 
 	runtimeAccount := h.store.FindByID(id)
 	resp := h.buildAccountResponse(row, runtimeAccount, requestCounts[id], usage5h[id], usage7d[id], true)
+	single := []accountResponse{resp}
+	h.attachModelMismatches(ctx, single, true)
+	resp = single[0]
 	if runtimeAccount != nil {
 		if resetAt := runtimeAccount.GetReset5hAt(); !resetAt.IsZero() {
 			if billed, billedErr := h.db.GetAccountBilledSince(ctx, id, resetAt.Add(-5*time.Hour)); billedErr == nil {
