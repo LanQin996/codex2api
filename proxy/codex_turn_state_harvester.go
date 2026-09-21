@@ -150,6 +150,27 @@ type verifiedCodexTurnStateProbe struct {
 	exitIP        string
 }
 
+type codexTurnStateProbeStopError struct {
+	status int
+	err    error
+}
+
+func (e *codexTurnStateProbeStopError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.err != nil {
+		return e.err.Error()
+	}
+	return fmt.Sprintf("probe stopped at status=%d", e.status)
+}
+
+func (e *codexTurnStateProbeStopError) Unwrap() error { return e.err }
+
+func codexTurnStateStopStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status == http.StatusForbidden || status == http.StatusUnauthorized
+}
+
 type codexTurnStateProbeStatus struct {
 	Queued         bool
 	InFlight       bool
@@ -772,7 +793,14 @@ func (h *CodexTurnStateHarvester) runProbeTask(ctx context.Context, key codexTur
 		state.LastError = ""
 	} else {
 		state.Failures++
-		state.NextAttempt = time.Now().Add(codexTurnStateRetryInterval(cfg))
+		retryAfter := codexTurnStateRetryInterval(cfg)
+		var stopErr *codexTurnStateProbeStopError
+		if errors.As(err, &stopErr) && (stopErr.status == http.StatusTooManyRequests || stopErr.status == http.StatusForbidden) {
+			if retryAfter < time.Minute {
+				retryAfter = time.Minute
+			}
+		}
+		state.NextAttempt = time.Now().Add(retryAfter)
 		state.LastError = codexTurnStateProbeError(err)
 		log.Printf("[codex-turn-state] account=%d model=%s failures=%d next_attempt=%s error=%s", key.accountID, key.model, state.Failures, state.NextAttempt.UTC().Format(time.RFC3339), state.LastError)
 	}
@@ -818,7 +846,7 @@ func (h *CodexTurnStateHarvester) probe(ctx context.Context, account *auth.Accou
 	}
 	winner, err := h.raceVerifiedProbes(ctx, min(64, max(1, cfg.Concurrency)), func(attemptCtx context.Context) (verifiedCodexTurnStateProbe, error) {
 		var lastErr error
-		for retry := 0; retry < 3; retry++ {
+		for retry := 0; retry < 8; retry++ {
 			proxyURL, sid, err := codexTurnStateStickyProxy(cfg.HarvestProxyURL)
 			if err != nil {
 				return verifiedCodexTurnStateProbe{}, err
@@ -845,15 +873,20 @@ func (h *CodexTurnStateHarvester) probe(ctx context.Context, account *auth.Accou
 			} else {
 				lastErr = err
 			}
-			if !isTransientCodexTurnStateProbeError(lastErr) || retry == 2 {
-				return verifiedCodexTurnStateProbe{}, lastErr
+			if codexTurnStateStopStatus(status) {
+				return verifiedCodexTurnStateProbe{}, &codexTurnStateProbeStopError{status: status, err: lastErr}
 			}
-			timer := time.NewTimer(250 * time.Millisecond)
-			select {
-			case <-attemptCtx.Done():
-				timer.Stop()
-				return verifiedCodexTurnStateProbe{}, attemptCtx.Err()
-			case <-timer.C:
+			// A degraded sid cannot become healthy by replaying it. Move to a
+			// fresh sticky sid immediately; only true transport failures get a
+			// short backoff before the next candidate.
+			if isTransientCodexTurnStateProbeError(lastErr) {
+				timer := time.NewTimer(250 * time.Millisecond)
+				select {
+				case <-attemptCtx.Done():
+					timer.Stop()
+					return verifiedCodexTurnStateProbe{}, attemptCtx.Err()
+				case <-timer.C:
+				}
 			}
 		}
 		return verifiedCodexTurnStateProbe{}, lastErr

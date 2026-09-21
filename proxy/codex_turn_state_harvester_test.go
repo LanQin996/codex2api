@@ -480,3 +480,34 @@ func TestCodexTurnStatePerAccountSlots(t *testing.T) {
 		t.Fatal("slots leaked")
 	}
 }
+
+func TestCodexTurnStateStickyProxyReplacesSID(t *testing.T) {
+	template := "http://user-region-Rand-sid-oldvalue-t-120:pass@proxy.example:3010"
+	first, firstSID, err := codexTurnStateStickyProxy(template)
+	if err != nil || firstSID == "" {
+		t.Fatalf("first sticky proxy = %q sid=%q err=%v", first, firstSID, err)
+	}
+	second, secondSID, err := codexTurnStateStickyProxy(template)
+	if err != nil || secondSID == "" {
+		t.Fatalf("second sticky proxy = %q sid=%q err=%v", second, secondSID, err)
+	}
+	if firstSID == secondSID || first == second {
+		t.Fatalf("sid was not replaced: %q vs %q", first, second)
+	}
+	if strings.Contains(first, "oldvalue") || !strings.Contains(first, "-t-120:") {
+		t.Fatalf("template shape not preserved: %q", first)
+	}
+}
+
+func TestCodexTurnStateProbeStopStatus(t *testing.T) {
+	for _, status := range []int{http.StatusTooManyRequests, http.StatusForbidden, http.StatusUnauthorized} {
+		if !codexTurnStateStopStatus(status) {
+			t.Fatalf("status=%d must stop the candidate batch", status)
+		}
+	}
+	for _, status := range []int{http.StatusOK, http.StatusBadGateway, http.StatusServiceUnavailable} {
+		if codexTurnStateStopStatus(status) {
+			t.Fatalf("status=%d must not stop the candidate batch", status)
+		}
+	}
+}
