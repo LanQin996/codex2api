@@ -1223,7 +1223,15 @@ func (h *CodexTurnStateHarvester) fireProbe(ctx context.Context, account *auth.A
 
 func (h *CodexTurnStateHarvester) fireProbeWithProxy(ctx context.Context, account *auth.Account, token, model string, cfg *CodexTurnStateTicketConfig, proxyURL string) (string, int, string, error) {
 	body, _ := json.Marshal(map[string]any{"model": model, "store": false, "stream": true, "instructions": "Reply with exactly: pong", "input": []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "input_text", "text": "ping"}}}}})
-	attemptCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.AttemptTimeoutSeconds)*time.Second)
+	// Candidate scanning only needs the response headers: the turn-state header
+	// is minted before the SSE body starts. A degraded candidate that stalls
+	// must not occupy a worker for the full stream timeout, so cap the header
+	// phase separately and always close the body before moving to the next sid.
+	headerTimeout := time.Duration(cfg.AttemptTimeoutSeconds) * time.Second
+	if headerTimeout <= 0 || headerTimeout > 12*time.Second {
+		headerTimeout = 12 * time.Second
+	}
+	attemptCtx, cancel := context.WithTimeout(ctx, headerTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, CodexBaseURL+"/responses", bytes.NewReader(body))
 	if err != nil {
@@ -1242,12 +1250,17 @@ func (h *CodexTurnStateHarvester) fireProbeWithProxy(ctx context.Context, accoun
 	if err != nil {
 		return "", 0, "", &codexTurnStateStageError{stage: "proxy/upstream_request", err: err}
 	}
-	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
 		return "", resp.StatusCode, "", fmt.Errorf("upstream probe status=%d request_id=%s body=%q", resp.StatusCode, strings.TrimSpace(resp.Header.Get("x-request-id")), strings.TrimSpace(string(body)))
 	}
-	return strings.TrimSpace(resp.Header.Get(codexTurnStateHeader)), resp.StatusCode, strings.TrimSpace(resp.Header.Get("openai-model")), nil
+	state := strings.TrimSpace(resp.Header.Get(codexTurnStateHeader))
+	responseModel := strings.TrimSpace(resp.Header.Get("openai-model"))
+	// Rejecting a degraded 312 must not read the SSE stream. Closing the body
+	// tears down the connection immediately, so the worker can try a new sid.
+	_ = resp.Body.Close()
+	return state, resp.StatusCode, responseModel, nil
 }
 
 // CodexTurnStateProbeDiagnostics returns a metadata-only snapshot for one account.
@@ -1404,6 +1417,7 @@ func (h *CodexTurnStateHarvester) raceVerifiedProbes(ctx context.Context, parall
 	}
 	var winner verifiedCodexTurnStateProbe
 	var lastErr error
+	var stopErr error
 	for i := 0; i < count; i++ {
 		r := <-results
 		if r.err == nil && r.value.state != "" && winner.state == "" {
@@ -1412,11 +1426,19 @@ func (h *CodexTurnStateHarvester) raceVerifiedProbes(ctx context.Context, parall
 		}
 		if r.err != nil && !errors.Is(r.err, context.Canceled) {
 			lastErr = r.err
+			var candidateStop *codexTurnStateProbeStopError
+			if stopErr == nil && errors.As(r.err, &candidateStop) {
+				stopErr = candidateStop
+				cancel()
+			}
 		}
 	}
 	workers.Wait()
 	if winner.state != "" {
 		return winner, nil
+	}
+	if stopErr != nil {
+		return verifiedCodexTurnStateProbe{}, stopErr
 	}
 	if ctx.Err() != nil {
 		return verifiedCodexTurnStateProbe{}, ctx.Err()
