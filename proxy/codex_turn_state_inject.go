@@ -5,6 +5,7 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -30,6 +31,8 @@ const codexTurnStateMetadataKey = "x-codex-turn-state"
 type codexTurnStateInjectionKey struct{}
 type codexTurnStateProxyKey struct{}
 type codexClientModelKey struct{}
+type codexTurnStateBindingKey struct{}
+type codexAffinityKeyKey struct{}
 
 // WithCodexClientModel 记录下游请求的原始模型名，供模型名单与上游模型名一并匹配：
 // 映射改写之后两者常常不是同一个名字，而操作者填的通常是自己请求时用的那个。
@@ -50,6 +53,86 @@ func codexClientModelFromContext(ctx context.Context) string {
 	}
 	model, _ := ctx.Value(codexClientModelKey{}).(string)
 	return model
+}
+
+// CodexTurnStateBinding 是逐 attempt 可变的出口决策记录器。出站决策（注入哪个
+// turn state、走不走票据绑定出口）在 ExecuteRequest 的局部 ctx 里定稿，不可变的
+// ctx 值传不回 handler；handler 在每次尝试的 upstreamCtx 上挂一个空实例，注入代码
+// 把实际决定写进来，响应采集据此知道这次请求到底有没有走票据绑定出口——
+// 没走绑定出口的尝试绝不能拿新票据顶掉旧绑定票据，否则绑定就此丢失。
+type CodexTurnStateBinding struct {
+	mu       sync.Mutex
+	proxyURL string
+	decided  bool
+}
+
+// WithCodexTurnStateBinding 在逐 attempt 的 ctx 上挂一个新的出口决策记录器。
+func WithCodexTurnStateBinding(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, codexTurnStateBindingKey{}, &CodexTurnStateBinding{})
+}
+
+func codexTurnStateBindingFromContext(ctx context.Context) *CodexTurnStateBinding {
+	if ctx == nil {
+		return nil
+	}
+	binding, _ := ctx.Value(codexTurnStateBindingKey{}).(*CodexTurnStateBinding)
+	return binding
+}
+
+// noteCodexTurnStateEgress 记录本次尝试最终的出口决策：proxyURL 为空表示这次出站
+// 没有绑定出口（账号/分组/代理池/直连）。decided 与取值一起落定，调用方不必猜
+// "没记到"到底是没挂记录器还是真的没绑定。ctx 上没有记录器时是空操作。
+func noteCodexTurnStateEgress(ctx context.Context, proxyURL string) {
+	binding := codexTurnStateBindingFromContext(ctx)
+	if binding == nil {
+		return
+	}
+	binding.mu.Lock()
+	binding.proxyURL = strings.TrimSpace(proxyURL)
+	binding.decided = true
+	binding.mu.Unlock()
+}
+
+// CodexTurnStateBoundEgress 返回本次尝试已定稿的绑定出口。decided=false 表示
+// 没有挂记录器（该路径不产生票据采集），不可当作"这次没有绑定出口"。
+func CodexTurnStateBoundEgress(ctx context.Context) (proxyURL string, decided bool) {
+	binding := codexTurnStateBindingFromContext(ctx)
+	if binding == nil {
+		return "", false
+	}
+	binding.mu.Lock()
+	defer binding.mu.Unlock()
+	return binding.proxyURL, binding.decided
+}
+
+// codexTurnStateBoundProxy 是 CodexTurnStateBoundEgress 的单值形态。
+func codexTurnStateBoundProxy(ctx context.Context) string {
+	proxyURL, _ := CodexTurnStateBoundEgress(ctx)
+	return proxyURL
+}
+
+// WithCodexAffinityKey 把下游会话亲和键挂到逐 attempt 的 ctx 上：注入侧要据它查
+// 溯源表——客户端回带的 blob 上一次是从哪条出口下发给这个会话的。
+func WithCodexAffinityKey(ctx context.Context, key string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	key = strings.TrimSpace(key)
+	if key == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, codexAffinityKeyKey{}, key)
+}
+
+func codexAffinityKeyFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	key, _ := ctx.Value(codexAffinityKeyKey{}).(string)
+	return key
 }
 
 func withCodexTurnStateInjection(ctx context.Context, value string) context.Context {
@@ -88,18 +171,29 @@ func withCodexTurnStateProxy(ctx context.Context, value string) context.Context 
 // prepareCodexTurnStateInjection 决定并落定注入：返回携带决策的 ctx、（可能克隆的）
 // 下游头与（WS 时改写了帧体的）请求体。未配置或名单未命中时全部原样返回。
 func prepareCodexTurnStateInjection(ctx context.Context, account *auth.Account, requestBody []byte, headers http.Header, websocket bool) (context.Context, []byte, http.Header) {
+	injectedProxy := ""
 	if account == nil {
+		noteCodexTurnStateEgress(ctx, injectedProxy)
 		return ctx, requestBody, headers
 	}
 	upstreamModel := strings.TrimSpace(gjson.GetBytes(requestBody, "model").String())
 	clientModel := codexClientModelFromContext(ctx)
 	injected := ""
-	injectedProxy := ""
 	cfg := CurrentCodexTurnStateTicketConfig()
 	if cfg.PreserveExisting && headers != nil {
 		existing := observedCodexTurnState(headers.Get(codexTurnStateHeader))
 		if auth.ValidCodexTurnStateTicketValue(existing, cfg.TargetLength) {
 			injected = existing
+			// 回带值本身不带出口信息，能确定的只有"上一次向该会话下发它的那条出口"。
+			injectedProxy = codexTurnStateProxyForAffinity(codexAffinityKeyFromContext(ctx))
+			if injectedProxy == "" && cfg.Enabled && cfg.ModelManaged(clientModel, upstreamModel) {
+				// 溯源里没有出口时优先换成账号上已绑定出口的托管票据：无绑定的回带值
+				// 会把票据发到别的出口，上游按铸造出口校验必然拒收——绑定票据比无
+				// 绑定回带值更可复用，绑定出口的保证不能在这一步丢掉。
+				if ticket, ok := boundCodexTurnStateTicket(account, cfg, clientModel, upstreamModel); ok {
+					injected, injectedProxy = ticket.State, strings.TrimSpace(ticket.ProxyURL)
+				}
+			}
 		}
 	}
 	if injected == "" && cfg.Enabled && cfg.ModelManaged(clientModel, upstreamModel) {
@@ -113,8 +207,10 @@ func prepareCodexTurnStateInjection(ctx context.Context, account *auth.Account, 
 		injected = account.CodexTurnStateInjection(clientModel, upstreamModel)
 	}
 	if injected == "" {
+		noteCodexTurnStateEgress(ctx, injectedProxy)
 		return ctx, requestBody, headers
 	}
+	noteCodexTurnStateEgress(ctx, injectedProxy)
 	NoteCodexTurnStateInjected()
 	ctx = withCodexTurnStateInjection(ctx, injected)
 	ctx = withCodexTurnStateProxy(ctx, injectedProxy)
@@ -132,6 +228,22 @@ func prepareCodexTurnStateInjection(ctx context.Context, account *auth.Account, 
 		}
 	}
 	return ctx, requestBody, headers
+}
+
+// boundCodexTurnStateTicket 找账号上"已绑定出口"的托管票据：上游模型优先，其次是
+// 下游客户端模型（映射改写后两者常常不是同一个名字）。没绑定出口的票据不返回。
+func boundCodexTurnStateTicket(account *auth.Account, cfg *CodexTurnStateTicketConfig, clientModel, upstreamModel string) (auth.CodexTurnStateTicket, bool) {
+	if account == nil || cfg == nil {
+		return auth.CodexTurnStateTicket{}, false
+	}
+	now := time.Now()
+	for _, model := range []string{upstreamModel, clientModel} {
+		ticket, ok := account.CodexTurnStateTicket(model, cfg.TargetLength, now)
+		if ok && strings.TrimSpace(ticket.ProxyURL) != "" {
+			return ticket, true
+		}
+	}
+	return auth.CodexTurnStateTicket{}, false
 }
 
 // applyCodexTurnStateInjectionHeader 在账号自定义头装配之后落定注入值：自定义头不该

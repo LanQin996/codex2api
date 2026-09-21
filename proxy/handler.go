@@ -4399,7 +4399,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			// account-bound turn-state token from an attempt that is not yet known
 			// to be successful.
 			if (!isStream || !continuousRetryBuffersAttempts(continuousRetryPolicy)) && !continuousRetryDeadlineActive(c.Request.Context()) {
-				relayCodexTurnStateResponseHeader(c, affinityKey, account, resp.Header)
+				relayCodexTurnStateResponseHeader(c, affinityKey, account, resp.Header, codexTurnStateBoundProxy(upstreamCtx))
 			}
 			if isGrokNativeRouteResponse(resp) {
 				downstreamFlusher, _ := c.Writer.(http.Flusher)
@@ -4430,7 +4430,7 @@ func (h *Handler) Responses(c *gin.Context) {
 						return
 					}
 					copyGrokNativeResponseHeaders(c, resp.Header)
-					if commitErr := h.commitResponsesStreamAttempt(c, streamAttempt, affinityKey, account, resp.Header); commitErr != nil {
+					if commitErr := h.commitResponsesStreamAttempt(c, streamAttempt, affinityKey, account, resp.Header, codexTurnStateBoundProxy(upstreamCtx)); commitErr != nil {
 						if isContinuousRetryLocalFailure(commitErr) {
 							outcome = overlayContinuousRetryLocalFailure(outcome, commitErr)
 						} else {
@@ -4768,7 +4768,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					return
 				}
 				copyGrokNativeResponseHeaders(c, resp.Header)
-				if commitErr := h.commitResponsesStreamAttempt(c, streamAttempt, affinityKey, account, resp.Header); commitErr != nil {
+				if commitErr := h.commitResponsesStreamAttempt(c, streamAttempt, affinityKey, account, resp.Header, codexTurnStateBoundProxy(upstreamCtx)); commitErr != nil {
 					if isContinuousRetryLocalFailure(commitErr) {
 						outcome = overlayContinuousRetryLocalFailure(outcome, commitErr)
 					} else {
@@ -4914,6 +4914,10 @@ func (h *Handler) Responses(c *gin.Context) {
 		upstreamCtx = context.WithValue(upstreamCtx, encryptedContentSessionKey{}, sessionIdentity.affinityID)
 		upstreamCtx = WithCodexClientModel(upstreamCtx, model)
 		upstreamCtx = BindCodexTurnStateRequest(upstreamCtx, account, attemptEffectiveModel)
+		// 出口决策在 ExecuteRequest 的局部 ctx 里定稿，这里挂上逐 attempt 的记录器
+		// 与下游会话亲和键，让响应回购与回带注入都能看到"这次到底走了哪条出口"。
+		upstreamCtx = WithCodexTurnStateBinding(upstreamCtx)
+		upstreamCtx = WithCodexAffinityKey(upstreamCtx, affinityKey)
 		// 身份按 attempt 附加实际选中账号维度：account_* 门随重试换号重新匹配（issue #410）。
 		attemptIdentity := ruleIdentity.WithSelectedAccount(account, h.store)
 		upstreamCtx = WithPayloadRuleIdentity(upstreamCtx, attemptIdentity)
@@ -5137,7 +5141,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		StageCodexTurnStateResponse(upstreamCtx, resp.Header)
 
 		if !isStream || !continuousRetryBuffersAttempts(continuousRetryPolicy) {
-			relayCodexTurnStateResponseHeader(c, affinityKey, account, resp.Header)
+			relayCodexTurnStateResponseHeader(c, affinityKey, account, resp.Header, codexTurnStateBoundProxy(upstreamCtx))
 		}
 		SyncCodexUsageState(h.store, account, resp)
 		// 成功！透传响应并跟踪 TTFT / usage
@@ -5631,7 +5635,7 @@ func (h *Handler) Responses(c *gin.Context) {
 				h.store.Release(account)
 				return
 			}
-			if commitErr := h.commitResponsesStreamAttempt(c, streamAttempt, affinityKey, account, resp.Header); commitErr != nil {
+			if commitErr := h.commitResponsesStreamAttempt(c, streamAttempt, affinityKey, account, resp.Header, codexTurnStateBoundProxy(upstreamCtx)); commitErr != nil {
 				if isContinuousRetryLocalFailure(commitErr) {
 					outcome = overlayContinuousRetryLocalFailure(outcome, commitErr)
 				} else {

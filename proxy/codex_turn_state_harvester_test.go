@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -74,6 +76,117 @@ func TestCodexTurnStateExpiredLearnedModelRetries(t *testing.T) {
 	case <-h.tasks:
 	default:
 		t.Fatal("model was forgotten after expired ticket pruning")
+	}
+}
+
+// 响应回购的票据必须继承本次尝试真正使用的绑定出口：出口决策在 ExecuteRequest 的
+// 局部 ctx 里定稿，只有逐 attempt 的 CodexTurnStateBinding 能把它带回来。
+func TestCodexTurnStateResponseHarvestInheritsBoundEgress(t *testing.T) {
+	_, account := ticketHarvesterFixture(t)
+	state := testTurnStateValue(10)
+	const boundProxy = "http://user:pass@sticky.example:9000/sid-abc123-t"
+	ctx := WithCodexTurnStateBinding(BindCodexTurnStateRequest(context.Background(), account, "gpt-test"))
+	noteCodexTurnStateEgress(ctx, boundProxy)
+	StageCodexTurnStateValue(ctx, state)
+	CommitCodexTurnStateRequest(ctx)
+	ticket, ok := account.CodexTurnStateTickets["gpt-test"]
+	if !ok {
+		t.Fatal("bound response ticket was not stored")
+	}
+	if ticket.State != state || ticket.Source != "response" {
+		t.Fatalf("stored ticket = %+v", ticket)
+	}
+	if ticket.ProxyURL != boundProxy {
+		t.Fatalf("harvested ticket lost the bound egress: %q", ticket.ProxyURL)
+	}
+	if ticket.ProxySID != "abc123" {
+		t.Fatalf("harvested ticket sid = %q, want abc123", ticket.ProxySID)
+	}
+}
+
+// 没走绑定出口的尝试回购到的是无绑定票据，绝不能顶掉同模型上仍然有效的绑定票据。
+func TestCodexTurnStateResponseHarvestKeepsExistingBoundTicket(t *testing.T) {
+	_, account := ticketHarvesterFixture(t)
+	bound := testTurnStateValue(12)
+	account.CodexTurnStateTickets["gpt-test"] = auth.CodexTurnStateTicket{
+		State: bound, Length: len(bound), CapturedAt: time.Now(), ExpiresAt: time.Now().Add(time.Hour),
+		ProxyURL: "http://bound.example:9000", ProxySID: "keepme", Source: "probe",
+	}
+	ctx := WithCodexTurnStateBinding(BindCodexTurnStateRequest(context.Background(), account, "gpt-test"))
+	noteCodexTurnStateEgress(ctx, "")
+	StageCodexTurnStateValue(ctx, testTurnStateValue(10))
+	CommitCodexTurnStateRequest(ctx)
+	got, ok := account.CodexTurnStateTickets["gpt-test"]
+	if !ok {
+		t.Fatal("bound ticket was dropped")
+	}
+	if got.State != bound || got.ProxyURL != "http://bound.example:9000" || got.ProxySID != "keepme" || got.Source != "probe" {
+		t.Fatalf("unbound harvest replaced the bound ticket: %+v", got)
+	}
+}
+
+// 无绑定出口且没有既有票据时保持原行为：照常保存（无绑定的）回购票据。
+func TestCodexTurnStateResponseHarvestStoresWithoutExistingTicket(t *testing.T) {
+	_, account := ticketHarvesterFixture(t)
+	state := testTurnStateValue(10)
+	ctx := WithCodexTurnStateBinding(BindCodexTurnStateRequest(context.Background(), account, "gpt-test"))
+	noteCodexTurnStateEgress(ctx, "")
+	StageCodexTurnStateValue(ctx, state)
+	CommitCodexTurnStateRequest(ctx)
+	got, ok := account.CodexTurnStateTickets["gpt-test"]
+	if !ok {
+		t.Fatal("unbound harvest was not stored")
+	}
+	if got.State != state || got.ProxyURL != "" || got.Source != "response" {
+		t.Fatalf("stored ticket = %+v", got)
+	}
+}
+
+// 端到端：出站出口由 ExecuteRequest 内部的注入决策定稿，逐 attempt 记录器把
+// "这次走了哪条绑定出口"带回 handler，响应回购的票据带着同一份绑定落库。
+func TestCodexTurnStateHarvestKeepsBoundEgressEndToEnd(t *testing.T) {
+	_, account := ticketHarvesterFixture(t)
+	account.AccessToken = "token"
+	const boundProxy = "http://sticky.example:9000/sid-mintme"
+	injected := testTurnStateValue(10)
+	harvested := testTurnStateValue(12)
+	account.CodexTurnStateTickets["gpt-test"] = auth.CodexTurnStateTicket{
+		State: injected, Length: len(injected), ExpiresAt: time.Now().Add(time.Hour), ProxyURL: boundProxy,
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get(codexTurnStateHeader); got != injected {
+			t.Errorf("outbound turn state = %q, want the bound ticket", got)
+		}
+		w.Header().Set(codexTurnStateHeader, harvested)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer server.Close()
+	previousResin := resinCfg.Load()
+	t.Cleanup(func() { resinCfg.Store(previousResin) })
+	SetResinConfig(&ResinConfig{BaseURL: server.URL, PlatformName: "test"})
+	clientPool.Delete(fmt.Sprintf("resin|%d", account.ID()))
+
+	ctx := WithCodexTurnStateBinding(BindCodexTurnStateRequest(context.Background(), account, "gpt-test"))
+	ctx = WithCodexClientModel(ctx, "gpt-test")
+	resp, err := ExecuteRequest(ctx, account, []byte(`{"model":"gpt-test","input":"hi"}`), "", "", "api-key-1", nil, http.Header{}, false)
+	if err != nil {
+		t.Fatalf("ExecuteRequest: %v", err)
+	}
+	bound, decided := CodexTurnStateBoundEgress(ctx)
+	if !decided || bound != boundProxy {
+		t.Fatalf("bound egress = %q decided=%v, want %q", bound, decided, boundProxy)
+	}
+	StageCodexTurnStateResponse(ctx, resp.Header)
+	_ = resp.Body.Close()
+	CommitCodexTurnStateRequest(ctx)
+	ticket, ok := account.CodexTurnStateTickets["gpt-test"]
+	if !ok || ticket.State != harvested {
+		t.Fatalf("harvested ticket = %+v ok=%v", ticket, ok)
+	}
+	if ticket.ProxyURL != boundProxy || ticket.ProxySID != "mintme" {
+		t.Fatalf("harvest lost the bound egress: proxy=%q sid=%q", ticket.ProxyURL, ticket.ProxySID)
 	}
 }
 

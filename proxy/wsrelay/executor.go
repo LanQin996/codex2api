@@ -145,6 +145,9 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	}
 	egress := proxy.ResolveCodexWebsocketEgress(account, wsURL, effectiveProxyOverride)
 	wsURL = egress.URL
+	// 出口在 beginUpstreamTrace 之后才定稿（票据绑定出口 / Resin 覆盖），用量日志
+	// 按最终拨号出口重刷，否则 WS 行只会显示入参代理，看不出真实出口。
+	proxy.NoteUpstreamTraceProxy(ctx, egress.DialProxyURL, true)
 
 	// 准备请求头
 	headers := e.prepareWebsocketHeaders(accessToken, account, accountIDStr, headerSessionID, apiKey, deviceCfg, ginHeaders, wsBody)
@@ -235,7 +238,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		}
 
 		reacquireStart := time.Now()
-		wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, poolSessionID, headers, proxyOverride)
+		wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, poolSessionID, headers, effectiveProxyOverride)
 		proxy.AddWsAcquireDuration(ctx, time.Since(reacquireStart))
 		if err2 != nil {
 			return nil, err2

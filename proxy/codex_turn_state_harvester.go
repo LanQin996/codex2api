@@ -122,6 +122,11 @@ type CodexTurnStateHarvester struct {
 	failed        atomic.Uint64
 	collected     atomic.Uint64
 	injected      atomic.Uint64
+	// harvestProxyWarn* 记录上一次已告警的采集代理取值：采集代理为空时探针必然
+	// 失败，只在该取值首次出现时告警一次，避免每轮刷新刷屏。
+	harvestProxyWarnMu  sync.Mutex
+	harvestProxyWarned  string
+	harvestProxyWarnSet bool
 }
 
 const (
@@ -422,7 +427,21 @@ func CommitCodexTurnStateRequest(ctx context.Context) {
 			h.enqueueProbe(pending.key, time.Now())
 			return
 		}
-		h.recordTicket(account, pending.key.model, pending.candidate, "response", true)
+		// 本次尝试真实的出口决策：只有确实走了票据绑定出口，回购到的票据才能
+		// 继承那份绑定。
+		bound := codexTurnStateBoundProxy(ctx)
+		if bound == "" {
+			// 这次出站没走绑定出口（账号/分组/代理池/直连）。新票据同样没绑定，
+			// 拿它顶掉同模型上仍然有效的绑定票据，等于把粘性出口的保证直接丢掉；
+			// 宁可保留旧绑定票据等下一次探针刷新。
+			cfg := CurrentCodexTurnStateTicketConfig()
+			if ticket, ok := account.CodexTurnStateTicket(pending.key.model, cfg.TargetLength, time.Now()); ok && strings.TrimSpace(ticket.ProxyURL) != "" {
+				return
+			}
+			h.recordTicket(account, pending.key.model, pending.candidate, "response", true)
+			return
+		}
+		h.recordTicketWithBinding(account, pending.key.model, pending.candidate, "response", true, bound, codexTurnStateProxySID(bound), pending.responseModel, "")
 	}
 }
 
@@ -614,8 +633,29 @@ func (h *CodexTurnStateHarvester) refresh(ctx context.Context) {
 		}
 	}
 	if dueTickets > 0 {
+		h.warnHarvestProxyUnset(cfg, eligibleAccounts, dueTickets)
 		log.Printf("[codex-turn-state] 定时刷新扫描完成: eligible_accounts=%d probe_models=%d due=%d queued=%d deferred=%d", eligibleAccounts, len(cfg.ProbeModels), dueTickets, queuedTickets, dueTickets-queuedTickets)
 	}
+}
+
+// warnHarvestProxyUnset 在采集代理未配置时告警：探针一律在拨号前就被拒（不再回退
+// 直连探测），票据只会过期不会刷新。这里只如实报告，绝不静默换一条出口去探。
+func (h *CodexTurnStateHarvester) warnHarvestProxyUnset(cfg *CodexTurnStateTicketConfig, eligibleAccounts, dueTickets int) {
+	proxyURL := ""
+	if cfg != nil {
+		proxyURL = strings.TrimSpace(cfg.HarvestProxyURL)
+	}
+	if proxyURL != "" {
+		return
+	}
+	h.harvestProxyWarnMu.Lock()
+	changed := !h.harvestProxyWarnSet || h.harvestProxyWarned != proxyURL
+	h.harvestProxyWarned, h.harvestProxyWarnSet = proxyURL, true
+	h.harvestProxyWarnMu.Unlock()
+	if !changed {
+		return
+	}
+	log.Printf("[codex-turn-state] 采集代理未配置(harvest_proxy_url 为空): 无法铸造探针票据，本轮跳过 due=%d 个待刷新模型(eligible_accounts=%d)；不回退直连探测，请配置采集代理后重试", dueTickets, eligibleAccounts)
 }
 
 func (h *CodexTurnStateHarvester) pruneAccountTickets(account *auth.Account, cfg *CodexTurnStateTicketConfig, now time.Time) {
@@ -853,11 +893,24 @@ func replaceStickyProxySID(raw, sid string) string {
 		return raw
 	}
 	valueStart := start + len("sid-")
+	valueEnd := valueStart + len(codexTurnStateProxySID(raw))
+	return raw[:valueStart] + sid + raw[valueEnd:]
+}
+
+// codexTurnStateProxySID 取回粘性代理 URL 里 sid- 片段的当前取值，没有该片段返回空。
+// 响应回购的票据要记住铸造它的那条粘性出口，sid 是这条出口的粘性键。
+func codexTurnStateProxySID(raw string) string {
+	lower := strings.ToLower(raw)
+	start := strings.Index(lower, "sid-")
+	if start < 0 {
+		return ""
+	}
+	valueStart := start + len("sid-")
 	valueEnd := valueStart
 	for valueEnd < len(raw) && raw[valueEnd] != '-' && raw[valueEnd] != '@' && raw[valueEnd] != ':' {
 		valueEnd++
 	}
-	return raw[:valueStart] + sid + raw[valueEnd:]
+	return raw[valueStart:valueEnd]
 }
 
 func (h *CodexTurnStateHarvester) recordTicket(account *auth.Account, model, state, source string, enqueuePersistence bool) {

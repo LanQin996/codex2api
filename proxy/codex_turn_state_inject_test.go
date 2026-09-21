@@ -141,6 +141,69 @@ func TestPrepareCodexTurnStateInjectionRejectsDegraded312(t *testing.T) {
 	}
 }
 
+// 回带值本身不带出口信息：溯源表记着上次向该会话下发它的出口时，注入必须回到
+// 同一条出口，粘性出口绑定才算成立。
+func TestPrepareCodexTurnStateInjectionEchoUsesProvenanceEgress(t *testing.T) {
+	state := testTurnStateValue(10)
+	previous := CurrentCodexTurnStateTicketConfig()
+	t.Cleanup(func() { SetCodexTurnStateTicketConfig(previous) })
+	SetCodexTurnStateTicketConfig(&CodexTurnStateTicketConfig{Enabled: true, Models: []string{"gpt-5.5"}, TargetLength: len(state), PreserveExisting: true})
+	affinityKey := "turn-inject-provenance::api-key:1"
+	t.Cleanup(func() { codexTurnStateOrigins.Delete(affinityKey) })
+	codexTurnStateOrigins.Store(affinityKey, codexTurnStateOrigin{
+		accountID: 55, proxyURL: "http://minted.example:9000", expiresAt: time.Now().Add(time.Hour),
+	})
+
+	account := &auth.Account{DBID: 55, CodexTurnStateTickets: map[string]auth.CodexTurnStateTicket{}}
+	headers := http.Header{}
+	headers.Set(codexTurnStateHeader, state)
+	ctx := WithCodexAffinityKey(WithCodexClientModel(context.Background(), "gpt-5.5"), affinityKey)
+	ctx, _, out := prepareCodexTurnStateInjection(ctx, account, []byte(`{"model":"gpt-5.5"}`), headers, false)
+	if got := out.Get(codexTurnStateHeader); got != state {
+		t.Fatalf("echoed ticket = %q, want the echoed value", got)
+	}
+	if got := CodexTurnStateInjectionFromContext(ctx); got != state {
+		t.Fatalf("context ticket = %q, want the echoed value", got)
+	}
+	if got := CodexTurnStateProxyFromContext(ctx); got != "http://minted.example:9000" {
+		t.Fatalf("bound proxy = %q, want the provenance egress", got)
+	}
+}
+
+// 溯源里没有出口时，已绑定出口的托管票据优先于无绑定的回带值；没有绑定出口的
+// 托管票据不改变"回带值优先"的既有语义。
+func TestPrepareCodexTurnStateInjectionEchoPrefersBoundTicket(t *testing.T) {
+	echo := testTurnStateValue(10)
+	managed := testTurnStateValue(12)
+	previous := CurrentCodexTurnStateTicketConfig()
+	t.Cleanup(func() { SetCodexTurnStateTicketConfig(previous) })
+	SetCodexTurnStateTicketConfig(&CodexTurnStateTicketConfig{Enabled: true, Models: []string{"gpt-5.5"}, TargetLength: len(echo), PreserveExisting: true})
+	headers := http.Header{}
+	headers.Set(codexTurnStateHeader, echo)
+
+	bound := &auth.Account{DBID: 66, CodexTurnStateTickets: map[string]auth.CodexTurnStateTicket{
+		"gpt-5.5": {State: managed, Length: len(managed), ExpiresAt: time.Now().Add(time.Hour), ProxyURL: "http://bound.example:9000"},
+	}}
+	ctx, _, out := prepareCodexTurnStateInjection(WithCodexClientModel(context.Background(), "gpt-5.5"), bound, []byte(`{"model":"gpt-5.5"}`), headers, false)
+	if got := out.Get(codexTurnStateHeader); got != managed {
+		t.Fatalf("bound managed ticket = %q, want %q", got, managed)
+	}
+	if got := CodexTurnStateProxyFromContext(ctx); got != "http://bound.example:9000" {
+		t.Fatalf("bound proxy = %q", got)
+	}
+
+	unbound := &auth.Account{DBID: 67, CodexTurnStateTickets: map[string]auth.CodexTurnStateTicket{
+		"gpt-5.5": {State: managed, Length: len(managed), ExpiresAt: time.Now().Add(time.Hour)},
+	}}
+	ctx, _, out = prepareCodexTurnStateInjection(WithCodexClientModel(context.Background(), "gpt-5.5"), unbound, []byte(`{"model":"gpt-5.5"}`), headers, false)
+	if got := out.Get(codexTurnStateHeader); got != echo {
+		t.Fatalf("unbound managed ticket overrode the echo: %q", got)
+	}
+	if got := CodexTurnStateProxyFromContext(ctx); got != "" {
+		t.Fatalf("unbound echo gained a proxy: %q", got)
+	}
+}
+
 func TestExecuteRequestUsesTicketBoundProxy(t *testing.T) {
 	state := testTurnStateValue(10)
 	previous := CurrentCodexTurnStateTicketConfig()
