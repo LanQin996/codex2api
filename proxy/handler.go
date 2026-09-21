@@ -128,6 +128,7 @@ func dispatchPolicyForModel(model string) auth.DispatchPolicy {
 }
 
 func (h *Handler) withModelCooldownFilter(model string, filter auth.AccountFilter) auth.AccountFilter {
+	filter = withCodexTurnStateDispatchFilter(model, filter)
 	if h == nil || h.store == nil {
 		return filter
 	}

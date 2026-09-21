@@ -4231,6 +4231,8 @@
     "codexTurnStateProbeModelsDesc": "Real model names used by background probes; wildcards are not allowed.",
     "codexTurnStateProbeModelPlaceholder": "Enter a real probe model and press Enter",
     "codexTurnStatePreserveExisting": "Preserve an existing client ticket",
+    "codexTurnStateAutoDispatch": "Automatically schedule by ticket availability",
+    "codexTurnStateAutoDispatchDesc": "With automatic collection enabled, managed models only use accounts with a matching valid automatic ticket. Missing, expired or unverified tickets pause dispatch; a valid ticket resumes it. Collection continues and manually disabled accounts stay disabled.",
     "codexTurnStatePreserveExistingDesc": "Do not overwrite a valid ticket already present on the request; disable to force automatic injection.",
     "codexTurnStateModelPlaceholder": "Enter a model and press Enter",
     "codexTurnStateAdd": "Add",

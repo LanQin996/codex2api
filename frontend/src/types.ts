@@ -2074,6 +2074,7 @@ export interface SystemSettings {
   codex_turn_state_attempt_timeout_seconds: number
   codex_turn_state_concurrency: number
   codex_turn_state_preserve_existing: boolean
+  codex_turn_state_fail_closed: boolean
   proxy_url?: string
   pg_max_conns: number
   redis_pool_size: number

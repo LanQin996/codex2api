@@ -2194,6 +2194,7 @@ export default function Settings() {
     codex_turn_state_attempt_timeout_seconds: 25,
     codex_turn_state_concurrency: 1,
     codex_turn_state_preserve_existing: true,
+    codex_turn_state_fail_closed: false,
     pg_max_conns: 50,
     redis_pool_size: 30,
     auto_clean_unauthorized: false,
@@ -3658,6 +3659,12 @@ export default function Settings() {
                       <Switch
                         checked={settingsForm.codex_turn_state_auto_enabled}
                         onCheckedChange={(checked) => autoSaveBooleanField('codex_turn_state_auto_enabled', checked)}
+                      />
+                    </SettingField>
+                    <SettingField label={t('settings.codexTurnStateAutoDispatch')} description={t('settings.codexTurnStateAutoDispatchDesc')} layout="switch">
+                      <Switch
+                        checked={settingsForm.codex_turn_state_fail_closed}
+                        onCheckedChange={(checked) => autoSaveBooleanField('codex_turn_state_fail_closed', checked)}
                       />
                     </SettingField>
                     <SettingField label={t('settings.codexTurnStateProxy')} description={t('settings.codexTurnStateProxyDesc')}>
