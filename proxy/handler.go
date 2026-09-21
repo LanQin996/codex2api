@@ -5023,13 +5023,16 @@ func (h *Handler) Responses(c *gin.Context) {
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			AbortCodexTurnStateRequest(upstreamCtx)
 			ttftGuard.Stop()
 			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/responses", account.ID(), attempt+1, durationMs, 0, resp.StatusCode)
 			}
 			retryAfter := normalizedRetryAfter(resp.Header.Get("Retry-After"))
 			errBody, _ := readAllWithContinuousRetryKeepalive(readCtx, resp.Body)
+			if explicitlyRejectedTicket(errBody) {
+				rejectManagedTicketFromContext(upstreamCtx)
+			}
+			AbortCodexTurnStateRequest(upstreamCtx)
 			rememberContinuousRetryHTTPFailure(c.Request.Context(), resp, errBody)
 			resp.Body.Close()
 			if continuousRetryCommitExpired(c, continuousRetryProtocolResponses) {

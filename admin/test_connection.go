@@ -119,7 +119,7 @@ func (h *Handler) testConnection(c *gin.Context, quality *qualityTestRequest) {
 	isAntigravityAccount := account.IsAntigravityAPI()
 	isOpenAIResponsesAccount := account.IsRelayStyle() && !isClaudeAccount && !isAntigravityAccount
 	// Agent Identity 无 AT，凭私钥动态签名，跳过 AT 预检（请求走 Codex 执行器动态签名）。
-	if !isOpenAIResponsesAccount && !isAntigravityAccount && !account.IsCodexAgentIdentity() && account.GetAccessToken() == "" {
+	if !isOpenAIResponsesAccount && !isAntigravityAccount && !account.IsCodexAgentIdentity() && account.GetAccessToken() == "" && (isTransient || !canRefreshCodexTest(account)) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "账号没有可用的 Access Token，请先刷新"})
 		return
 	}
@@ -198,7 +198,7 @@ func (h *Handler) testConnection(c *gin.Context, quality *qualityTestRequest) {
 	} else if isOpenAIResponsesAccount {
 		resp, reqErr = proxy.ExecuteRelayStyleRequest(c.Request.Context(), account, payload, h.store.ResolveProxyForAccount(account), nil)
 	} else {
-		resp, reqErr = proxy.ExecuteRequest(c.Request.Context(), account, payload, "", h.store.ResolveProxyForAccount(account), "", nil, nil)
+		resp, reqErr = h.executeCodexConnectionTest(c.Request.Context(), account, payload, !isTransient)
 	}
 	if reqErr != nil {
 		h.logConnectionTestTransportFailure(c, account, usageReason, usageEndpoint, testModel, usageEffort, start, reqErr)
@@ -1587,7 +1587,7 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 		return "failed", "账号不存在"
 	}
 
-	if !acc.IsRelayStyle() && !acc.IsCodexAgentIdentity() && acc.GetAccessToken() == "" {
+	if !acc.IsRelayStyle() && !acc.IsCodexAgentIdentity() && acc.GetAccessToken() == "" && !canRefreshCodexTest(acc) {
 		acc.Mu().RLock()
 		hasRefreshToken := acc.RefreshToken != ""
 		acc.Mu().RUnlock()
@@ -1626,7 +1626,7 @@ func (h *Handler) runSingleBatchTest(ctx context.Context, acc *auth.Account) (st
 	} else if acc.IsRelayStyle() {
 		resp, err = proxy.ExecuteRelayStyleRequest(testCtx, acc, payload, h.store.ResolveProxyForAccount(acc), nil)
 	} else {
-		resp, err = proxy.ExecuteRequest(testCtx, acc, payload, "", h.store.ResolveProxyForAccount(acc), "", nil, nil)
+		resp, err = h.executeCodexConnectionTest(testCtx, acc, payload, true)
 	}
 	if err != nil {
 		if msg, ok := batchTestContextFailure(testCtx, err); ok {

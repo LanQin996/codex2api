@@ -199,6 +199,7 @@ function CodexTurnStateTicketDetails({ account }: { account: AccountRow }) {
       case "ready": return t("accounts.codexTurnStateStateReady");
       case "refreshing": return t("accounts.codexTurnStateStateRefreshing");
       case "queued": return t("accounts.codexTurnStateStateQueued");
+      case "unverified": return t("accounts.codexTurnStateStateUnverified");
       case "expired": return t("accounts.codexTurnStateStateExpired");
       default: return t("accounts.codexTurnStateStateMissing");
     }

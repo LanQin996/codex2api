@@ -411,6 +411,12 @@ func StageCodexTurnStateValueWithModel(ctx context.Context, value, responseModel
 	}
 	cfg := CurrentCodexTurnStateTicketConfig()
 	value = observedCodexTurnState(value)
+	// A degraded reply invalidates only the managed ticket actually used by this
+	// attempt, even if the downstream stream later aborts.
+	if blocks, valid := auth.CodexTurnStateFernetBlocks(value); valid && blocks == 11 {
+		rejectManagedTicketFromContext(ctx)
+		return
+	}
 	if !auth.ValidCodexTurnStateTicketValue(value, cfg.TargetLength) {
 		return
 	}
@@ -621,7 +627,7 @@ func (h *CodexTurnStateHarvester) refresh(ctx context.Context) {
 	dueTickets := 0
 	queuedTickets := 0
 	for _, account := range h.store.Accounts() {
-		if !isNativeCodexOAuth(account) || !account.IsAvailable() {
+		if !isNativeCodexOAuth(account) || !account.IsAvailableForTicketMaintenance() {
 			continue
 		}
 		eligibleAccounts++
@@ -687,7 +693,7 @@ func (h *CodexTurnStateHarvester) pruneAccountTickets(account *auth.Account, cfg
 	changed := false
 	account.Mu().Lock()
 	for model, ticket := range account.CodexTurnStateTickets {
-		if !cfg.ModelManaged(model) || !ticket.Valid(now, cfg.TargetLength) {
+		if !cfg.ModelManaged(model) || !ticket.StoredValid(now, cfg.TargetLength) {
 			delete(account.CodexTurnStateTickets, model)
 			changed = true
 		}
@@ -703,7 +709,7 @@ func (h *CodexTurnStateHarvester) probeEligible(key codexTurnStateProbeKey) bool
 		return false
 	}
 	account := h.store.FindByID(key.accountID)
-	if !isNativeCodexOAuth(account) || !account.IsAvailable() || account.IsModelRateLimited(key.model) {
+	if !isNativeCodexOAuth(account) || !account.IsAvailableForTicketMaintenance() || account.IsModelRateLimited(key.model) {
 		return false
 	}
 	// Background maintenance must not spend credits to bypass exhausted usage windows.
@@ -827,7 +833,7 @@ func (h *CodexTurnStateHarvester) ticketNeedsRefresh(account *auth.Account, mode
 	account.Mu().RLock()
 	ticket, ok := account.CodexTurnStateTickets[strings.ToLower(strings.TrimSpace(model))]
 	account.Mu().RUnlock()
-	return !ok || ticket.ExpiresAt.Before(now.Add(time.Duration(cfg.RefreshBeforeSeconds)*time.Second))
+	return !ok || ticket.NeedsVerification || ticket.ExpiresAt.Before(now.Add(time.Duration(cfg.RefreshBeforeSeconds)*time.Second))
 }
 
 func (h *CodexTurnStateHarvester) probe(ctx context.Context, account *auth.Account, model string, cfg *CodexTurnStateTicketConfig) error {
@@ -847,6 +853,9 @@ func (h *CodexTurnStateHarvester) probe(ctx context.Context, account *auth.Accou
 	}
 	if token == "" {
 		return errors.New("missing access token")
+	}
+	if handled, err := h.verifyLoadedTicket(ctx, account, token, model, cfg); handled {
+		return err
 	}
 	winner, err := h.raceVerifiedProbes(ctx, min(64, max(1, cfg.Concurrency)), func(attemptCtx context.Context) (verifiedCodexTurnStateProbe, error) {
 		var lastErr error
@@ -1093,6 +1102,8 @@ func CodexTurnStateRuntimeStatus() any {
 				state := "missing"
 				if hasTicket && ticket.Valid(now, cfg.TargetLength) {
 					state = "ready"
+				} else if hasTicket && ticket.NeedsVerification && ticket.StoredValid(now, cfg.TargetLength) {
+					state = "unverified"
 				} else if hasTicket {
 					state = "expired"
 				}
@@ -1242,6 +1253,9 @@ func (h *CodexTurnStateHarvester) fireTicketProbe(ctx context.Context, account *
 	if headerTimeout <= 0 || headerTimeout > 12*time.Second {
 		headerTimeout = 12 * time.Second
 	}
+	if candidate != "" {
+		headerTimeout = time.Duration(max(25, cfg.AttemptTimeoutSeconds)) * time.Second
+	}
 	attemptCtx, cancel := context.WithTimeout(ctx, headerTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, CodexBaseURL+"/responses", bytes.NewReader(body))
@@ -1280,6 +1294,23 @@ func (h *CodexTurnStateHarvester) fireTicketProbe(ctx context.Context, account *
 	}
 	state := strings.TrimSpace(resp.Header.Get(codexTurnStateHeader))
 	responseModel := strings.TrimSpace(resp.Header.Get("openai-model"))
+	if candidate != "" {
+		defer resp.Body.Close()
+		if state != "" && !auth.ValidCodexTurnStateTicketValue(state, cfg.TargetLength) {
+			return state, resp.StatusCode, responseModel, errTicketRejected
+		}
+		streamModel, streamState, err := readTicketReplayStream(resp.Body)
+		if err != nil {
+			return state, resp.StatusCode, responseModel, fmt.Errorf("ticket replay stream: %w", err)
+		}
+		if streamModel != "" {
+			responseModel = streamModel
+		}
+		if streamState != "" {
+			state = streamState
+		}
+		log.Printf("[codex-turn-state-probe] account=%d phase=replay_completed model=%s returned_model=%s sid=%s returned_length=%d", account.ID(), model, responseModel, codexTurnStateProxySID(proxyURL), len(state))
+	}
 	// Rejecting a degraded 312 must not read the SSE stream. Closing the body
 	// tears down the connection immediately, so the worker can try a new sid.
 	_ = resp.Body.Close()

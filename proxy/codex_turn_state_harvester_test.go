@@ -262,6 +262,7 @@ func TestCodexTurnStateProbeSkipsUnavailableAccounts(t *testing.T) {
 		t.Run(reason, func(t *testing.T) {
 			h, account := ticketHarvesterFixture(t)
 			key := codexTurnStateProbeKey{accountID: account.ID(), model: "gpt-test"}
+			account.DispatchPaused = 1
 			switch reason {
 			case "quota":
 				account.UsagePercent7d = 100
@@ -508,6 +509,37 @@ func TestCodexTurnStateProbeStopStatus(t *testing.T) {
 	for _, status := range []int{http.StatusOK, http.StatusBadGateway, http.StatusServiceUnavailable} {
 		if codexTurnStateStopStatus(status) {
 			t.Fatalf("status=%d must not stop the candidate batch", status)
+		}
+	}
+}
+
+// Pausing business dispatch must not prevent background or manual ticket maintenance.
+func TestCodexTurnStateDispatchPausedStillMaintainsTickets(t *testing.T) {
+	for _, manual := range []bool{false, true} {
+		h, account := ticketHarvesterFixture(t)
+		account.DispatchPaused = 1
+		cfg := *CurrentCodexTurnStateTicketConfig()
+		cfg.ProbeModels = []string{"gpt-test"}
+		cfg.HarvestProxyURL = "http://proxy.example:3010"
+		SetCodexTurnStateTicketConfig(&cfg)
+		if account.IsAvailable() {
+			t.Fatal("paused account entered business dispatch")
+		}
+		if manual {
+			if !TriggerCodexTurnStateProbe(account.ID(), "gpt-test") {
+				t.Fatal("manual maintenance blocked by dispatch pause")
+			}
+		} else {
+			h.refresh(context.Background())
+		}
+		if len(h.tasks) != 1 {
+			t.Fatalf("queued tasks=%d", len(h.tasks))
+		}
+		if !h.probeEligible(codexTurnStateProbeKey{accountID: account.ID(), model: "gpt-test"}) {
+			t.Fatal("worker rejects paused account")
+		}
+		if account.DispatchPaused != 1 || account.IsAvailable() {
+			t.Fatal("maintenance enabled business dispatch")
 		}
 	}
 }

@@ -64,6 +64,7 @@ type CodexTurnStateBinding struct {
 	mu       sync.Mutex
 	proxyURL string
 	decided  bool
+	injected string
 }
 
 // WithCodexTurnStateBinding 在逐 attempt 的 ctx 上挂一个新的出口决策记录器。
@@ -139,6 +140,11 @@ func withCodexTurnStateInjection(ctx context.Context, value string) context.Cont
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if binding := codexTurnStateBindingFromContext(ctx); binding != nil {
+		binding.mu.Lock()
+		binding.injected = value
+		binding.mu.Unlock()
+	}
 	return context.WithValue(ctx, codexTurnStateInjectionKey{}, value)
 }
 
@@ -148,6 +154,13 @@ func CodexTurnStateInjectionFromContext(ctx context.Context) string {
 		return ""
 	}
 	value, _ := ctx.Value(codexTurnStateInjectionKey{}).(string)
+	if value == "" {
+		if binding := codexTurnStateBindingFromContext(ctx); binding != nil {
+			binding.mu.Lock()
+			value = binding.injected
+			binding.mu.Unlock()
+		}
+	}
 	return value
 }
 
@@ -330,6 +343,9 @@ func codexTurnStateFromFrame(payload []byte) string {
 // ObserveCodexTurnStateFrame 供 WS 中继在逐帧转发时调用：发现上游回带的 turn state
 // 就记到本次尝试的追踪里（用量日志据此显示"回带 Turn State"）。
 func ObserveCodexTurnStateFrame(ctx context.Context, payload []byte) {
+	if explicitlyRejectedTicket(payload) {
+		rejectManagedTicketFromContext(ctx)
+	}
 	if state := codexTurnStateFromFrame(payload); state != "" {
 		StageCodexTurnStateValue(ctx, state)
 		noteUpstreamTurnState(ctx, state)

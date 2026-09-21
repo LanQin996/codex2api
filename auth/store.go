@@ -1382,6 +1382,17 @@ func (a *Account) IsAvailable() bool {
 	return a.isAvailableLocked(time.Now())
 }
 
+// IsAvailableForTicketMaintenance keeps credential, health and quota checks while
+// allowing administratively paused accounts to maintain tickets without dispatch.
+func (a *Account) IsAvailableForTicketMaintenance() bool {
+	if a == nil || atomic.LoadInt32(&a.Disabled) != 0 {
+		return false
+	}
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.isAvailableLocked(time.Now())
+}
+
 func (a *Account) isAvailableLocked(now time.Time) bool {
 	if a.Status == StatusError {
 		return false

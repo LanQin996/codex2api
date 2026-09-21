@@ -53,6 +53,8 @@ func codexTurnStateTicketStatuses(row *database.AccountRow, runtimeAccount *auth
 		if hasTicket && ticket.Valid(now, cfg.TargetLength) {
 			state = "ready"
 			ready++
+		} else if hasTicket && ticket.NeedsVerification && ticket.StoredValid(now, cfg.TargetLength) {
+			state = "unverified"
 		} else if hasTicket {
 			state = "expired"
 		}

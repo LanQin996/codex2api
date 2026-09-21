@@ -382,6 +382,11 @@ func codexUserAgentFromConfig(raw string, accountID int64, versionFloor string) 
 	if isEmptyCodexUserAgentConfig(cfg) {
 		return "", "", false
 	}
+	// Synced versions constrain gateway-generated identities even in preserve mode.
+	// Preserve applies to incoming client headers, not stale catalog entries.
+	if synced := CurrentRuntimeSettings().CodexSyncedCLIVersion; validCodexClientVersionString(synced) {
+		versionFloor = effectiveCodexClientVersion(versionFloor, effectiveLatestCodexCLIVersion())
+	}
 	if cfg.Mode == CodexUserAgentModePool {
 		return codexPoolPersona(cfg, accountID, versionFloor)
 	}

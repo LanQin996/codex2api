@@ -28,16 +28,18 @@ const (
 )
 
 type CodexTurnStateTicket struct {
-	State         string    `json:"state"`
-	CapturedAt    time.Time `json:"captured_at"`
-	ExpiresAt     time.Time `json:"expires_at"`
-	Length        int       `json:"length"`
-	Source        string    `json:"source,omitempty"`
-	ProxyURL      string    `json:"proxy_url,omitempty"`
-	ProxySID      string    `json:"proxy_sid,omitempty"`
-	ExitIP        string    `json:"exit_ip,omitempty"`
-	VerifiedModel string    `json:"verified_model,omitempty"`
-	FernetBlocks  int       `json:"fernet_blocks,omitempty"`
+	// Runtime-only: persisted tickets must be replayed after loading.
+	NeedsVerification bool      `json:"-"`
+	State             string    `json:"state"`
+	CapturedAt        time.Time `json:"captured_at"`
+	ExpiresAt         time.Time `json:"expires_at"`
+	Length            int       `json:"length"`
+	Source            string    `json:"source,omitempty"`
+	ProxyURL          string    `json:"proxy_url,omitempty"`
+	ProxySID          string    `json:"proxy_sid,omitempty"`
+	ExitIP            string    `json:"exit_ip,omitempty"`
+	VerifiedModel     string    `json:"verified_model,omitempty"`
+	FernetBlocks      int       `json:"fernet_blocks,omitempty"`
 }
 
 // CodexTurnStateFernetBlocks decodes only the public Fernet envelope. It does
@@ -81,6 +83,11 @@ func ValidCodexTurnStateTicketValue(state string, targetLength int) bool {
 }
 
 func (t CodexTurnStateTicket) Valid(now time.Time, targetLength int) bool {
+	return !t.NeedsVerification && t.StoredValid(now, targetLength)
+}
+
+// StoredValid checks only local structure and the configured expiry, not upstream acceptance.
+func (t CodexTurnStateTicket) StoredValid(now time.Time, targetLength int) bool {
 	state := strings.TrimSpace(t.State)
 	return ValidCodexTurnStateTicketValue(state, targetLength) && t.Length == len(state) && !t.ExpiresAt.IsZero() && now.Before(t.ExpiresAt)
 }
@@ -323,6 +330,7 @@ func ParseCodexTurnStateTickets(raw any) map[string]CodexTurnStateTicket {
 				ticket.FernetBlocks = blocks
 			}
 		}
+		ticket.NeedsVerification = true
 		result[model] = ticket
 	}
 	return result
