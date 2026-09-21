@@ -47,7 +47,7 @@ func init() {
 
 func databaseCodexTicketConfig(s *database.CodexTurnStateSettings) *CodexTurnStateTicketConfig {
 	if s == nil {
-		return &CodexTurnStateTicketConfig{TargetLength: 292, TTLSeconds: 3600, RefreshBeforeSeconds: 600, ProbeIntervalSeconds: 6, AttemptTimeoutSeconds: 25, Concurrency: 8, Models: []string{"gpt-6-astra", "gpt-5.6-sol"}, ProbeModels: []string{"gpt-6-astra", "gpt-5.6-sol"}, PreserveExisting: true}
+		return &CodexTurnStateTicketConfig{TargetLength: 292, TTLSeconds: 3600, RefreshBeforeSeconds: 600, ProbeIntervalSeconds: 6, AttemptTimeoutSeconds: 25, Concurrency: 1, Models: []string{"gpt-6-astra", "gpt-5.6-sol"}, ProbeModels: []string{"gpt-6-astra", "gpt-5.6-sol"}, PreserveExisting: true}
 	}
 	models := append([]string(nil), s.Models...)
 	probeModels := append([]string(nil), s.ProbeModels...)
@@ -800,6 +800,10 @@ func (h *CodexTurnStateHarvester) runProbeTask(ctx context.Context, key codexTur
 				retryAfter = time.Minute
 			}
 		}
+		var upstreamErr *codexTicketHTTPError
+		if errors.As(err, &upstreamErr) && upstreamErr.retryAfter > retryAfter {
+			retryAfter = upstreamErr.retryAfter
+		}
 		state.NextAttempt = time.Now().Add(retryAfter)
 		state.LastError = codexTurnStateProbeError(err)
 		log.Printf("[codex-turn-state] account=%d model=%s failures=%d next_attempt=%s error=%s", key.accountID, key.model, state.Failures, state.NextAttempt.UTC().Format(time.RFC3339), state.LastError)
@@ -851,20 +855,23 @@ func (h *CodexTurnStateHarvester) probe(ctx context.Context, account *auth.Accou
 			if err != nil {
 				return verifiedCodexTurnStateProbe{}, err
 			}
-			state, status, responseModel, err := h.fireProbeWithProxy(attemptCtx, account, token, model, cfg, proxyURL)
+			sessionID := uuid.NewString()
+			state, status, responseModel, err := h.fireTicketProbe(attemptCtx, account, token, model, cfg, proxyURL, sessionID, "")
 			if err == nil && status == http.StatusOK && auth.ValidCodexTurnStateTicketValue(state, cfg.TargetLength) && responseModelMatches(model, responseModel) {
-				// A healthy probe must be renewable on the same sticky egress.
-				// The verification response may omit the header because the
-				// upstream accepted the ticket; a different 312 is a discard.
-				verifyState, verifyStatus, verifyModel, verifyErr := h.fireProbeWithProxy(attemptCtx, account, token, model, cfg, proxyURL)
-				if verifyErr == nil && verifyStatus == http.StatusOK && responseModelMatches(model, verifyModel) &&
-					(verifyState == "" || verifyState == state) {
-					return verifiedCodexTurnStateProbe{state: state, proxyURL: proxyURL, sid: sid, verifiedModel: firstNonEmptyString(verifyModel, responseModel)}, nil
+				// Replay the candidate on the same session and egress. An accepted
+				// ticket may rotate; retain a valid replacement instead of demanding equality.
+				verifyState, verifyStatus, verifyModel, verifyErr := h.fireTicketProbe(attemptCtx, account, token, model, cfg, proxyURL, sessionID, state)
+				accepted, ok := acceptedCodexTicket(state, verifyState, verifyStatus, model, verifyModel, cfg.TargetLength)
+				if verifyErr == nil && ok {
+					return verifiedCodexTurnStateProbe{state: accepted, proxyURL: proxyURL, sid: sid, verifiedModel: firstNonEmptyString(verifyModel, responseModel)}, nil
 				}
 				if verifyErr != nil {
 					lastErr = verifyErr
 				} else {
-					lastErr = fmt.Errorf("sticky verification returned status=%d length=%d model=%s", verifyStatus, len(verifyState), verifyModel)
+					lastErr = fmt.Errorf("ticket replay rejected: status=%d candidate_length=%d returned_length=%d model=%s", verifyStatus, len(state), len(verifyState), verifyModel)
+				}
+				if codexTurnStateStopStatus(verifyStatus) {
+					return verifiedCodexTurnStateProbe{}, &codexTurnStateProbeStopError{status: verifyStatus, err: lastErr}
 				}
 				continue
 			}
@@ -1222,6 +1229,10 @@ func (h *CodexTurnStateHarvester) fireProbe(ctx context.Context, account *auth.A
 }
 
 func (h *CodexTurnStateHarvester) fireProbeWithProxy(ctx context.Context, account *auth.Account, token, model string, cfg *CodexTurnStateTicketConfig, proxyURL string) (string, int, string, error) {
+	return h.fireTicketProbe(ctx, account, token, model, cfg, proxyURL, uuid.NewString(), "")
+}
+
+func (h *CodexTurnStateHarvester) fireTicketProbe(ctx context.Context, account *auth.Account, token, model string, cfg *CodexTurnStateTicketConfig, proxyURL, sessionID, candidate string) (string, int, string, error) {
 	body, _ := json.Marshal(map[string]any{"model": model, "store": false, "stream": true, "instructions": "Reply with exactly: pong", "input": []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "input_text", "text": "ping"}}}}})
 	// Candidate scanning only needs the response headers: the turn-state header
 	// is minted before the SSE body starts. A degraded candidate that stalls
@@ -1243,17 +1254,29 @@ func (h *CodexTurnStateHarvester) fireProbeWithProxy(ctx context.Context, accoun
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("OpenAI-Beta", "responses=experimental")
-	req.Header.Set("session_id", fmt.Sprintf("codex-ticket-%d", time.Now().UnixNano()))
+	req.Header.Set("session_id", sessionID)
 	applyCodexRequestHeaders(req, account, token, req.Header.Get("session_id"), "", nil, http.Header{})
 	applyCodexTurnStateHarvestIdentity(req.Header, model)
-	resp, err := NewUTLSHttpClient(proxyURL).Do(req)
-	if err != nil {
-		return "", 0, "", &codexTurnStateStageError{stage: "proxy/upstream_request", err: err}
+	applyTicketReplayHeader(req.Header, candidate)
+	phase := "acquire"
+	if candidate != "" {
+		phase = "replay"
 	}
+	started := time.Now()
+	client := NewUTLSHttpClient(proxyURL)
+	defer client.CloseIdleConnections()
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", 0, "", &codexTurnStateStageError{stage: "proxy/upstream_request", err: errors.New(redactTicketDiagnostic(err.Error(), token, proxyURL, candidate))}
+	}
+	log.Printf("[codex-turn-state-probe] account=%d phase=%s model=%s sid=%s status=%d length=%d elapsed_ms=%d request_id=%q cf_ray=%q ua=%q version=%q", account.ID(), phase, model, codexTurnStateProxySID(proxyURL), resp.StatusCode, len(strings.TrimSpace(resp.Header.Get(codexTurnStateHeader))), time.Since(started).Milliseconds(), resp.Header.Get("x-request-id"), resp.Header.Get("cf-ray"), req.Header.Get("User-Agent"), req.Header.Get("Version"))
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
 		_ = resp.Body.Close()
-		return "", resp.StatusCode, "", fmt.Errorf("upstream probe status=%d request_id=%s body=%q", resp.StatusCode, strings.TrimSpace(resp.Header.Get("x-request-id")), strings.TrimSpace(string(body)))
+		// Redact before shortening the summary, so truncation cannot expose a token prefix.
+		cleanBody := redactTicketDiagnostic(string(body), token, proxyURL, candidate)
+		detail := ticketErrorSummary([]byte(cleanBody), resp.Header.Get("Content-Type"))
+		return "", resp.StatusCode, "", &codexTicketHTTPError{status: resp.StatusCode, retryAfter: ticketRetryAfter(resp.Header.Get("Retry-After"), time.Now()), detail: fmt.Sprintf("phase=%s request_id=%q cf_ray=%q retry_after=%q detail=%q", phase, resp.Header.Get("x-request-id"), resp.Header.Get("cf-ray"), resp.Header.Get("Retry-After"), detail)}
 	}
 	state := strings.TrimSpace(resp.Header.Get(codexTurnStateHeader))
 	responseModel := strings.TrimSpace(resp.Header.Get("openai-model"))

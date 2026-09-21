@@ -83,7 +83,7 @@ func normalizeCodexTicketSettings(s *CodexTurnStateSettings) *CodexTurnStateSett
 		s.AttemptTimeoutSeconds = 25
 	}
 	if s.Concurrency <= 0 {
-		s.Concurrency = 8
+		s.Concurrency = 1
 	}
 	if s.Concurrency > 64 {
 		s.Concurrency = 64

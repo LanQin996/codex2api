@@ -2192,7 +2192,7 @@ export default function Settings() {
     codex_turn_state_refresh_before_seconds: 600,
     codex_turn_state_probe_interval_seconds: 6,
     codex_turn_state_attempt_timeout_seconds: 25,
-    codex_turn_state_concurrency: 8,
+    codex_turn_state_concurrency: 1,
     codex_turn_state_preserve_existing: true,
     pg_max_conns: 50,
     redis_pool_size: 30,
