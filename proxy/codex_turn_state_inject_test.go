@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -107,12 +108,12 @@ func TestPrepareCodexTurnStateInjectionWebsocketBody(t *testing.T) {
 }
 
 func TestPrepareCodexTurnStateInjectionPrefersManagedTicket(t *testing.T) {
-	const state = "gAAAAAautomatic-ticket"
+	state := testTurnStateValue(10)
 	previous := CurrentCodexTurnStateTicketConfig()
 	t.Cleanup(func() { SetCodexTurnStateTicketConfig(previous) })
 	SetCodexTurnStateTicketConfig(&CodexTurnStateTicketConfig{Enabled: true, Models: []string{"gpt-5.5"}, TargetLength: len(state)})
 	account := &auth.Account{DBID: 9, CodexTurnState: "manual-state", CodexTurnStateTickets: map[string]auth.CodexTurnStateTicket{
-		"gpt-5.5": {State: state, Length: len(state), ExpiresAt: time.Now().Add(time.Hour)},
+		"gpt-5.5": {State: state, Length: len(state), ExpiresAt: time.Now().Add(time.Hour), ProxyURL: "http://sticky.example:9000"},
 	}}
 	ctx := WithCodexClientModel(context.Background(), "gpt-5.5")
 	ctx, _, headers := prepareCodexTurnStateInjection(ctx, account, []byte(`{"model":"gpt-5.5"}`), nil, false)
@@ -121,6 +122,47 @@ func TestPrepareCodexTurnStateInjectionPrefersManagedTicket(t *testing.T) {
 	}
 	if got := CodexTurnStateInjectionFromContext(ctx); got != state {
 		t.Fatalf("context ticket = %q, want %q", got, state)
+	}
+	if got := CodexTurnStateProxyFromContext(ctx); got != "http://sticky.example:9000" {
+		t.Fatalf("bound proxy = %q", got)
+	}
+}
+
+func TestPrepareCodexTurnStateInjectionRejectsDegraded312(t *testing.T) {
+	previous := CurrentCodexTurnStateTicketConfig()
+	t.Cleanup(func() { SetCodexTurnStateTicketConfig(previous) })
+	SetCodexTurnStateTicketConfig(&CodexTurnStateTicketConfig{Enabled: true, Models: []string{"gpt-5.5"}, TargetLength: len(testTurnStateValue(10))})
+	account := &auth.Account{DBID: 11, CodexTurnStateTickets: map[string]auth.CodexTurnStateTicket{
+		"gpt-5.5": {State: testTurnStateValue(11), Length: len(testTurnStateValue(11)), ExpiresAt: time.Now().Add(time.Hour)},
+	}}
+	_, _, headers := prepareCodexTurnStateInjection(WithCodexClientModel(context.Background(), "gpt-5.5"), account, []byte(`{"model":"gpt-5.5"}`), nil, false)
+	if got := headers.Get(codexTurnStateHeader); got != "" {
+		t.Fatalf("degraded 312 injected: %q", got)
+	}
+}
+
+func TestExecuteRequestUsesTicketBoundProxy(t *testing.T) {
+	state := testTurnStateValue(10)
+	previous := CurrentCodexTurnStateTicketConfig()
+	t.Cleanup(func() { SetCodexTurnStateTicketConfig(previous) })
+	SetCodexTurnStateTicketConfig(&CodexTurnStateTicketConfig{Enabled: true, Models: []string{"gpt-5.5"}, TargetLength: len(state)})
+
+	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	defer proxyServer.Close()
+	account := &auth.Account{DBID: 12, AccessToken: "token", ProxyURL: "http://wrong-proxy.invalid:9000", CodexTurnStateTickets: map[string]auth.CodexTurnStateTicket{
+		"gpt-5.5": {State: state, Length: len(state), ExpiresAt: time.Now().Add(time.Hour), ProxyURL: proxyServer.URL},
+	}}
+	ctx := WithCodexClientModel(context.Background(), "gpt-5.5")
+	resp, err := ExecuteRequest(ctx, account, []byte(`{"model":"gpt-5.5","input":"hi"}`), "", "", "key", nil, http.Header{}, false)
+	if err == nil {
+		_ = resp.Body.Close()
+		t.Fatal("expected the local HTTP proxy probe to fail TLS, got a response")
+	}
+	if !strings.Contains(err.Error(), "server gave HTTP response to HTTPS client") {
+		t.Fatalf("request did not reach the ticket-bound proxy: %v", err)
 	}
 }
 

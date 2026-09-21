@@ -28,6 +28,7 @@ import (
 const codexTurnStateMetadataKey = "x-codex-turn-state"
 
 type codexTurnStateInjectionKey struct{}
+type codexTurnStateProxyKey struct{}
 type codexClientModelKey struct{}
 
 // WithCodexClientModel 记录下游请求的原始模型名，供模型名单与上游模型名一并匹配：
@@ -67,6 +68,23 @@ func CodexTurnStateInjectionFromContext(ctx context.Context) string {
 	return value
 }
 
+// CodexTurnStateProxyFromContext returns the sticky egress bound to the
+// injected ticket. Empty means the normal account/group/pool proxy applies.
+func CodexTurnStateProxyFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	value, _ := ctx.Value(codexTurnStateProxyKey{}).(string)
+	return strings.TrimSpace(value)
+}
+
+func withCodexTurnStateProxy(ctx context.Context, value string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, codexTurnStateProxyKey{}, strings.TrimSpace(value))
+}
+
 // prepareCodexTurnStateInjection 决定并落定注入：返回携带决策的 ctx、（可能克隆的）
 // 下游头与（WS 时改写了帧体的）请求体。未配置或名单未命中时全部原样返回。
 func prepareCodexTurnStateInjection(ctx context.Context, account *auth.Account, requestBody []byte, headers http.Header, websocket bool) (context.Context, []byte, http.Header) {
@@ -76,6 +94,7 @@ func prepareCodexTurnStateInjection(ctx context.Context, account *auth.Account, 
 	upstreamModel := strings.TrimSpace(gjson.GetBytes(requestBody, "model").String())
 	clientModel := codexClientModelFromContext(ctx)
 	injected := ""
+	injectedProxy := ""
 	cfg := CurrentCodexTurnStateTicketConfig()
 	if cfg.PreserveExisting && headers != nil {
 		existing := observedCodexTurnState(headers.Get(codexTurnStateHeader))
@@ -84,9 +103,10 @@ func prepareCodexTurnStateInjection(ctx context.Context, account *auth.Account, 
 		}
 	}
 	if injected == "" && cfg.Enabled && cfg.ModelManaged(clientModel, upstreamModel) {
-		injected = account.CodexTurnStateTicketInjection(upstreamModel, cfg.TargetLength, time.Now())
-		if injected == "" {
-			injected = account.CodexTurnStateTicketInjection(clientModel, cfg.TargetLength, time.Now())
+		if ticket, ok := account.CodexTurnStateTicket(upstreamModel, cfg.TargetLength, time.Now()); ok {
+			injected, injectedProxy = ticket.State, ticket.ProxyURL
+		} else if ticket, ok := account.CodexTurnStateTicket(clientModel, cfg.TargetLength, time.Now()); ok {
+			injected, injectedProxy = ticket.State, ticket.ProxyURL
 		}
 	}
 	if injected == "" {
@@ -97,6 +117,7 @@ func prepareCodexTurnStateInjection(ctx context.Context, account *auth.Account, 
 	}
 	NoteCodexTurnStateInjected()
 	ctx = withCodexTurnStateInjection(ctx, injected)
+	ctx = withCodexTurnStateProxy(ctx, injectedProxy)
 	if headers == nil {
 		headers = make(http.Header)
 	} else {

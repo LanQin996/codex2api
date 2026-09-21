@@ -14,6 +14,10 @@ import (
 type codexTurnStateTicketStatus struct {
 	Model            string    `json:"model"`
 	Length           int       `json:"length,omitempty"`
+	FernetBlocks     int       `json:"fernet_blocks,omitempty"`
+	ProxySID         string    `json:"proxy_sid,omitempty"`
+	ExitIP           string    `json:"exit_ip,omitempty"`
+	VerifiedModel    string    `json:"verified_model,omitempty"`
 	State            string    `json:"state"`
 	CapturedAt       time.Time `json:"captured_at,omitempty"`
 	ExpiresAt        time.Time `json:"expires_at,omitempty"`

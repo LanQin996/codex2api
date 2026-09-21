@@ -17,6 +17,7 @@ import (
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
+	"github.com/google/uuid"
 )
 
 // CodexTurnStateTicketConfig is the runtime copy of the persisted harvester
@@ -135,6 +136,14 @@ type codexTurnStateProbeKey struct {
 	model     string
 }
 
+type verifiedCodexTurnStateProbe struct {
+	state         string
+	proxyURL      string
+	sid           string
+	verifiedModel string
+	exitIP        string
+}
+
 type codexTurnStateProbeStatus struct {
 	Queued         bool
 	InFlight       bool
@@ -162,10 +171,11 @@ type CodexTurnStateProbeSnapshot struct {
 }
 
 type codexTurnStatePendingCapture struct {
-	key       codexTurnStateProbeKey
-	createdAt time.Time
-	expiresAt time.Time
-	candidate string
+	key           codexTurnStateProbeKey
+	createdAt     time.Time
+	expiresAt     time.Time
+	candidate     string
+	responseModel string
 }
 
 type codexTurnStatePendingContextKey struct{}
@@ -353,10 +363,17 @@ func StageCodexTurnStateResponse(ctx context.Context, headers http.Header) {
 	if len(values) != 1 {
 		return
 	}
-	StageCodexTurnStateValue(ctx, values[0])
+	// HTTP exposes the routed model as OpenAIModel/openai-model on both JSON and
+	// SSE initial headers. If it is absent, model verification remains unknown
+	// rather than being treated as a mismatch.
+	StageCodexTurnStateValueWithModel(ctx, values[0], headers.Get("openai-model"))
 }
 
 func StageCodexTurnStateValue(ctx context.Context, value string) {
+	StageCodexTurnStateValueWithModel(ctx, value, "")
+}
+
+func StageCodexTurnStateValueWithModel(ctx context.Context, value, responseModel string) {
 	h := activeCodexTurnStateHarvester.Load()
 	if h == nil || ctx == nil {
 		return
@@ -374,6 +391,7 @@ func StageCodexTurnStateValue(ctx context.Context, value string) {
 	defer h.pendingMu.Unlock()
 	if pending := h.pending[id]; pending != nil && time.Now().Before(pending.expiresAt) {
 		pending.candidate = value
+		pending.responseModel = strings.TrimSpace(responseModel)
 	}
 }
 
@@ -394,6 +412,16 @@ func CommitCodexTurnStateRequest(ctx context.Context) {
 		return
 	}
 	if account := h.store.FindByID(pending.key.accountID); account != nil {
+		if pending.responseModel != "" && !responseModelMatches(pending.key.model, pending.responseModel) {
+			h.store.DropAccountCodexTurnStateTicket(account.DBID, pending.key.model)
+			h.enqueueProbe(pending.key, time.Now())
+			return
+		}
+		if blocks, ok := auth.CodexTurnStateFernetBlocks(pending.candidate); !ok || (blocks != 10 && blocks != 12) {
+			h.store.DropAccountCodexTurnStateTicket(account.DBID, pending.key.model)
+			h.enqueueProbe(pending.key, time.Now())
+			return
+		}
 		h.recordTicket(account, pending.key.model, pending.candidate, "response", true)
 	}
 }
@@ -747,39 +775,96 @@ func (h *CodexTurnStateHarvester) probe(ctx context.Context, account *auth.Accou
 	if token == "" {
 		return errors.New("missing access token")
 	}
-	state, err := h.raceProbes(ctx, min(64, max(1, cfg.Concurrency)), func(attemptCtx context.Context) (string, error) {
+	winner, err := h.raceVerifiedProbes(ctx, min(64, max(1, cfg.Concurrency)), func(attemptCtx context.Context) (verifiedCodexTurnStateProbe, error) {
 		var lastErr error
 		for retry := 0; retry < 3; retry++ {
-			state, status, err := h.fireProbe(attemptCtx, account, token, model, cfg)
-			if err == nil && status == http.StatusOK && auth.ValidCodexTurnStateTicketValue(state, cfg.TargetLength) {
-				return state, nil
+			proxyURL, sid, err := codexTurnStateStickyProxy(cfg.HarvestProxyURL)
+			if err != nil {
+				return verifiedCodexTurnStateProbe{}, err
+			}
+			state, status, responseModel, err := h.fireProbeWithProxy(attemptCtx, account, token, model, cfg, proxyURL)
+			if err == nil && status == http.StatusOK && auth.ValidCodexTurnStateTicketValue(state, cfg.TargetLength) && responseModelMatches(model, responseModel) {
+				// A healthy probe must be renewable on the same sticky egress.
+				// The verification response may omit the header because the
+				// upstream accepted the ticket; a different 312 is a discard.
+				verifyState, verifyStatus, verifyModel, verifyErr := h.fireProbeWithProxy(attemptCtx, account, token, model, cfg, proxyURL)
+				if verifyErr == nil && verifyStatus == http.StatusOK && responseModelMatches(model, verifyModel) &&
+					(verifyState == "" || verifyState == state) {
+					return verifiedCodexTurnStateProbe{state: state, proxyURL: proxyURL, sid: sid, verifiedModel: firstNonEmptyString(verifyModel, responseModel)}, nil
+				}
+				if verifyErr != nil {
+					lastErr = verifyErr
+				} else {
+					lastErr = fmt.Errorf("sticky verification returned status=%d length=%d model=%s", verifyStatus, len(verifyState), verifyModel)
+				}
+				continue
 			}
 			if err == nil {
-				lastErr = fmt.Errorf("probe returned status=%d length=%d", status, len(state))
+				lastErr = fmt.Errorf("probe returned status=%d length=%d model=%s", status, len(state), responseModel)
 			} else {
 				lastErr = err
 			}
 			if !isTransientCodexTurnStateProbeError(lastErr) || retry == 2 {
-				return "", lastErr
+				return verifiedCodexTurnStateProbe{}, lastErr
 			}
 			timer := time.NewTimer(250 * time.Millisecond)
 			select {
 			case <-attemptCtx.Done():
 				timer.Stop()
-				return "", attemptCtx.Err()
+				return verifiedCodexTurnStateProbe{}, attemptCtx.Err()
 			case <-timer.C:
 			}
 		}
-		return "", lastErr
+		return verifiedCodexTurnStateProbe{}, lastErr
 	}, account.ID())
 	if err != nil {
 		return err
 	}
-	h.recordTicket(account, model, state, "probe", true)
+	h.recordTicketWithBinding(account, model, winner.state, "probe", true, winner.proxyURL, winner.sid, winner.verifiedModel, winner.exitIP)
 	return nil
 }
 
+func responseModelMatches(requested, actual string) bool {
+	actual = strings.TrimSpace(actual)
+	if actual == "" {
+		return true
+	}
+	return strings.EqualFold(strings.TrimSpace(requested), actual)
+}
+
+func codexTurnStateStickyProxy(template string) (proxyURL, sid string, err error) {
+	template = strings.TrimSpace(template)
+	if template == "" {
+		return "", "", errors.New("codex turn-state harvest proxy is empty")
+	}
+	sid = strings.ReplaceAll(uuid.NewString(), "-", "")[:12]
+	if strings.Contains(template, "sid-") {
+		proxyURL = replaceStickyProxySID(template, sid)
+	} else {
+		proxyURL = template
+	}
+	return proxyURL, sid, nil
+}
+
+func replaceStickyProxySID(raw, sid string) string {
+	lower := strings.ToLower(raw)
+	start := strings.Index(lower, "sid-")
+	if start < 0 {
+		return raw
+	}
+	valueStart := start + len("sid-")
+	valueEnd := valueStart
+	for valueEnd < len(raw) && raw[valueEnd] != '-' && raw[valueEnd] != '@' && raw[valueEnd] != ':' {
+		valueEnd++
+	}
+	return raw[:valueStart] + sid + raw[valueEnd:]
+}
+
 func (h *CodexTurnStateHarvester) recordTicket(account *auth.Account, model, state, source string, enqueuePersistence bool) {
+	h.recordTicketWithBinding(account, model, state, source, enqueuePersistence, "", "", "", "")
+}
+
+func (h *CodexTurnStateHarvester) recordTicketWithBinding(account *auth.Account, model, state, source string, enqueuePersistence bool, proxyURL, proxySID, verifiedModel, exitIP string) {
 	if h == nil || account == nil {
 		return
 	}
@@ -793,7 +878,13 @@ func (h *CodexTurnStateHarvester) recordTicket(account *auth.Account, model, sta
 	if model == "" {
 		return
 	}
-	ticket := auth.CodexTurnStateTicket{State: state, Length: len(state), CapturedAt: now, ExpiresAt: now.Add(time.Duration(cfg.TTLSeconds) * time.Second), Source: source}
+	blocks, _ := auth.CodexTurnStateFernetBlocks(state)
+	ticket := auth.CodexTurnStateTicket{
+		State: state, Length: len(state), CapturedAt: now,
+		ExpiresAt: now.Add(time.Duration(cfg.TTLSeconds) * time.Second), Source: source,
+		ProxyURL: strings.TrimSpace(proxyURL), ProxySID: strings.TrimSpace(proxySID),
+		VerifiedModel: strings.TrimSpace(verifiedModel), ExitIP: strings.TrimSpace(exitIP), FernetBlocks: blocks,
+	}
 	account.Mu().Lock()
 	if account.CodexTurnStateTickets == nil {
 		account.CodexTurnStateTickets = make(map[string]auth.CodexTurnStateTicket)
@@ -1020,6 +1111,35 @@ func (h *CodexTurnStateHarvester) fireProbe(ctx context.Context, account *auth.A
 	return strings.TrimSpace(resp.Header.Get(codexTurnStateHeader)), resp.StatusCode, nil
 }
 
+func (h *CodexTurnStateHarvester) fireProbeWithProxy(ctx context.Context, account *auth.Account, token, model string, cfg *CodexTurnStateTicketConfig, proxyURL string) (string, int, string, error) {
+	body, _ := json.Marshal(map[string]any{"model": model, "store": false, "stream": true, "instructions": "Reply with exactly: pong", "input": []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "input_text", "text": "ping"}}}}})
+	attemptCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.AttemptTimeoutSeconds)*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, CodexBaseURL+"/responses", bytes.NewReader(body))
+	if err != nil {
+		return "", 0, "", err
+	}
+	req.Close = true
+	req.Host = "chatgpt.com"
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "text/event-stream")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("OpenAI-Beta", "responses=experimental")
+	req.Header.Set("session_id", fmt.Sprintf("codex-ticket-%d", time.Now().UnixNano()))
+	applyCodexRequestHeaders(req, account, token, req.Header.Get("session_id"), "", nil, http.Header{})
+	applyCodexTurnStateHarvestIdentity(req.Header, model)
+	resp, err := NewUTLSHttpClient(proxyURL).Do(req)
+	if err != nil {
+		return "", 0, "", &codexTurnStateStageError{stage: "proxy/upstream_request", err: err}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", resp.StatusCode, "", fmt.Errorf("upstream probe status=%d request_id=%s body=%q", resp.StatusCode, strings.TrimSpace(resp.Header.Get("x-request-id")), strings.TrimSpace(string(body)))
+	}
+	return strings.TrimSpace(resp.Header.Get(codexTurnStateHeader)), resp.StatusCode, strings.TrimSpace(resp.Header.Get("openai-model")), nil
+}
+
 // CodexTurnStateProbeDiagnostics returns a metadata-only snapshot for one account.
 func CodexTurnStateProbeDiagnostics(accountID int64) map[string]struct {
 	Queued      bool
@@ -1139,6 +1259,62 @@ func (h *CodexTurnStateHarvester) raceProbes(ctx context.Context, parallelism in
 		lastErr = errors.New("probe batch returned no ticket")
 	}
 	return "", lastErr
+}
+
+func (h *CodexTurnStateHarvester) raceVerifiedProbes(ctx context.Context, parallelism int, attempt func(context.Context) (verifiedCodexTurnStateProbe, error), accountIDs ...int64) (verifiedCodexTurnStateProbe, error) {
+	accountID := int64(0)
+	if len(accountIDs) > 0 {
+		accountID = accountIDs[0]
+	}
+	batchCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type result struct {
+		value verifiedCodexTurnStateProbe
+		err   error
+	}
+	count := min(64, max(1, parallelism))
+	results := make(chan result, count)
+	var workers sync.WaitGroup
+	for i := 0; i < count; i++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			if err := h.acquireProbeSlot(batchCtx, accountID); err != nil {
+				results <- result{err: err}
+				return
+			}
+			defer h.releaseProbeSlot(accountID)
+			if err := batchCtx.Err(); err != nil {
+				results <- result{err: err}
+				return
+			}
+			value, err := attempt(batchCtx)
+			results <- result{value: value, err: err}
+		}()
+	}
+	var winner verifiedCodexTurnStateProbe
+	var lastErr error
+	for i := 0; i < count; i++ {
+		r := <-results
+		if r.err == nil && r.value.state != "" && winner.state == "" {
+			winner = r.value
+			cancel()
+		}
+		if r.err != nil && !errors.Is(r.err, context.Canceled) {
+			lastErr = r.err
+		}
+	}
+	workers.Wait()
+	if winner.state != "" {
+		return winner, nil
+	}
+	if ctx.Err() != nil {
+		return verifiedCodexTurnStateProbe{}, ctx.Err()
+	}
+	if lastErr == nil {
+		lastErr = errors.New("probe batch returned no verified ticket")
+	}
+	return verifiedCodexTurnStateProbe{}, lastErr
 }
 
 func (h *CodexTurnStateHarvester) acquireProbeSlot(ctx context.Context, accountID int64) error {

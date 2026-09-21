@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"strings"
 	"testing"
@@ -11,12 +12,27 @@ import (
 	"github.com/codex2api/database"
 )
 
+func testTurnStateValue(blocks int) string {
+	if blocks <= 0 {
+		blocks = 10
+	}
+	raw := make([]byte, 1+8+16+blocks*16+32)
+	raw[0] = 0x80
+	for i := 1; i <= 8; i++ {
+		raw[i] = 0
+	}
+	for i := 9; i < len(raw); i++ {
+		raw[i] = byte(i % 251)
+	}
+	return base64.URLEncoding.EncodeToString(raw)
+}
+
 func ticketHarvesterFixture(t *testing.T) (*CodexTurnStateHarvester, *auth.Account) {
 	t.Helper()
 	oldConfig := CurrentCodexTurnStateTicketConfig()
 	oldHarvester := activeCodexTurnStateHarvester.Load()
 	t.Cleanup(func() { SetCodexTurnStateTicketConfig(oldConfig); activeCodexTurnStateHarvester.Store(oldHarvester) })
-	SetCodexTurnStateTicketConfig(&CodexTurnStateTicketConfig{Enabled: true, Models: []string{"gpt-*"}, TargetLength: len("gAAAAAtest"), TTLSeconds: 3600, RefreshBeforeSeconds: 600})
+	SetCodexTurnStateTicketConfig(&CodexTurnStateTicketConfig{Enabled: true, Models: []string{"gpt-*"}, TargetLength: len(testTurnStateValue(10)), TTLSeconds: 3600, RefreshBeforeSeconds: 600})
 	account := &auth.Account{DBID: 42, AccessToken: "test", CodexTurnStateTickets: map[string]auth.CodexTurnStateTicket{}}
 	store := &auth.Store{}
 	store.SetAccountsForTest([]*auth.Account{account})
@@ -27,7 +43,8 @@ func ticketHarvesterFixture(t *testing.T) (*CodexTurnStateHarvester, *auth.Accou
 
 func TestCodexTurnStateEchoDoesNotExtendExpiry(t *testing.T) {
 	h, account := ticketHarvesterFixture(t)
-	original := auth.CodexTurnStateTicket{State: "gAAAAAtest", Length: len("gAAAAAtest"), CapturedAt: time.Now().Add(-55 * time.Minute), ExpiresAt: time.Now().Add(5 * time.Minute)}
+	state := testTurnStateValue(10)
+	original := auth.CodexTurnStateTicket{State: state, Length: len(state), CapturedAt: time.Now().Add(-55 * time.Minute), ExpiresAt: time.Now().Add(5 * time.Minute)}
 	account.CodexTurnStateTickets["gpt-test"] = original
 	h.recordTicket(account, "gpt-test", original.State, "response", true)
 	if got := account.CodexTurnStateTickets["gpt-test"]; !got.ExpiresAt.Equal(original.ExpiresAt) || !got.CapturedAt.Equal(original.CapturedAt) {
@@ -40,7 +57,7 @@ func TestCodexTurnStateEchoDoesNotExtendExpiry(t *testing.T) {
 
 func TestCodexTurnStateExpiredLearnedModelRetries(t *testing.T) {
 	h, account := ticketHarvesterFixture(t)
-	account.CodexTurnStateTickets["gpt-test"] = auth.CodexTurnStateTicket{State: "gAAAAAtest", Length: len("gAAAAAtest"), ExpiresAt: time.Now().Add(-time.Minute)}
+	account.CodexTurnStateTickets["gpt-test"] = auth.CodexTurnStateTicket{State: testTurnStateValue(10), Length: len(testTurnStateValue(10)), ExpiresAt: time.Now().Add(-time.Minute)}
 	h.refresh(context.Background())
 	select {
 	case key := <-h.tasks:
@@ -72,9 +89,10 @@ func TestCodexTurnStateMissingRequestQueuesWithBackoff(t *testing.T) {
 		t.Fatal("request bypassed retry backoff")
 	default:
 	}
-	StageCodexTurnStateValue(ctx, "gAAAAAtest")
+	state := testTurnStateValue(10)
+	StageCodexTurnStateValue(ctx, state)
 	CommitCodexTurnStateRequest(ctx)
-	if account.CodexTurnStateTicketInjection("gpt-test", len("gAAAAAtest"), time.Now()) == "" {
+	if account.CodexTurnStateTicketInjection("gpt-test", len(state), time.Now()) == "" {
 		t.Fatal("response ticket not published")
 	}
 	select {
@@ -88,28 +106,35 @@ func TestCodexTurnStateMissingRequestQueuesWithBackoff(t *testing.T) {
 }
 
 func TestCodexTurnStateMixedTicketLengths(t *testing.T) {
-	for _, configured := range []int{292, 332} {
+	tickets := []struct {
+		length int
+		blocks int
+	}{
+		{len(testTurnStateValue(10)), 10},
+		{len(testTurnStateValue(12)), 12},
+	}
+	for _, configured := range []int{tickets[0].length, tickets[1].length} {
 		t.Run(fmt.Sprint(configured), func(t *testing.T) {
 			h, account := ticketHarvesterFixture(t)
 			cfg := *CurrentCodexTurnStateTicketConfig()
 			cfg.TargetLength = configured
 			SetCodexTurnStateTicketConfig(&cfg)
-			for _, length := range []int{292, 332} {
-				model := fmt.Sprintf("gpt-test-%d", length)
-				state := "gAAAAA" + strings.Repeat("x", length-6)
+			for _, tc := range tickets {
+				model := fmt.Sprintf("gpt-test-%d", tc.length)
+				state := testTurnStateValue(tc.blocks)
 				ctx := BindCodexTurnStateRequest(context.Background(), account, model)
 				StageCodexTurnStateValue(ctx, state)
 				CommitCodexTurnStateRequest(ctx)
 				h.pruneAccountTickets(account, &cfg, time.Now())
 				if got := account.CodexTurnStateTicketInjection(model, configured, time.Now()); got != state {
-					t.Fatalf("length %d not retained with config %d", length, configured)
+					t.Fatalf("length %d not retained with config %d", tc.length, configured)
 				}
 				_, _, headers := prepareCodexTurnStateInjection(context.Background(), account, []byte(fmt.Sprintf("{\"model\":\"%s\"}", model)), nil, false)
 				if headers.Get(codexTurnStateHeader) != state {
-					t.Fatalf("length %d not injected", length)
+					t.Fatalf("length %d not injected", tc.length)
 				}
 			}
-			if auth.ValidCodexTurnStateTicketValue("gAAAAA"+strings.Repeat("x", 300-6), configured) {
+			if auth.ValidCodexTurnStateTicketValue(testTurnStateValue(11), configured) {
 				t.Fatal("unexpected length accepted")
 			}
 			if auth.ValidCodexTurnStateTicketValue("gAAAAA"+strings.Repeat("x", 292-7)+"\n", configured) {
@@ -239,8 +264,9 @@ func TestCodexTurnStateRaceCancelsLosers(t *testing.T) {
 func TestCodexTurnStateProbeRenewsSameTicket(t *testing.T) {
 	h, account := ticketHarvesterFixture(t)
 	old := time.Now().Add(-time.Minute)
-	account.CodexTurnStateTickets["gpt-test"] = auth.CodexTurnStateTicket{State: "gAAAAAtest", Length: len("gAAAAAtest"), CapturedAt: old, ExpiresAt: old}
-	h.recordTicket(account, "gpt-test", "gAAAAAtest", "probe", true)
+	state := testTurnStateValue(10)
+	account.CodexTurnStateTickets["gpt-test"] = auth.CodexTurnStateTicket{State: state, Length: len(state), CapturedAt: old, ExpiresAt: old}
+	h.recordTicket(account, "gpt-test", state, "probe", true)
 	got := account.CodexTurnStateTickets["gpt-test"]
 	if !got.CapturedAt.After(old) || !got.ExpiresAt.After(time.Now()) {
 		t.Fatal("same probe ticket not renewed")
@@ -290,7 +316,7 @@ func TestCodexTurnStateRejects356ForConfigured292And332(t *testing.T) {
 			cfg := *CurrentCodexTurnStateTicketConfig()
 			cfg.TargetLength = length
 			SetCodexTurnStateTicketConfig(&cfg)
-			bad := "gAAAAA" + strings.Repeat("x", 350)
+			bad := testTurnStateValue(13)
 			if auth.ValidCodexTurnStateTicketValue(bad, length) {
 				t.Fatal("356 accepted")
 			}
@@ -298,7 +324,7 @@ func TestCodexTurnStateRejects356ForConfigured292And332(t *testing.T) {
 			if len(account.CodexTurnStateTickets) != 0 {
 				t.Fatal("356 persisted")
 			}
-			account.CodexTurnStateTickets["gpt-test"] = auth.CodexTurnStateTicket{State: bad, Length: 356, ExpiresAt: time.Now().Add(time.Hour)}
+			account.CodexTurnStateTickets["gpt-test"] = auth.CodexTurnStateTicket{State: bad, Length: len(bad), ExpiresAt: time.Now().Add(time.Hour)}
 			if account.CodexTurnStateTicketInjection("gpt-test", length, time.Now()) != "" {
 				t.Fatal("stored 356 injected")
 			}

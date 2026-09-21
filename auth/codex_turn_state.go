@@ -1,6 +1,8 @@
 package auth
 
 import (
+	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -26,18 +28,54 @@ const (
 )
 
 type CodexTurnStateTicket struct {
-	State      string    `json:"state"`
-	CapturedAt time.Time `json:"captured_at"`
-	ExpiresAt  time.Time `json:"expires_at"`
-	Length     int       `json:"length"`
-	Source     string    `json:"source,omitempty"`
+	State         string    `json:"state"`
+	CapturedAt    time.Time `json:"captured_at"`
+	ExpiresAt     time.Time `json:"expires_at"`
+	Length        int       `json:"length"`
+	Source        string    `json:"source,omitempty"`
+	ProxyURL      string    `json:"proxy_url,omitempty"`
+	ProxySID      string    `json:"proxy_sid,omitempty"`
+	ExitIP        string    `json:"exit_ip,omitempty"`
+	VerifiedModel string    `json:"verified_model,omitempty"`
+	FernetBlocks  int       `json:"fernet_blocks,omitempty"`
 }
 
-// ValidCodexTurnStateTicketValue accepts both observed ticket formats. The
-// configured length remains an additional supported format for compatibility.
+// CodexTurnStateFernetBlocks decodes only the public Fernet envelope. It does
+// not verify the HMAC, which is impossible without the upstream key. A normal
+// Pro ticket has 10 ciphertext blocks (292 chars), a normal Team ticket has 12
+// (332 chars), and the degraded 312-char ticket has 11.
+func CodexTurnStateFernetBlocks(state string) (int, bool) {
+	state = strings.TrimSpace(state)
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(state, "="))
+	if err != nil || len(raw) < 1+8+16+32 || raw[0] != 0x80 {
+		return 0, false
+	}
+	ciphertext := len(raw) - 1 - 8 - 16 - 32
+	if ciphertext <= 0 || ciphertext%16 != 0 {
+		return 0, false
+	}
+	return ciphertext / 16, true
+}
+
+func CodexTurnStateTicketIssuedAt(state string) (time.Time, bool) {
+	state = strings.TrimSpace(state)
+	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(state, "="))
+	if err != nil || len(raw) < 9 || raw[0] != 0x80 {
+		return time.Time{}, false
+	}
+	return time.Unix(int64(binary.BigEndian.Uint64(raw[1:9])), 0).UTC(), true
+}
+
+// ValidCodexTurnStateTicketValue accepts only non-degraded Fernet tickets. The
+// configured length remains supported only when it also has a normal block
+// count, so a 312-byte degraded ticket can never become a reusable template.
 func ValidCodexTurnStateTicketValue(state string, targetLength int) bool {
 	state = strings.TrimSpace(state)
 	length := len(state)
+	blocks, ok := CodexTurnStateFernetBlocks(state)
+	if !ok || (blocks != 10 && blocks != 12) {
+		return false
+	}
 	return (length == 292 || length == 332 || (targetLength > 0 && length == targetLength)) &&
 		strings.HasPrefix(state, "gAAAAA") && ValidateCodexTurnState(state) == nil
 }
@@ -172,20 +210,28 @@ func (a *Account) CodexTurnStateInjection(models ...string) string {
 }
 
 func (a *Account) CodexTurnStateTicketInjection(model string, targetLength int, now time.Time) string {
-	if a == nil {
+	ticket, ok := a.CodexTurnStateTicket(model, targetLength, now)
+	if !ok {
 		return ""
+	}
+	return strings.TrimSpace(ticket.State)
+}
+
+func (a *Account) CodexTurnStateTicket(model string, targetLength int, now time.Time) (CodexTurnStateTicket, bool) {
+	if a == nil {
+		return CodexTurnStateTicket{}, false
 	}
 	model = strings.ToLower(strings.TrimSpace(model))
 	if model == "" {
-		return ""
+		return CodexTurnStateTicket{}, false
 	}
 	a.mu.RLock()
 	ticket, ok := a.CodexTurnStateTickets[model]
 	a.mu.RUnlock()
 	if !ok || !ticket.Valid(now, targetLength) {
-		return ""
+		return CodexTurnStateTicket{}, false
 	}
-	return strings.TrimSpace(ticket.State)
+	return ticket, true
 }
 
 // CodexTurnStateConfig 返回配置快照（值、模型名单、设置时刻）。
@@ -235,6 +281,21 @@ func (s *Store) ApplyAccountCodexTurnStateTicket(id int64, model string, ticket 
 	}
 }
 
+func (s *Store) DropAccountCodexTurnStateTicket(id int64, model string) {
+	if s == nil {
+		return
+	}
+	model = strings.ToLower(strings.TrimSpace(model))
+	if model == "" {
+		return
+	}
+	if a := s.FindByID(id); a != nil {
+		a.mu.Lock()
+		delete(a.CodexTurnStateTickets, model)
+		a.mu.Unlock()
+	}
+}
+
 func ParseCodexTurnStateTickets(raw any) map[string]CodexTurnStateTicket {
 	if raw == nil {
 		return nil
@@ -256,6 +317,11 @@ func ParseCodexTurnStateTickets(raw any) map[string]CodexTurnStateTicket {
 		}
 		if ticket.Length <= 0 {
 			ticket.Length = len(ticket.State)
+		}
+		if ticket.FernetBlocks <= 0 {
+			if blocks, ok := CodexTurnStateFernetBlocks(ticket.State); ok {
+				ticket.FernetBlocks = blocks
+			}
 		}
 		result[model] = ticket
 	}

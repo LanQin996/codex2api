@@ -687,6 +687,10 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	// requestBody——它们解析 JSON，拿到压缩帧只会静默失配。
 	outboundBody, contentEncoding := CompressCodexRequestBody(requestBody)
 
+	// 票据绑定出口优先：上游认可的 turn state 与铸造它的粘性出口必须一致。
+	if boundProxy := CodexTurnStateProxyFromContext(ctx); boundProxy != "" {
+		proxyURL = boundProxy
+	}
 	// 出口链路统一由 ResolveCodexEgress 决定(Resin > 代理 > 直连,见 egress.go)。
 	egress := ResolveCodexEgress(account, endpoint, proxyURL)
 	endpoint = egress.URL
@@ -1014,6 +1018,10 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 	// compact 端点
 	endpoint := CodexBaseURL + "/responses/compact"
 
+	// 票据绑定出口优先：compact 与普通轮次共用同一条粘性出口。
+	if boundProxy := CodexTurnStateProxyFromContext(ctx); boundProxy != "" {
+		proxyURL = boundProxy
+	}
 	// 出口链路统一由 ResolveCodexEgress 决定(Resin > 代理 > 直连,见 egress.go)。
 	egress := ResolveCodexEgress(account, endpoint, proxyURL)
 	endpoint = egress.URL

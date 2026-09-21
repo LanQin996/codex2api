@@ -139,7 +139,11 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 
 	// 出口链路统一由 ResolveCodexWebsocketEgress 决定(Resin > 代理 > 直连):
 	// Resin 模式下 WS 地址改写为反代路径,拨号侧(createConnection)同样按它跳过代理。
-	egress := proxy.ResolveCodexWebsocketEgress(account, wsURL, effectiveProxyURL(account, proxyOverride))
+	effectiveProxyOverride := effectiveProxyURL(account, proxyOverride)
+	if boundProxy := proxy.CodexTurnStateProxyFromContext(ctx); boundProxy != "" {
+		effectiveProxyOverride = boundProxy
+	}
+	egress := proxy.ResolveCodexWebsocketEgress(account, wsURL, effectiveProxyOverride)
 	wsURL = egress.URL
 
 	// 准备请求头
@@ -189,9 +193,9 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	}
 	if wc == nil {
 		if proxy.IsStatelessWebsocketSessionID(sessionID) && baseKey != "" && !statelessOneShotEnabled() {
-			wc, pr, poolSessionID, err2 = e.manager.AcquireReusableConnection(ctx, account, wsURL, baseKey, sessionID, statelessConnectionSlots(), headers, proxyOverride)
+			wc, pr, poolSessionID, err2 = e.manager.AcquireReusableConnection(ctx, account, wsURL, baseKey, sessionID, statelessConnectionSlots(), headers, effectiveProxyOverride)
 		} else {
-			wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, poolSessionID, headers, proxyOverride)
+			wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, poolSessionID, headers, effectiveProxyOverride)
 		}
 	}
 	// 取连耗时（busy 排队 + 探活 + 握手）计入本 attempt 的 ws_acquire_ms（issue #413）

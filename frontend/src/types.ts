@@ -466,6 +466,10 @@ export interface AccountRow {
 export interface CodexTurnStateTicketStatus {
   model: string
   length?: number
+  fernet_blocks?: number
+  proxy_sid?: string
+  exit_ip?: string
+  verified_model?: string
   state: 'ready' | 'expired' | 'refreshing' | 'missing' | string
   captured_at?: string
   expires_at?: string

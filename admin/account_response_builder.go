@@ -56,7 +56,11 @@ func codexTurnStateTicketStatuses(row *database.AccountRow, runtimeAccount *auth
 		} else if hasTicket {
 			state = "expired"
 		}
-		item := codexTurnStateTicketStatus{Model: model, State: state, Length: ticket.Length, CapturedAt: ticket.CapturedAt, ExpiresAt: ticket.ExpiresAt}
+		item := codexTurnStateTicketStatus{
+			Model: model, State: state, Length: ticket.Length, FernetBlocks: ticket.FernetBlocks,
+			ProxySID: ticket.ProxySID, ExitIP: ticket.ExitIP, VerifiedModel: ticket.VerifiedModel,
+			CapturedAt: ticket.CapturedAt, ExpiresAt: ticket.ExpiresAt,
+		}
 		if state == "ready" {
 			item.RemainingSeconds = max(0, int64(time.Until(ticket.ExpiresAt).Seconds()))
 			item.NextAttempt = ticket.ExpiresAt.Add(-time.Duration(cfg.RefreshBeforeSeconds) * time.Second)
