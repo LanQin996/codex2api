@@ -372,6 +372,7 @@ func main() {
 			TTLSeconds: ticketSettings.TTLSeconds, RefreshBeforeSeconds: ticketSettings.RefreshBeforeSeconds,
 			ProbeIntervalSeconds: ticketSettings.ProbeIntervalSeconds, AttemptTimeoutSeconds: ticketSettings.AttemptTimeoutSeconds,
 			Concurrency: ticketSettings.Concurrency, PreserveExisting: ticketSettings.PreserveExisting, FailClosed: ticketSettings.FailClosed,
+			TicketProxySticky: ticketSettings.TicketProxySticky,
 		})
 	}
 	ticketHarvester := proxy.NewCodexTurnStateHarvester(store, db)

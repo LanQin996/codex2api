@@ -37,6 +37,7 @@ type CodexTurnStateTicketConfig struct {
 	Concurrency           int
 	PreserveExisting      bool
 	FailClosed            bool
+	TicketProxySticky     bool
 }
 
 var codexTurnStateTicketConfig atomic.Pointer[CodexTurnStateTicketConfig]
@@ -51,7 +52,7 @@ func databaseCodexTicketConfig(s *database.CodexTurnStateSettings) *CodexTurnSta
 	}
 	models := append([]string(nil), s.Models...)
 	probeModels := append([]string(nil), s.ProbeModels...)
-	return &CodexTurnStateTicketConfig{Enabled: s.Enabled, HarvestProxyURL: strings.TrimSpace(s.HarvestProxyURL), Models: models, ProbeModels: probeModels, TargetLength: s.TargetLength, TTLSeconds: s.TTLSeconds, RefreshBeforeSeconds: s.RefreshBeforeSeconds, ProbeIntervalSeconds: s.ProbeIntervalSeconds, AttemptTimeoutSeconds: s.AttemptTimeoutSeconds, Concurrency: s.Concurrency, PreserveExisting: s.PreserveExisting, FailClosed: s.FailClosed}
+	return &CodexTurnStateTicketConfig{Enabled: s.Enabled, HarvestProxyURL: strings.TrimSpace(s.HarvestProxyURL), Models: models, ProbeModels: probeModels, TargetLength: s.TargetLength, TTLSeconds: s.TTLSeconds, RefreshBeforeSeconds: s.RefreshBeforeSeconds, ProbeIntervalSeconds: s.ProbeIntervalSeconds, AttemptTimeoutSeconds: s.AttemptTimeoutSeconds, Concurrency: s.Concurrency, PreserveExisting: s.PreserveExisting, FailClosed: s.FailClosed, TicketProxySticky: s.TicketProxySticky}
 }
 
 func SetCodexTurnStateTicketConfig(cfg *CodexTurnStateTicketConfig) {

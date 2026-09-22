@@ -198,22 +198,33 @@ func prepareCodexTurnStateInjection(ctx context.Context, account *auth.Account, 
 		if auth.ValidCodexTurnStateTicketValue(existing, cfg.TargetLength) {
 			injected = existing
 			// 回带值本身不带出口信息，能确定的只有"上一次向该会话下发它的那条出口"。
-			injectedProxy = codexTurnStateProxyForAffinity(codexAffinityKeyFromContext(ctx))
-			if injectedProxy == "" && cfg.Enabled && cfg.ModelManaged(clientModel, upstreamModel) {
+			if cfg.TicketProxySticky {
+				injectedProxy = codexTurnStateProxyForAffinity(codexAffinityKeyFromContext(ctx))
+			}
+			if cfg.TicketProxySticky && injectedProxy == "" && cfg.Enabled && cfg.ModelManaged(clientModel, upstreamModel) {
 				// 溯源里没有出口时优先换成账号上已绑定出口的托管票据：无绑定的回带值
 				// 会把票据发到别的出口，上游按铸造出口校验必然拒收——绑定票据比无
 				// 绑定回带值更可复用，绑定出口的保证不能在这一步丢掉。
 				if ticket, ok := boundCodexTurnStateTicket(account, cfg, clientModel, upstreamModel); ok {
-					injected, injectedProxy = ticket.State, strings.TrimSpace(ticket.ProxyURL)
+					injected = ticket.State
+					if cfg.TicketProxySticky {
+						injectedProxy = strings.TrimSpace(ticket.ProxyURL)
+					}
 				}
 			}
 		}
 	}
 	if injected == "" && cfg.Enabled && cfg.ModelManaged(clientModel, upstreamModel) {
 		if ticket, ok := account.CodexTurnStateTicket(upstreamModel, cfg.TargetLength, time.Now()); ok {
-			injected, injectedProxy = ticket.State, ticket.ProxyURL
+			injected = ticket.State
+			if cfg.TicketProxySticky {
+				injectedProxy = ticket.ProxyURL
+			}
 		} else if ticket, ok := account.CodexTurnStateTicket(clientModel, cfg.TargetLength, time.Now()); ok {
-			injected, injectedProxy = ticket.State, ticket.ProxyURL
+			injected = ticket.State
+			if cfg.TicketProxySticky {
+				injectedProxy = ticket.ProxyURL
+			}
 		}
 	}
 	if injected == "" {

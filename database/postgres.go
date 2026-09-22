@@ -1340,10 +1340,12 @@ func (db *DB) migrate(ctx context.Context) error {
 			attempt_timeout_seconds INTEGER NOT NULL DEFAULT 25,
 			concurrency INTEGER NOT NULL DEFAULT 8,
 			preserve_existing BOOLEAN NOT NULL DEFAULT TRUE,
-			fail_closed BOOLEAN NOT NULL DEFAULT FALSE
+			fail_closed BOOLEAN NOT NULL DEFAULT FALSE,
+			ticket_proxy_sticky BOOLEAN NOT NULL DEFAULT FALSE
 		);
 		ALTER TABLE codex_turn_state_settings ADD COLUMN IF NOT EXISTS probe_models TEXT NOT NULL DEFAULT '["gpt-6-astra","gpt-5.6-sol"]';
 		ALTER TABLE codex_turn_state_settings ADD COLUMN IF NOT EXISTS preserve_existing BOOLEAN NOT NULL DEFAULT TRUE;
+		ALTER TABLE codex_turn_state_settings ADD COLUMN IF NOT EXISTS ticket_proxy_sticky BOOLEAN NOT NULL DEFAULT FALSE;
 		INSERT INTO codex_turn_state_settings (id) VALUES (1) ON CONFLICT (id) DO NOTHING;
 	CREATE TABLE IF NOT EXISTS api_key_model_request_counters (
 		api_key_id BIGINT NOT NULL,

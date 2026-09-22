@@ -4234,6 +4234,8 @@
     "codexTurnStateAutoDispatch": "Automatically schedule by ticket availability",
     "codexTurnStateAutoDispatchDesc": "With automatic collection enabled, managed models only use accounts with a matching valid automatic ticket. Missing, expired or unverified tickets pause dispatch; a valid ticket resumes it. Collection continues and manually disabled accounts stay disabled.",
     "codexTurnStatePreserveExistingDesc": "Do not overwrite a valid ticket already present on the request; disable to force automatic injection.",
+    "codexTurnStateTicketProxySticky": "Enable ticket proxy SID stickiness",
+    "codexTurnStateTicketProxyStickyDesc": "Keep using the proxy egress and SID that minted a reused ticket. When disabled, tickets are not bound to their harvest proxy. Off by default.",
     "codexTurnStateModelPlaceholder": "Enter a model and press Enter",
     "codexTurnStateAdd": "Add",
     "codexTurnStateRemove": "Remove",

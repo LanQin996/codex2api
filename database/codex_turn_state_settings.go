@@ -24,6 +24,7 @@ type CodexTurnStateSettings struct {
 	Concurrency           int
 	PreserveExisting      bool
 	FailClosed            bool
+	TicketProxySticky     bool
 }
 
 const (
@@ -98,10 +99,10 @@ func (db *DB) GetCodexTurnStateSettings(ctx context.Context) (*CodexTurnStateSet
 	if db == nil || db.conn == nil {
 		return normalizeCodexTicketSettings(nil), nil
 	}
-	query := `SELECT enabled, harvest_proxy_url, models, probe_models, target_length, ttl_seconds, refresh_before_seconds, probe_interval_seconds, attempt_timeout_seconds, concurrency, preserve_existing, fail_closed FROM codex_turn_state_settings WHERE id = 1`
+	query := `SELECT enabled, harvest_proxy_url, models, probe_models, target_length, ttl_seconds, refresh_before_seconds, probe_interval_seconds, attempt_timeout_seconds, concurrency, preserve_existing, fail_closed, ticket_proxy_sticky FROM codex_turn_state_settings WHERE id = 1`
 	s := &CodexTurnStateSettings{}
 	var modelsRaw, probeModelsRaw string
-	err := db.conn.QueryRowContext(ctx, query).Scan(&s.Enabled, &s.HarvestProxyURL, &modelsRaw, &probeModelsRaw, &s.TargetLength, &s.TTLSeconds, &s.RefreshBeforeSeconds, &s.ProbeIntervalSeconds, &s.AttemptTimeoutSeconds, &s.Concurrency, &s.PreserveExisting, &s.FailClosed)
+	err := db.conn.QueryRowContext(ctx, query).Scan(&s.Enabled, &s.HarvestProxyURL, &modelsRaw, &probeModelsRaw, &s.TargetLength, &s.TTLSeconds, &s.RefreshBeforeSeconds, &s.ProbeIntervalSeconds, &s.AttemptTimeoutSeconds, &s.Concurrency, &s.PreserveExisting, &s.FailClosed, &s.TicketProxySticky)
 	if err == sql.ErrNoRows {
 		return normalizeCodexTicketSettings(nil), nil
 	}
@@ -132,10 +133,10 @@ func (db *DB) UpdateCodexTurnStateSettings(ctx context.Context, s *CodexTurnStat
 	}
 	if db.isSQLite() {
 		return db.withSQLiteWriteLock(ctx, func() error {
-			_, err := db.conn.ExecContext(ctx, `INSERT INTO codex_turn_state_settings (id, enabled, harvest_proxy_url, models, probe_models, target_length, ttl_seconds, refresh_before_seconds, probe_interval_seconds, attempt_timeout_seconds, concurrency, preserve_existing, fail_closed) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled, harvest_proxy_url=excluded.harvest_proxy_url, models=excluded.models, probe_models=excluded.probe_models, target_length=excluded.target_length, ttl_seconds=excluded.ttl_seconds, refresh_before_seconds=excluded.refresh_before_seconds, probe_interval_seconds=excluded.probe_interval_seconds, attempt_timeout_seconds=excluded.attempt_timeout_seconds, concurrency=excluded.concurrency, preserve_existing=excluded.preserve_existing, fail_closed=excluded.fail_closed`, s.Enabled, s.HarvestProxyURL, string(modelsRaw), string(probeModelsRaw), s.TargetLength, s.TTLSeconds, s.RefreshBeforeSeconds, s.ProbeIntervalSeconds, s.AttemptTimeoutSeconds, s.Concurrency, s.PreserveExisting, s.FailClosed)
+			_, err := db.conn.ExecContext(ctx, `INSERT INTO codex_turn_state_settings (id, enabled, harvest_proxy_url, models, probe_models, target_length, ttl_seconds, refresh_before_seconds, probe_interval_seconds, attempt_timeout_seconds, concurrency, preserve_existing, fail_closed, ticket_proxy_sticky) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled, harvest_proxy_url=excluded.harvest_proxy_url, models=excluded.models, probe_models=excluded.probe_models, target_length=excluded.target_length, ttl_seconds=excluded.ttl_seconds, refresh_before_seconds=excluded.refresh_before_seconds, probe_interval_seconds=excluded.probe_interval_seconds, attempt_timeout_seconds=excluded.attempt_timeout_seconds, concurrency=excluded.concurrency, preserve_existing=excluded.preserve_existing, fail_closed=excluded.fail_closed, ticket_proxy_sticky=excluded.ticket_proxy_sticky`, s.Enabled, s.HarvestProxyURL, string(modelsRaw), string(probeModelsRaw), s.TargetLength, s.TTLSeconds, s.RefreshBeforeSeconds, s.ProbeIntervalSeconds, s.AttemptTimeoutSeconds, s.Concurrency, s.PreserveExisting, s.FailClosed, s.TicketProxySticky)
 			return err
 		})
 	}
-	_, err = db.conn.ExecContext(ctx, `INSERT INTO codex_turn_state_settings (id, enabled, harvest_proxy_url, models, probe_models, target_length, ttl_seconds, refresh_before_seconds, probe_interval_seconds, attempt_timeout_seconds, concurrency, preserve_existing, fail_closed) VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) ON CONFLICT (id) DO UPDATE SET enabled=EXCLUDED.enabled, harvest_proxy_url=EXCLUDED.harvest_proxy_url, models=EXCLUDED.models, probe_models=EXCLUDED.probe_models, target_length=EXCLUDED.target_length, ttl_seconds=EXCLUDED.ttl_seconds, refresh_before_seconds=EXCLUDED.refresh_before_seconds, probe_interval_seconds=EXCLUDED.probe_interval_seconds, attempt_timeout_seconds=EXCLUDED.attempt_timeout_seconds, concurrency=EXCLUDED.concurrency, preserve_existing=EXCLUDED.preserve_existing, fail_closed=EXCLUDED.fail_closed`, s.Enabled, s.HarvestProxyURL, string(modelsRaw), string(probeModelsRaw), s.TargetLength, s.TTLSeconds, s.RefreshBeforeSeconds, s.ProbeIntervalSeconds, s.AttemptTimeoutSeconds, s.Concurrency, s.PreserveExisting, s.FailClosed)
+	_, err = db.conn.ExecContext(ctx, `INSERT INTO codex_turn_state_settings (id, enabled, harvest_proxy_url, models, probe_models, target_length, ttl_seconds, refresh_before_seconds, probe_interval_seconds, attempt_timeout_seconds, concurrency, preserve_existing, fail_closed, ticket_proxy_sticky) VALUES (1, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) ON CONFLICT (id) DO UPDATE SET enabled=EXCLUDED.enabled, harvest_proxy_url=EXCLUDED.harvest_proxy_url, models=EXCLUDED.models, probe_models=EXCLUDED.probe_models, target_length=EXCLUDED.target_length, ttl_seconds=EXCLUDED.ttl_seconds, refresh_before_seconds=EXCLUDED.refresh_before_seconds, probe_interval_seconds=EXCLUDED.probe_interval_seconds, attempt_timeout_seconds=EXCLUDED.attempt_timeout_seconds, concurrency=EXCLUDED.concurrency, preserve_existing=EXCLUDED.preserve_existing, fail_closed=EXCLUDED.fail_closed, ticket_proxy_sticky=EXCLUDED.ticket_proxy_sticky`, s.Enabled, s.HarvestProxyURL, string(modelsRaw), string(probeModelsRaw), s.TargetLength, s.TTLSeconds, s.RefreshBeforeSeconds, s.ProbeIntervalSeconds, s.AttemptTimeoutSeconds, s.Concurrency, s.PreserveExisting, s.FailClosed, s.TicketProxySticky)
 	return err
 }

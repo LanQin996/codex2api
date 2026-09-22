@@ -4633,6 +4633,8 @@
     "codexTurnStateAutoDispatch": "按票据自动启停调度",
     "codexTurnStateAutoDispatchDesc": "开启自动采集后，对托管模型仅调度持有对应有效自动票据的账号；缺票、过期或待验证时暂停，补票成功后自动恢复。后台继续采集，手动禁用不受影响。",
     "codexTurnStatePreserveExistingDesc": "请求已经带有合法票据时不覆盖；关闭后自动票据会强制覆盖。",
+    "codexTurnStateTicketProxySticky": "启用票据代理 SID 粘性",
+    "codexTurnStateTicketProxyStickyDesc": "复用票据时沿用采集该票据的代理出口和 SID。关闭后票据不再绑定代理出口。默认关闭。",
     "codexTurnStateModelPlaceholder": "输入模型名后回车",
     "codexTurnStateAdd": "添加",
     "codexTurnStateRemove": "删除",

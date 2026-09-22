@@ -9179,6 +9179,7 @@ type settingsResponse struct {
 	CodexTurnStateConcurrency           int      `json:"codex_turn_state_concurrency"`
 	CodexTurnStatePreserveExisting      bool     `json:"codex_turn_state_preserve_existing"`
 	CodexTurnStateFailClosed            bool     `json:"codex_turn_state_fail_closed"`
+	CodexTurnStateTicketProxySticky     bool     `json:"codex_turn_state_ticket_proxy_sticky"`
 	SiteName                            string   `json:"site_name"`
 	SiteLogo                            string   `json:"site_logo"`
 	BackgroundImage                     string   `json:"background_image"`
@@ -9396,6 +9397,7 @@ type updateSettingsReq struct {
 	CodexTurnStateConcurrency           *int                             `json:"codex_turn_state_concurrency"`
 	CodexTurnStatePreserveExisting      *bool                            `json:"codex_turn_state_preserve_existing"`
 	CodexTurnStateFailClosed            *bool                            `json:"codex_turn_state_fail_closed"`
+	CodexTurnStateTicketProxySticky     *bool                            `json:"codex_turn_state_ticket_proxy_sticky"`
 	SiteName                            *string                          `json:"site_name"`
 	SiteLogo                            *string                          `json:"site_logo"`
 	BackgroundImage                     *string                          `json:"background_image"`
@@ -10229,6 +10231,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexTurnStateConcurrency:           ticketSettings.Concurrency,
 		CodexTurnStatePreserveExisting:      ticketSettings.PreserveExisting,
 		CodexTurnStateFailClosed:            ticketSettings.FailClosed,
+		CodexTurnStateTicketProxySticky:     ticketSettings.TicketProxySticky,
 		antigravityOAuthSettingsView:        currentAntigravityOAuthSettingsView(),
 		SiteName:                            branding.SiteName,
 		SiteLogo:                            branding.SiteLogo,
@@ -10813,7 +10816,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	if req.CodexTurnStateFailClosed != nil {
 		ticketSettings.FailClosed = *req.CodexTurnStateFailClosed
 	}
-	ticketSettingsChanged := req.CodexTurnStateAutoEnabled != nil || req.CodexTurnStateHarvestProxyURL != nil || req.CodexTurnStateManagedModels != nil || req.CodexTurnStateProbeModels != nil || req.CodexTurnStateTargetLength != nil || req.CodexTurnStateTTLSeconds != nil || req.CodexTurnStateRefreshBeforeSeconds != nil || req.CodexTurnStateProbeIntervalSeconds != nil || req.CodexTurnStateAttemptTimeoutSeconds != nil || req.CodexTurnStateConcurrency != nil || req.CodexTurnStatePreserveExisting != nil || req.CodexTurnStateFailClosed != nil
+	if req.CodexTurnStateTicketProxySticky != nil {
+		ticketSettings.TicketProxySticky = *req.CodexTurnStateTicketProxySticky
+	}
+	ticketSettingsChanged := req.CodexTurnStateAutoEnabled != nil || req.CodexTurnStateHarvestProxyURL != nil || req.CodexTurnStateManagedModels != nil || req.CodexTurnStateProbeModels != nil || req.CodexTurnStateTargetLength != nil || req.CodexTurnStateTTLSeconds != nil || req.CodexTurnStateRefreshBeforeSeconds != nil || req.CodexTurnStateProbeIntervalSeconds != nil || req.CodexTurnStateAttemptTimeoutSeconds != nil || req.CodexTurnStateConcurrency != nil || req.CodexTurnStatePreserveExisting != nil || req.CodexTurnStateFailClosed != nil || req.CodexTurnStateTicketProxySticky != nil
 	if existingSettings != nil {
 		currentAdminSecret = existingSettings.AdminSecret
 		siteName = database.NormalizeSiteName(existingSettings.SiteName)
@@ -12061,6 +12067,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 				TargetLength: ticketSettings.TargetLength, TTLSeconds: ticketSettings.TTLSeconds, RefreshBeforeSeconds: ticketSettings.RefreshBeforeSeconds,
 				ProbeIntervalSeconds: ticketSettings.ProbeIntervalSeconds, AttemptTimeoutSeconds: ticketSettings.AttemptTimeoutSeconds,
 				Concurrency: ticketSettings.Concurrency, PreserveExisting: ticketSettings.PreserveExisting, FailClosed: ticketSettings.FailClosed,
+				TicketProxySticky: ticketSettings.TicketProxySticky,
 			})
 			proxy.WakeCodexTurnStateHarvester()
 		}
