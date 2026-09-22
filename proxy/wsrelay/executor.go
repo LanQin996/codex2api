@@ -155,6 +155,9 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	headers := e.prepareWebsocketHeaders(accessToken, account, accountIDStr, headerSessionID, apiKey, deviceCfg, ginHeaders, wsBody)
 	// 凭据级 turn state 注入在账号自定义头之后落定（帧体已由 proxy.ExecuteRequest 写入）。
 	proxy.ApplyCodexTurnStateInjectionHeader(ctx, headers)
+	wsModel := strings.TrimSpace(gjson.GetBytes(wsBody, "model").String())
+	proxy.ApplyCodexRouteCookies(ctx, headers, account, httpURL, wsModel)
+	ctx = proxy.WithCodexRouteCookieScope(ctx, httpURL, wsModel)
 	// Record the attempted handshake UA immediately so failed handshakes are
 	// still auditable. A reused connection replaces this below with the UA that
 	// was actually sent when that connection was established.
@@ -383,6 +386,7 @@ func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Acc
 	// 握手头是逐连接冻结的，复用连接沿用建连时的取值；收敛值按账号恒定，正好与
 	// 这一语义相容。off 档为空操作。
 	proxy.ApplyCodexFingerprintHeaders(headers, account, ginHeaders)
+	proxy.ApplyCodexProtocolHeaders(headers, ginHeaders)
 
 	// Account ID
 	if accountID != "" {

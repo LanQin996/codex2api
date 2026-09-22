@@ -456,6 +456,29 @@ func TestApplyCodexRequestHeadersUsesSessionIDWithoutConversationID(t *testing.T
 	}
 }
 
+func TestApplyCodexRequestHeadersPreservesCodexPrereleaseVersion(t *testing.T) {
+	req, err := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest() error = %v", err)
+	}
+
+	const version = "0.155.0-alpha9.2"
+	cfg := &DeviceProfileConfig{
+		UserAgent:              "codex_cli_rs/" + version + " (Mac OS 15.5.0; arm64)",
+		PackageVersion:         version,
+		RuntimeVersion:         version,
+		OS:                     "MacOS",
+		Arch:                   "arm64",
+		StabilizeDeviceProfile: true,
+	}
+
+	applyCodexRequestHeaders(req, &auth.Account{DBID: 42}, "token-123", "", "api-key-1", cfg, http.Header{})
+
+	if got := req.Header.Get("Version"); got != version {
+		t.Fatalf("Version = %q, want %q", got, version)
+	}
+}
+
 func TestApplyCodexRequestHeadersAppliesAccountCustomHeadersLast(t *testing.T) {
 	req, err := http.NewRequest(http.MethodPost, "https://example.com/v1/responses", nil)
 	if err != nil {

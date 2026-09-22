@@ -2195,6 +2195,7 @@ export default function Settings() {
     codex_turn_state_concurrency: 1,
     codex_turn_state_preserve_existing: true,
     codex_turn_state_fail_closed: false,
+    codex_turn_state_ticket_proxy_sticky: false,
     pg_max_conns: 50,
     redis_pool_size: 30,
     auto_clean_unauthorized: false,
@@ -3735,6 +3736,12 @@ export default function Settings() {
                       <Switch
                         checked={settingsForm.codex_turn_state_preserve_existing}
                         onCheckedChange={(checked) => autoSaveBooleanField('codex_turn_state_preserve_existing', checked)}
+                      />
+                    </SettingField>
+                    <SettingField label={t('settings.codexTurnStateTicketProxySticky')} description={t('settings.codexTurnStateTicketProxyStickyDesc')} layout="switch">
+                      <Switch
+                        checked={settingsForm.codex_turn_state_ticket_proxy_sticky}
+                        onCheckedChange={(checked) => autoSaveBooleanField('codex_turn_state_ticket_proxy_sticky', checked)}
                       />
                     </SettingField>
                     <div className={SETTINGS_FIELD_GRID}>

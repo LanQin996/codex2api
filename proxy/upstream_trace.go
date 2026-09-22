@@ -194,6 +194,13 @@ func doTracedUpstreamRequest(client *http.Client, req *http.Request, account *au
 	record := beginUpstreamTrace(req.Context(), account, proxyURL, false)
 	resp, err := client.Do(req)
 	record(resp)
+	if resp != nil {
+		fallback := ""
+		if req != nil && req.URL != nil {
+			fallback = req.URL.String()
+		}
+		ObserveCodexRouteResponseCookies(req.Context(), account, fallback, resp.Header)
+	}
 	return resp, err
 }
 

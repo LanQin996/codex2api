@@ -408,7 +408,8 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 			attempt_timeout_seconds INTEGER NOT NULL DEFAULT 25,
 			concurrency INTEGER NOT NULL DEFAULT 8,
 			preserve_existing INTEGER NOT NULL DEFAULT 1,
-			fail_closed INTEGER NOT NULL DEFAULT 0
+			fail_closed INTEGER NOT NULL DEFAULT 0,
+			ticket_proxy_sticky INTEGER NOT NULL DEFAULT 0
 		);`,
 		`INSERT OR IGNORE INTO codex_turn_state_settings (id) VALUES (1);`,
 		`CREATE TABLE IF NOT EXISTS model_registry_sync (
@@ -556,6 +557,7 @@ func (db *DB) migrateSQLite(ctx context.Context) error {
 		{"accounts", "credential_generation", "INTEGER NOT NULL DEFAULT 1"},
 		{"codex_turn_state_settings", "probe_models", "TEXT NOT NULL DEFAULT '[\"gpt-6-astra\",\"gpt-5.6-sol\"]'"},
 		{"codex_turn_state_settings", "preserve_existing", "INTEGER NOT NULL DEFAULT 1"},
+		{"codex_turn_state_settings", "ticket_proxy_sticky", "INTEGER NOT NULL DEFAULT 0"},
 		{"usage_logs", "channel", "TEXT DEFAULT ''"},
 		{"usage_logs", "input_tokens", "INTEGER DEFAULT 0"},
 		{"usage_logs", "output_tokens", "INTEGER DEFAULT 0"},
