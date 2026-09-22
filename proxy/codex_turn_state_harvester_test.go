@@ -34,7 +34,7 @@ func ticketHarvesterFixture(t *testing.T) (*CodexTurnStateHarvester, *auth.Accou
 	oldConfig := CurrentCodexTurnStateTicketConfig()
 	oldHarvester := activeCodexTurnStateHarvester.Load()
 	t.Cleanup(func() { SetCodexTurnStateTicketConfig(oldConfig); activeCodexTurnStateHarvester.Store(oldHarvester) })
-	SetCodexTurnStateTicketConfig(&CodexTurnStateTicketConfig{Enabled: true, Models: []string{"gpt-*"}, TargetLength: len(testTurnStateValue(10)), TTLSeconds: 3600, RefreshBeforeSeconds: 600})
+	SetCodexTurnStateTicketConfig(&CodexTurnStateTicketConfig{Enabled: true, Models: []string{"gpt-*"}, TargetLength: len(testTurnStateValue(10)), TTLSeconds: 3600, RefreshBeforeSeconds: 600, TicketProxySticky: true})
 	account := &auth.Account{DBID: 42, AccessToken: "test", CodexTurnStateTickets: map[string]auth.CodexTurnStateTicket{}}
 	store := &auth.Store{}
 	store.SetAccountsForTest([]*auth.Account{account})

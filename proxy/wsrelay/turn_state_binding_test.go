@@ -181,7 +181,7 @@ func turnStateTicketFixture(t *testing.T, boundProxy, state, model string) *auth
 	t.Cleanup(func() { proxy.SetCodexTurnStateTicketConfig(previous) })
 	proxy.SetCodexTurnStateTicketConfig(&proxy.CodexTurnStateTicketConfig{
 		Enabled: true, PreserveExisting: true, TargetLength: len(state), TTLSeconds: 3600,
-		RefreshBeforeSeconds: 600, Models: []string{model}, ProbeModels: []string{model},
+		RefreshBeforeSeconds: 600, Models: []string{model}, ProbeModels: []string{model}, TicketProxySticky: true,
 	})
 	account := &auth.Account{
 		DBID:        42,

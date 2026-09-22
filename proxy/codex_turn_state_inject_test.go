@@ -111,7 +111,7 @@ func TestPrepareCodexTurnStateInjectionPrefersManagedTicket(t *testing.T) {
 	state := testTurnStateValue(10)
 	previous := CurrentCodexTurnStateTicketConfig()
 	t.Cleanup(func() { SetCodexTurnStateTicketConfig(previous) })
-	SetCodexTurnStateTicketConfig(&CodexTurnStateTicketConfig{Enabled: true, Models: []string{"gpt-5.5"}, TargetLength: len(state)})
+	SetCodexTurnStateTicketConfig(&CodexTurnStateTicketConfig{Enabled: true, Models: []string{"gpt-5.5"}, TargetLength: len(state), TicketProxySticky: true})
 	account := &auth.Account{DBID: 9, CodexTurnState: "manual-state", CodexTurnStateTickets: map[string]auth.CodexTurnStateTicket{
 		"gpt-5.5": {State: state, Length: len(state), ExpiresAt: time.Now().Add(time.Hour), ProxyURL: "http://sticky.example:9000"},
 	}}
@@ -147,7 +147,7 @@ func TestPrepareCodexTurnStateInjectionEchoUsesProvenanceEgress(t *testing.T) {
 	state := testTurnStateValue(10)
 	previous := CurrentCodexTurnStateTicketConfig()
 	t.Cleanup(func() { SetCodexTurnStateTicketConfig(previous) })
-	SetCodexTurnStateTicketConfig(&CodexTurnStateTicketConfig{Enabled: true, Models: []string{"gpt-5.5"}, TargetLength: len(state), PreserveExisting: true})
+	SetCodexTurnStateTicketConfig(&CodexTurnStateTicketConfig{Enabled: true, Models: []string{"gpt-5.5"}, TargetLength: len(state), PreserveExisting: true, TicketProxySticky: true})
 	affinityKey := "turn-inject-provenance::api-key:1"
 	t.Cleanup(func() { codexTurnStateOrigins.Delete(affinityKey) })
 	codexTurnStateOrigins.Store(affinityKey, codexTurnStateOrigin{
@@ -177,7 +177,7 @@ func TestPrepareCodexTurnStateInjectionEchoPrefersBoundTicket(t *testing.T) {
 	managed := testTurnStateValue(12)
 	previous := CurrentCodexTurnStateTicketConfig()
 	t.Cleanup(func() { SetCodexTurnStateTicketConfig(previous) })
-	SetCodexTurnStateTicketConfig(&CodexTurnStateTicketConfig{Enabled: true, Models: []string{"gpt-5.5"}, TargetLength: len(echo), PreserveExisting: true})
+	SetCodexTurnStateTicketConfig(&CodexTurnStateTicketConfig{Enabled: true, Models: []string{"gpt-5.5"}, TargetLength: len(echo), PreserveExisting: true, TicketProxySticky: true})
 	headers := http.Header{}
 	headers.Set(codexTurnStateHeader, echo)
 
@@ -208,7 +208,7 @@ func TestExecuteRequestUsesTicketBoundProxy(t *testing.T) {
 	state := testTurnStateValue(10)
 	previous := CurrentCodexTurnStateTicketConfig()
 	t.Cleanup(func() { SetCodexTurnStateTicketConfig(previous) })
-	SetCodexTurnStateTicketConfig(&CodexTurnStateTicketConfig{Enabled: true, Models: []string{"gpt-5.5"}, TargetLength: len(state)})
+	SetCodexTurnStateTicketConfig(&CodexTurnStateTicketConfig{Enabled: true, Models: []string{"gpt-5.5"}, TargetLength: len(state), TicketProxySticky: true})
 
 	proxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

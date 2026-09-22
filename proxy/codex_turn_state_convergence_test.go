@@ -143,6 +143,7 @@ func convergenceHarvesterFixture(t *testing.T, dbid int64, harvestProxyTemplate 
 		Enabled: true, Models: []string{convergenceModel}, ProbeModels: []string{convergenceModel},
 		TargetLength: len(testTurnStateValue(10)), TTLSeconds: convergenceTTLSeconds,
 		RefreshBeforeSeconds: 60, HarvestProxyURL: harvestProxyTemplate, PreserveExisting: true,
+		TicketProxySticky: true,
 	})
 	account := &auth.Account{DBID: dbid, AccessToken: "convergence-access-token", CodexTurnStateTickets: map[string]auth.CodexTurnStateTicket{}}
 	store := &auth.Store{}

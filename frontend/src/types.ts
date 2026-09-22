@@ -2067,6 +2067,7 @@ export interface SystemSettings {
   codex_turn_state_harvest_proxy_url: string
   codex_turn_state_managed_models: string[]
   codex_turn_state_probe_models: string[]
+  codex_turn_state_ticket_proxy_sticky: boolean
   codex_turn_state_target_length: number
   codex_turn_state_ttl_seconds: number
   codex_turn_state_refresh_before_seconds: number
