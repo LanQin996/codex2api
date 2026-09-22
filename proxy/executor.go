@@ -191,6 +191,13 @@ const (
 )
 
 func codexTransportModeFromEnv() string {
+	if CodexTLSImpersonationEnabled() {
+		return "codex_tls"
+	}
+	return legacyCodexTransportModeFromEnv()
+}
+
+func legacyCodexTransportModeFromEnv() string {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_TRANSPORT_MODE"))) {
 	case "", "standard", "go", "default":
 		return codexTransportModeStandard
@@ -217,7 +224,7 @@ func shouldRecyclePooledClient(err error) bool {
 }
 
 func recyclePooledClient(account *auth.Account, proxyURL string) {
-	key := clientPoolKey(account, proxyURL, codexTransportModeFromEnv())
+	key := clientPoolKey(account, proxyURL, codexAccountTransportMode(account))
 	if v, ok := clientPool.LoadAndDelete(key); ok {
 		releaseEvictedClient(v.(*poolEntry).client)
 	}
@@ -263,7 +270,14 @@ func newCodexStandardTransport(proxyURL string) http.RoundTripper {
 }
 
 func newCodexTransport(proxyURL string) http.RoundTripper {
-	switch codexTransportModeFromEnv() {
+	if CodexTLSImpersonationEnabled() {
+		return newCodexProfileTransport(proxyURL)
+	}
+	return newLegacyCodexTransport(proxyURL)
+}
+
+func newLegacyCodexTransport(proxyURL string) http.RoundTripper {
+	switch legacyCodexTransportModeFromEnv() {
 	case codexTransportModeUTLSChrome:
 		return NewUTLSTransport(proxyURL)
 	default:
@@ -316,8 +330,15 @@ func logCodexFingerprintDebug(kind string, account *auth.Account, proxyURL strin
 }
 
 // getPooledClient 获取或创建连接池中的 HTTP Client（按账号隔离，TTL 自动淘汰）
+func codexAccountTransportMode(account *auth.Account) string {
+	if account != nil && account.IsRelayStyle() {
+		return legacyCodexTransportModeFromEnv()
+	}
+	return codexTransportModeFromEnv()
+}
+
 func getPooledClient(account *auth.Account, proxyURL string) *http.Client {
-	transportMode := codexTransportModeFromEnv()
+	transportMode := codexAccountTransportMode(account)
 	key := clientPoolKey(account, proxyURL, transportMode)
 	if v, ok := clientPool.Load(key); ok {
 		entry := v.(*poolEntry)
@@ -325,7 +346,10 @@ func getPooledClient(account *auth.Account, proxyURL string) *http.Client {
 		return entry.client
 	}
 
-	transport := newCodexTransport(proxyURL)
+	transport := newLegacyCodexTransport(proxyURL)
+	if transportMode == "codex_tls" {
+		transport = newCodexProfileTransport(proxyURL)
+	}
 
 	entry := &poolEntry{
 		createdAt: time.Now().UnixNano(),
@@ -598,6 +622,7 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		}
 	}
 	if wantWebsocket && WebsocketExecuteFunc != nil {
+		requestBody, headers = prepareCodexProtocolMetadata(requestBody, account, sessionID, headers)
 		requestBody, headers = prepareCodexResponsesLiteTransport(requestBody, headers, true, responsesLite)
 		if responsesLite {
 			requestBody = normalizeCodexResponsesLiteBody(requestBody, false)
@@ -651,41 +676,9 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		return nil, ErrNoAvailableAccount()
 	}
 
-	// ==================== Codex 请求体优化 ====================
-	// 参考 CLIProxyAPI/codex_executor.go + sub2api 的实现
-
-	// 1. 确保 instructions 字段存在（Codex 后端要求）
-	if !gjson.GetBytes(requestBody, "instructions").Exists() {
-		requestBody, _ = sjson.SetBytes(requestBody, "instructions", "")
-	}
-
-	// 2. 清理可能导致上游报错的多余字段
-	requestBody, _ = sjson.DeleteBytes(requestBody, "previous_response_id")
-	// 注意：HTTP /responses 上游不接受 prompt_cache_retention（会 400），必须删除；
-	// 该字段的 cache 收益只在 WS 路径注入（见 wsrelay 的 prepareWebsocketBody）。
-	requestBody, _ = sjson.DeleteBytes(requestBody, "prompt_cache_retention")
-	requestBody, _ = sjson.DeleteBytes(requestBody, "safety_identifier")
-	requestBody, _ = sjson.DeleteBytes(requestBody, "disable_response_storage")
-	// 顶层 type 是 Responses WS 事件信封字段（response.create），native WS ingress 的
-	// 1009 降级、生图强制 HTTP、Agent Identity 强制 HTTP 都会复用带信封的 body，而
-	// HTTP /responses 上游不接受它（400 Unsupported parameter: type）。此处为出站
-	// 收口兜底；sjson 只删顶层路径，input[] 等嵌套 type 不受影响（issue #548）。
-	requestBody, _ = sjson.DeleteBytes(requestBody, "type")
-
-	// 3. 注入 prompt_cache_key（如果请求体中没有，且 sessionID 不为空）
-	existingCacheKey := strings.TrimSpace(gjson.GetBytes(requestBody, "prompt_cache_key").String())
-	cacheKey := existingCacheKey
-	if sessionID != "" {
-		cacheKey = sessionID
-		requestBody, _ = sjson.SetBytes(requestBody, "prompt_cache_key", cacheKey)
-	}
-
+	wirePayload := prepareCodexHTTPWirePayload(requestBody, account, sessionID, headers)
+	requestBody = wirePayload.body
 	endpoint := CodexBaseURL + "/responses"
-
-	// 出站字节在选客户端之前定稿：send() 会因 Agent Identity 401 重注册而重放，
-	// 两次重放必须发同一份字节。routing hint 等需要读字段的改写点继续用明文
-	// requestBody——它们解析 JSON，拿到压缩帧只会静默失配。
-	outboundBody, contentEncoding := CompressCodexRequestBody(requestBody)
 
 	// 票据绑定出口优先：上游认可的 turn state 与铸造它的粘性出口必须一致。
 	if boundProxy := CodexTurnStateProxyFromContext(ctx); boundProxy != "" {
@@ -697,23 +690,10 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	client := egress.Client()
 
 	send := func() (*http.Response, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(outboundBody))
+		req, err := newCodexHTTPWireRequest(ctx, endpoint, account, accessToken, apiKey, deviceCfg, wirePayload)
 		if err != nil {
 			return nil, ErrInternalError("创建请求失败", err)
 		}
-
-		// ==================== 请求头（伪装 Codex CLI） ====================
-		applyCodexRequestHeaders(req, account, accessToken, cacheKey, apiKey, deviceCfg, headers)
-		// 凭据级 turn state 注入在账号自定义头之后落定：自定义头不该顶掉它。
-		applyCodexTurnStateInjectionHeader(ctx, req.Header)
-		// Content-Encoding 在通用头装配之后设置：真实客户端也是在编码完成时才补这个头
-		// （codex-rs/http-client/src/request.rs prepare_encoded_json），且账号自定义头
-		// 不该有能力声明一个与实际字节不符的编码。
-		if contentEncoding != "" {
-			req.Header.Set("Content-Encoding", contentEncoding)
-		}
-		// routing hint 由网关按最终出站 body 合成，须在账号自定义头之后设置。
-		ApplyCodexRoutingHint(req.Header, account, requestBody)
 
 		egress.ApplyHeaders(req.Header)
 		logCodexFingerprintDebug("http", account, egress.DialProxyURL, req.Header)
@@ -1004,6 +984,7 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 	// 必须用 prepareCodexResponsesLiteTransport 之后的 headers（它可能返回克隆），
 	// 与下方 applyCodexRequestHeaders 取同一份下游头，两处推导结果才一致。
 	requestBody = ApplyCodexFingerprintToBody(requestBody, account, headers)
+	requestBody, headers = prepareCodexProtocolMetadata(requestBody, account, sessionID, headers)
 	requestBody = ApplyCodexTimezoneToBody(requestBody, account, time.Now())
 	// 凭据级 turn state 强制注入：compact 与普通轮共用同一条回合状态。
 	ctx, requestBody, headers = prepareCodexTurnStateInjection(ctx, account, requestBody, headers, false)
@@ -1056,6 +1037,13 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 
 func codexVersionFromProfile(profile deviceProfile, fallback string) string {
 	if profile.HasVersion {
+		// cliVersion only stores the numeric components used for ordering. When
+		// the client advertises a prerelease (for example
+		// 0.155.0-alpha9.2), derive the outbound version from the original UA so
+		// the prerelease identifier is not silently dropped.
+		if version := codexVersionFromUserAgent(profile.UserAgent, ""); version != "" {
+			return version
+		}
 		return fmt.Sprintf("%d.%d.%d", profile.Version.major, profile.Version.minor, profile.Version.patch)
 	}
 	return strings.TrimSpace(fallback)
@@ -1250,6 +1238,7 @@ func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessTo
 	// 指纹收敛必须在白名单透传之后（覆盖客户端原值）、账号自定义头之前（运维显式
 	// 配置保持最终优先）。off 档为空操作。
 	ApplyCodexFingerprintHeaders(req.Header, account, downstreamHeaders)
+	ApplyCodexProtocolHeaders(req.Header, downstreamHeaders)
 	if accountID != "" {
 		req.Header.Set("Chatgpt-Account-Id", accountID)
 	}

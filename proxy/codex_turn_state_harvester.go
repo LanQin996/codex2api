@@ -864,7 +864,7 @@ func (h *CodexTurnStateHarvester) probe(ctx context.Context, account *auth.Accou
 			if err != nil {
 				return verifiedCodexTurnStateProbe{}, err
 			}
-			sessionID := uuid.NewString()
+			sessionID := codexTicketProbeSessionID()
 			state, status, responseModel, err := h.fireTicketProbe(attemptCtx, account, token, model, cfg, proxyURL, sessionID, "")
 			if err == nil && status == http.StatusOK && auth.ValidCodexTurnStateTicketValue(state, cfg.TargetLength) && responseModelMatches(model, responseModel) {
 				// Replay the candidate on the same session and egress. An accepted
@@ -1211,6 +1211,10 @@ func TriggerCodexTurnStateProbes(accountID int64, model string) int {
 }
 
 func (h *CodexTurnStateHarvester) fireProbe(ctx context.Context, account *auth.Account, token, model string, cfg *CodexTurnStateTicketConfig) (string, int, error) {
+	if codexTicketSharedProtocolEnabled() {
+		state, status, _, err := h.fireTicketProbe(ctx, account, token, model, cfg, cfg.HarvestProxyURL, codexTicketProbeSessionID(), "")
+		return state, status, err
+	}
 	body, _ := json.Marshal(map[string]any{"model": model, "store": false, "stream": true, "instructions": "Reply with exactly: pong", "input": []any{map[string]any{"role": "user", "content": []any{map[string]any{"type": "input_text", "text": "ping"}}}}})
 	attemptCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.AttemptTimeoutSeconds)*time.Second)
 	defer cancel()
@@ -1240,7 +1244,18 @@ func (h *CodexTurnStateHarvester) fireProbe(ctx context.Context, account *auth.A
 }
 
 func (h *CodexTurnStateHarvester) fireProbeWithProxy(ctx context.Context, account *auth.Account, token, model string, cfg *CodexTurnStateTicketConfig, proxyURL string) (string, int, string, error) {
-	return h.fireTicketProbe(ctx, account, token, model, cfg, proxyURL, uuid.NewString(), "")
+	return h.fireTicketProbe(ctx, account, token, model, cfg, proxyURL, codexTicketProbeSessionID(), "")
+}
+
+func codexTicketSharedProtocolEnabled() bool {
+	return codexEnvEnabled("CODEX_TICKET_SHARED_PROTOCOL")
+}
+
+func codexTicketProbeSessionID() string {
+	if codexTicketSharedProtocolEnabled() {
+		return NewUpstreamSessionUUID()
+	}
+	return uuid.NewString()
 }
 
 func (h *CodexTurnStateHarvester) fireTicketProbe(ctx context.Context, account *auth.Account, token, model string, cfg *CodexTurnStateTicketConfig, proxyURL, sessionID, candidate string) (string, int, string, error) {
@@ -1272,13 +1287,27 @@ func (h *CodexTurnStateHarvester) fireTicketProbe(ctx context.Context, account *
 	applyCodexRequestHeaders(req, account, token, req.Header.Get("session_id"), "", nil, http.Header{})
 	applyCodexTurnStateHarvestIdentity(req.Header, model)
 	applyTicketReplayHeader(req.Header, candidate)
+	var client *http.Client
+	if codexTicketSharedProtocolEnabled() {
+		// Share the native /responses wire builder and transport selection.
+		// Keep the probe's explicit sticky egress and acquisition/replay logic.
+		wirePayload := prepareCodexHTTPWirePayload(body, account, sessionID, http.Header{})
+		req, err = newCodexHTTPWireRequest(attemptCtx, CodexBaseURL+"/responses", account, token, "", nil, wirePayload)
+		if err != nil {
+			return "", 0, "", err
+		}
+		applyCodexTurnStateHarvestIdentity(req.Header, model)
+		applyTicketReplayHeader(req.Header, candidate)
+		client = getPooledClient(account, proxyURL)
+	} else {
+		client = NewUTLSHttpClient(proxyURL)
+		defer client.CloseIdleConnections()
+	}
 	phase := "acquire"
 	if candidate != "" {
 		phase = "replay"
 	}
 	started := time.Now()
-	client := NewUTLSHttpClient(proxyURL)
-	defer client.CloseIdleConnections()
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", 0, "", &codexTurnStateStageError{stage: "proxy/upstream_request", err: errors.New(redactTicketDiagnostic(err.Error(), token, proxyURL, candidate))}

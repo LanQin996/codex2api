@@ -1234,6 +1234,15 @@ func (m *Manager) createConnection(
 			return nil, err
 		}
 	}
+	if proxy.CodexTLSImpersonationEnabled() && strings.HasPrefix(wsURL, "wss://") && !account.IsRelayStyle() {
+		// Tunnel first, then apply uTLS to the target. Leaving Gorilla's Proxy
+		// wrapper active would apply TLS to the proxy before CONNECT.
+		dialProxy := proxy.CodexDialProxyURL(account, proxyURL)
+		dialer.Proxy = nil
+		dialer.NetDialTLSContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			return proxy.DialCodexTLS(ctx, network, address, dialProxy, nil)
+		}
+	}
 
 	// 创建会话（先关闭旧 session 避免泄漏）
 	poolKey := m.poolKey(account.ID(), wsURL, sessionKey, proxyURL)
