@@ -40,6 +40,8 @@ type CodexTurnStateTicket struct {
 	ExitIP            string    `json:"exit_ip,omitempty"`
 	VerifiedModel     string    `json:"verified_model,omitempty"`
 	FernetBlocks      int       `json:"fernet_blocks,omitempty"`
+	// Persist the route with the exact ticket, not in an independently rotating jar.
+	RouteCookies []CodexRouteCookie `json:"route_cookies,omitempty"`
 }
 
 // CodexTurnStateFernetBlocks decodes only the public Fernet envelope. It does
@@ -88,6 +90,9 @@ func (t CodexTurnStateTicket) Valid(now time.Time, targetLength int) bool {
 
 // StoredValid checks only local structure and the configured expiry, not upstream acceptance.
 func (t CodexTurnStateTicket) StoredValid(now time.Time, targetLength int) bool {
+	if len(t.RouteCookies) > 0 && CodexTicketCookieHeader(t.RouteCookies, "https://chatgpt.com/backend-api/codex/responses", now) == "" {
+		return false
+	}
 	state := strings.TrimSpace(t.State)
 	return ValidCodexTurnStateTicketValue(state, targetLength) && t.Length == len(state) && !t.ExpiresAt.IsZero() && now.Before(t.ExpiresAt)
 }

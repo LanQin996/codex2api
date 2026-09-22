@@ -39,6 +39,7 @@ type WsConnection struct {
 	// 不能用当前配置重新推导，否则设置变更后会记录并未发送的 UA。
 	upstreamUserAgent      string
 	upstreamUserAgentKnown bool
+	routeCookieFingerprint string
 
 	// 创建/复用该连接的账号。仅用于读取当前动态并发上限，让 response_id
 	// 续链复用路径也能在账号上限下调后收敛空闲连接数。
@@ -1279,6 +1280,7 @@ func (m *Manager) createConnection(
 	wc.poolKeyProxyURL = strings.TrimSpace(proxyURL)
 	wc.upstreamUserAgent = strings.TrimSpace(headers.Get("User-Agent"))
 	wc.upstreamUserAgentKnown = true
+	wc.routeCookieFingerprint = proxy.CodexRouteCookieFingerprint(headers)
 	wc.httpResp = resp
 	wc.onDisconnected = m.getOnDisconnected()
 	wc.onReadFailure = m.DiscardConnection
@@ -1447,9 +1449,12 @@ func (m *Manager) lookupResponseConn(responseID string, accountID int64, apiKey 
 // 上游按铸造出口校验票据，换出口发同一张票据必被拒收，因此宁可丢续链（上游可能回
 // previous response not found），也不换出口。回退路径的池键本就含出口，会在绑定出口上
 // 新建连接。requiredProxyURL 为空时不做任何出口判断，续链亲和与既有行为完全一致。
-func (m *Manager) AcquirePreferredConnection(responseID string, accountID int64, apiKey string, requiredProxyURL string) (*WsConnection, *PendingRequest, string) {
+func (m *Manager) AcquirePreferredConnection(responseID string, accountID int64, apiKey string, requiredProxyURL string, requiredCookie ...string) (*WsConnection, *PendingRequest, string) {
 	wc, sessionKey := m.lookupResponseConn(responseID, accountID, apiKey)
 	if wc == nil {
+		return nil, nil, ""
+	}
+	if len(requiredCookie) > 0 && wc.routeCookieFingerprint != requiredCookie[0] {
 		return nil, nil, ""
 	}
 	if required := strings.TrimSpace(requiredProxyURL); required != "" && required != wc.poolKeyProxyURL {

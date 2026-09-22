@@ -29,6 +29,32 @@ type CodexRouteCookie struct {
 	Secure   bool   `json:"secure"`
 }
 
+// CodexTicketCookies parses an isolated candidate jar. Never seed it with another
+// ticket's cookies. Only __oailb is part of the tested ticket/route pair.
+func CodexTicketCookies(lines []string, scope string, now time.Time) []CodexRouteCookie {
+	a := &Account{}
+	a.ReplaceCodexRouteCookies("ticket", scope, lines, now)
+	var out []CodexRouteCookie
+	for _, c := range a.SnapshotCodexRouteCookies()["ticket"] {
+		if c.Name == "__oailb" {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+func CodexTicketCookieHeader(cookies []CodexRouteCookie, scope string, now time.Time) string {
+	// Revalidate even persisted cookie fields before rendering a request header.
+	var safe []CodexRouteCookie
+	for _, c := range cookies {
+		if c.Name == "__oailb" && validStoredRouteCookie(c) {
+			safe = append(safe, c)
+		}
+	}
+	a := &Account{codexRouteCookies: map[string][]CodexRouteCookie{"ticket": safe}}
+	return a.CodexRouteCookieHeader("ticket", scope, now)
+}
+
 type routeCookieJar struct {
 	mu      sync.Mutex
 	byModel map[string][]CodexRouteCookie

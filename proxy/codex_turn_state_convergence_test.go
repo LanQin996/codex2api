@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -431,7 +432,7 @@ func TestCodexTurnStateConvergenceUnboundHarvestKeepsBoundTicket(t *testing.T) {
 	assertConvergenceDial(t, "undecided attempt", s.boundEgress, boundBefore, "sid-"+mintedSID)
 	assertNoConvergenceDial(t, "undecided attempt", s.poolEgress, poolBefore)
 	harvestOn(undecided, convergenceTurnStateValue(5, 12))
-	if got := storedTicket(t, s.account); got != bound {
+	if got := storedTicket(t, s.account); !reflect.DeepEqual(got, bound) {
 		t.Fatalf("无记录器尝试的回购顶掉了绑定票据: %+v", got)
 	}
 
@@ -443,7 +444,7 @@ func TestCodexTurnStateConvergenceUnboundHarvestKeepsBoundTicket(t *testing.T) {
 		t.Fatalf("unbound attempt 的出口 = %q decided=%v，期望 decided=true 且无绑定出口", proxyURL, decided)
 	}
 	harvestOn(unbound, convergenceTurnStateValue(6, 12))
-	if got := storedTicket(t, s.account); got != bound {
+	if got := storedTicket(t, s.account); !reflect.DeepEqual(got, bound) {
 		t.Fatalf("无绑定出口尝试的回购顶掉了绑定票据: %+v", got)
 	}
 

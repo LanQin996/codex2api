@@ -190,18 +190,25 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	// 同线程上的后台副请求（request_kind=memory、guardian 子代理）另成一道，
 	// 不与用户在飞轮次同键排队；Desktop 走 HTTP 时元数据只在请求体里。
 	poolSessionID := proxy.ResolveCodexWebsocketTransportSessionKeyWithBody(sessionID, ginHeaders, wsBody)
+	routeFingerprint := proxy.CodexRouteCookieFingerprint(headers)
+	if routeFingerprint != "" {
+		poolSessionID += ":route:" + routeFingerprint
+	}
 	var wc *WsConnection
 	var pr *PendingRequest
 	var err2 error
 	acquireStart := time.Now()
 	if prevRespID := strings.TrimSpace(gjson.GetBytes(wsBody, "previous_response_id").String()); prevRespID != "" {
-		if pwc, ppr, slotKey := e.manager.AcquirePreferredConnection(prevRespID, account.ID(), apiKey, ticketBoundProxy); pwc != nil {
+		if pwc, ppr, slotKey := e.manager.AcquirePreferredConnection(prevRespID, account.ID(), apiKey, ticketBoundProxy, routeFingerprint); pwc != nil {
 			wc, pr, poolSessionID = pwc, ppr, slotKey
 		}
 	}
 	baseKey := strings.TrimSpace(poolRouteKey)
 	if baseKey == "" && headerSessionID != sessionID {
 		baseKey = headerSessionID
+	}
+	if baseKey != "" && routeFingerprint != "" {
+		baseKey += ":route:" + routeFingerprint
 	}
 	if wc == nil {
 		if proxy.IsStatelessWebsocketSessionID(sessionID) && baseKey != "" && !statelessOneShotEnabled() {

@@ -147,14 +147,18 @@ func (h *CodexTurnStateHarvester) verifyLoadedTicket(ctx context.Context, accoun
 	if !ok || !ticket.NeedsVerification {
 		return false, nil
 	}
-	if !ticket.StoredValid(time.Now(), cfg.TargetLength) || ticket.ProxyURL == "" {
+	if !ticket.StoredValid(time.Now(), cfg.TargetLength) || auth.CodexTicketCookieHeader(ticket.RouteCookies, CodexBaseURL+"/responses", time.Now()) == "" {
 		h.invalidateTicket(account, model, ticket.State)
 		return false, nil
 	}
 	if err := h.acquireProbeSlot(ctx, account.ID()); err != nil {
 		return true, err
 	}
-	state, status, responseModel, err := h.fireTicketProbe(ctx, account, token, model, cfg, ticket.ProxyURL, uuid.NewString(), ticket.State)
+	verifyCtx, capture := WithCodexRouteCookieCapture(ctx)
+	capture.probe = true
+	capture.scope = CodexBaseURL + "/responses"
+	capture.seed = append([]auth.CodexRouteCookie(nil), ticket.RouteCookies...)
+	state, status, responseModel, err := h.fireTicketProbe(verifyCtx, account, token, model, cfg, h.store.ResolveProxyForAccount(account), uuid.NewString(), ticket.State)
 	h.releaseProbeSlot(account.ID())
 	if err != nil {
 		if errors.Is(err, errTicketRejected) {
@@ -167,6 +171,7 @@ func (h *CodexTurnStateHarvester) verifyLoadedTicket(ctx context.Context, accoun
 		return true, err
 	}
 	accepted, valid := acceptedCodexTicket(ticket.State, state, status, model, responseModel, cfg.TargetLength)
+	valid = valid && auth.CodexTicketCookieHeader(capturedTicketCookies(capture), CodexBaseURL+"/responses", time.Now()) != ""
 	if !valid {
 		h.invalidateTicket(account, model, ticket.State)
 		return false, nil
@@ -181,6 +186,13 @@ func (h *CodexTurnStateHarvester) verifyLoadedTicket(ctx context.Context, accoun
 		current.NeedsVerification = false
 		current.FernetBlocks, _ = auth.CodexTurnStateFernetBlocks(accepted)
 		current.VerifiedModel = responseModel
+		current.RouteCookies = capturedTicketCookies(capture)
+		current.ProxyURL = ""
+		for _, c := range current.RouteCookies {
+			if c.Expires > 0 && time.Unix(c.Expires, 0).Before(current.ExpiresAt) {
+				current.ExpiresAt = time.Unix(c.Expires, 0)
+			}
+		}
 		account.CodexTurnStateTickets[model] = current
 	}
 	account.Mu().Unlock()

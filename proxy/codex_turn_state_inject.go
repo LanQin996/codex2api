@@ -29,6 +29,23 @@ import (
 const codexTurnStateMetadataKey = "x-codex-turn-state"
 
 type codexTurnStateInjectionKey struct{}
+type codexTicketPairKey struct{}
+type codexTicketPairSnapshot struct {
+	Ticket  *auth.CodexTurnStateTicket
+	Account *auth.Account
+}
+
+func ticketPairFromContext(ctx context.Context, account *auth.Account) *auth.CodexTurnStateTicket {
+	if ctx == nil {
+		return nil
+	}
+	p, _ := ctx.Value(codexTicketPairKey{}).(*codexTicketPairSnapshot)
+	if p == nil || p.Account != account {
+		return nil
+	}
+	return p.Ticket
+}
+
 type codexTurnStateProxyKey struct{}
 type codexClientModelKey struct{}
 type codexTurnStateBindingKey struct{}
@@ -217,11 +234,17 @@ func prepareCodexTurnStateInjection(ctx context.Context, account *auth.Account, 
 	if injected == "" && cfg.Enabled && cfg.ModelManaged(clientModel, upstreamModel) {
 		if ticket, ok := account.CodexTurnStateTicket(upstreamModel, cfg.TargetLength, time.Now()); ok {
 			injected = ticket.State
+			if len(ticket.RouteCookies) > 0 {
+				ctx = context.WithValue(ctx, codexTicketPairKey{}, &codexTicketPairSnapshot{Ticket: &ticket, Account: account})
+			}
 			if cfg.TicketProxySticky {
 				injectedProxy = ticket.ProxyURL
 			}
 		} else if ticket, ok := account.CodexTurnStateTicket(clientModel, cfg.TargetLength, time.Now()); ok {
 			injected = ticket.State
+			if len(ticket.RouteCookies) > 0 {
+				ctx = context.WithValue(ctx, codexTicketPairKey{}, &codexTicketPairSnapshot{Ticket: &ticket, Account: account})
+			}
 			if cfg.TicketProxySticky {
 				injectedProxy = ticket.ProxyURL
 			}
@@ -229,6 +252,18 @@ func prepareCodexTurnStateInjection(ctx context.Context, account *auth.Account, 
 	}
 	if injected == "" {
 		injected = account.CodexTurnStateInjection(clientModel, upstreamModel)
+	}
+	// Match caller-preserved tickets only to the same account/model's exact pair.
+	if ticketPairFromContext(ctx, account) == nil && injected != "" {
+		for _, model := range []string{upstreamModel, clientModel} {
+			if ticket, ok := account.CodexTurnStateTicket(model, cfg.TargetLength, time.Now()); ok && ticket.State == injected && len(ticket.RouteCookies) > 0 {
+				ctx = context.WithValue(ctx, codexTicketPairKey{}, &codexTicketPairSnapshot{Ticket: &ticket, Account: account})
+				break
+			}
+		}
+	}
+	if ticketPairFromContext(ctx, account) != nil {
+		injectedProxy = ""
 	}
 	if injected == "" {
 		noteCodexTurnStateEgress(ctx, injectedProxy)

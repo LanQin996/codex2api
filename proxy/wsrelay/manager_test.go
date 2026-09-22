@@ -746,6 +746,24 @@ func TestAcquirePreferredConnection(t *testing.T) {
 	}
 }
 
+func TestAcquirePreferredConnectionRejectsRotatedRouteCookie(t *testing.T) {
+	manager := NewManager()
+	t.Cleanup(manager.Stop)
+	manager.probeFunc = func(*WsConnection) bool { return true }
+	wc := newBoundTestConn(t, manager, 7, "base#3")
+	wc.routeCookieFingerprint = "old-cookie-hash"
+	manager.BindResponseConn("resp_pair", wc, "base#3", 7, "key-A")
+	if got, pr, _ := manager.AcquirePreferredConnection("resp_pair", 7, "key-A", "", "new-cookie-hash"); got != nil || pr != nil {
+		t.Fatal("reused handshake with stale cookie")
+	}
+	if wc.session.PendingCount() != 0 {
+		t.Fatal("rejected connection acquired a lease")
+	}
+	if got, pr, _ := manager.AcquirePreferredConnection("resp_pair", 7, "key-A", "", "old-cookie-hash"); got != wc || pr == nil {
+		t.Fatal("matching cookie prevented continuation")
+	}
+}
+
 func TestAcquirePreferredConnectionProbeDoesNotBlockDifferentPoolKey(t *testing.T) {
 	manager := NewManager()
 	t.Cleanup(manager.Stop)

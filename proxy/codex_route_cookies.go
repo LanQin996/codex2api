@@ -2,6 +2,8 @@ package proxy
 
 import (
 	"context"
+	"crypto/sha256"
+	"fmt"
 	"log"
 	"net/http"
 	"net/url"
@@ -16,8 +18,75 @@ type codexRouteCookieModelKey struct{}
 type codexRouteCookieCaptureKey struct{}
 
 type codexRouteCookieCapture struct {
-	scope string
-	lines []string
+	scope      string
+	lines      []string
+	capturedAt time.Time
+	// Set by the probe, isolated from the live account's previously published pair.
+	probe bool
+	seed  []auth.CodexRouteCookie
+}
+
+func capturedTicketCookies(c *codexRouteCookieCapture) []auth.CodexRouteCookie {
+	if c == nil {
+		return nil
+	}
+	// Rebuild from the captured response sequence, respecting cookie deletion.
+	if len(c.lines) == 0 {
+		return append([]auth.CodexRouteCookie(nil), c.seed...)
+	}
+	jar := &auth.Account{}
+	var lines []string
+	for _, cookie := range c.seed {
+		domain := cookie.Domain
+		if cookie.HostOnly {
+			domain = ""
+		}
+		h := (&http.Cookie{Name: cookie.Name, Value: cookie.Value, Path: cookie.Path, Domain: domain, Secure: cookie.Secure}).String()
+		if cookie.Expires > 0 {
+			h = (&http.Cookie{Name: cookie.Name, Value: cookie.Value, Path: cookie.Path, Domain: domain, Secure: cookie.Secure, Expires: time.Unix(cookie.Expires, 0)}).String()
+		}
+		lines = append(lines, h)
+	}
+	lines = append(lines, c.lines...)
+	at := c.capturedAt
+	if at.IsZero() {
+		at = time.Now()
+	}
+	jar.ReplaceCodexRouteCookies("ticket", c.scope, lines, at)
+	var out []auth.CodexRouteCookie
+	for _, v := range jar.SnapshotCodexRouteCookies()["ticket"] {
+		if v.Name == "__oailb" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+func setPairedRouteCookie(headers http.Header, value string) {
+	r := &http.Request{Header: headers}
+	cookies := r.Cookies()
+	headers.Del("Cookie")
+	for _, c := range cookies {
+		if c.Name != "__oailb" && c.Name != "__cflb" {
+			r.AddCookie(c)
+		}
+	}
+	if value != "" {
+		for _, c := range (&http.Request{Header: http.Header{"Cookie": []string{value}}}).Cookies() {
+			r.AddCookie(c)
+		}
+	}
+}
+
+// Fingerprints isolate WS handshakes when __oailb rotates without logging it.
+func CodexRouteCookieFingerprint(headers http.Header) string {
+	for _, c := range (&http.Request{Header: headers}).Cookies() {
+		if c.Name == "__oailb" {
+			sum := sha256.Sum256([]byte(c.Value))
+			return fmt.Sprintf("%x", sum[:])
+		}
+	}
+	return ""
 }
 
 func WithCodexRouteCookieScope(ctx context.Context, rawURL, model string) context.Context {
@@ -54,7 +123,7 @@ func codexRouteCookieCaptureFromContext(ctx context.Context) *codexRouteCookieCa
 }
 
 func ApplyCodexRouteCookies(ctx context.Context, headers http.Header, account *auth.Account, rawURL, model string) {
-	if headers == nil || account == nil || strings.TrimSpace(headers.Get(codexTurnStateHeader)) == "" || strings.TrimSpace(headers.Get("Cookie")) != "" {
+	if headers == nil || account == nil || strings.TrimSpace(headers.Get(codexTurnStateHeader)) == "" {
 		return
 	}
 	model = strings.TrimSpace(model)
@@ -63,6 +132,26 @@ func ApplyCodexRouteCookies(ctx context.Context, headers http.Header, account *a
 	}
 	scope, ok := codexRouteCookieScope(rawURL)
 	if !ok {
+		return
+	}
+	if capture := codexRouteCookieCaptureFromContext(ctx); capture != nil && capture.probe {
+		setPairedRouteCookie(headers, auth.CodexTicketCookieHeader(capturedTicketCookies(capture), scope, time.Now()))
+		return
+	}
+	if pair := ticketPairFromContext(ctx, account); pair != nil && pair.State == headers.Get(codexTurnStateHeader) {
+		setPairedRouteCookie(headers, auth.CodexTicketCookieHeader(pair.RouteCookies, scope, time.Now()))
+		return
+	}
+	account.Mu().RLock()
+	ticket, found := account.CodexTurnStateTickets[strings.ToLower(model)]
+	account.Mu().RUnlock()
+	if found && len(ticket.RouteCookies) > 0 {
+		if ticket.State == headers.Get(codexTurnStateHeader) {
+			setPairedRouteCookie(headers, auth.CodexTicketCookieHeader(ticket.RouteCookies, scope, time.Now()))
+		}
+		return
+	}
+	if strings.TrimSpace(headers.Get("Cookie")) != "" {
 		return
 	}
 	if value := account.CodexRouteCookieHeader(model, scope, time.Now()); value != "" {
@@ -92,6 +181,9 @@ func ObserveCodexRouteResponseCookies(ctx context.Context, account *auth.Account
 	}
 	if capture := codexRouteCookieCaptureFromContext(ctx); capture != nil {
 		capture.scope = scope
+		if capture.capturedAt.IsZero() {
+			capture.capturedAt = time.Now()
+		}
 		capture.lines = append(capture.lines, lines...)
 		return
 	}

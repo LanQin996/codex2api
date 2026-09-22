@@ -458,6 +458,10 @@ func CommitCodexTurnStateRequest(ctx context.Context) {
 		account.Mu().RLock()
 		current := account.CodexTurnStateTickets[pending.key.model]
 		account.Mu().RUnlock()
+		if len(current.RouteCookies) > 0 {
+			h.commitPairedTicketResponse(ctx, account, pending, current)
+			return
+		}
 		if pending.candidate == "" {
 			MergeCapturedCodexRouteCookies(account, pending.key.model, pending.routeCapture)
 			return
@@ -938,12 +942,18 @@ func (h *CodexTurnStateHarvester) probe(ctx context.Context, account *auth.Accou
 			}
 			sessionID := codexTicketProbeSessionID()
 			probeCtx, routeCapture := WithCodexRouteCookieCapture(attemptCtx)
+			routeCapture.probe = true
 			state, status, responseModel, err := h.fireTicketProbe(probeCtx, account, token, model, cfg, proxyURL, sessionID, "")
 			if err == nil && status == http.StatusOK && auth.ValidCodexTurnStateTicketValue(state, cfg.TargetLength) && responseModelMatches(model, responseModel) {
-				// Replay the candidate on the same session and egress. An accepted
-				// ticket may rotate; retain a valid replacement instead of demanding equality.
-				verifyState, verifyStatus, verifyModel, verifyErr := h.fireTicketProbe(probeCtx, account, token, model, cfg, proxyURL, sessionID, state)
+				if auth.CodexTicketCookieHeader(capturedTicketCookies(routeCapture), CodexBaseURL+"/responses", time.Now()) == "" {
+					lastErr = errors.New("ticket acquired without a valid paired __oailb cookie")
+					continue
+				}
+				// Verify the candidate/cookie pair on the account's normal route,
+				// retaining the session. An accepted ticket may rotate.
+				verifyState, verifyStatus, verifyModel, verifyErr := h.fireTicketProbe(probeCtx, account, token, model, cfg, h.store.ResolveProxyForAccount(account), sessionID, state)
 				accepted, ok := acceptedCodexTicket(state, verifyState, verifyStatus, model, verifyModel, cfg.TargetLength)
+				ok = ok && auth.CodexTicketCookieHeader(capturedTicketCookies(routeCapture), CodexBaseURL+"/responses", time.Now()) != ""
 				if verifyErr == nil && ok {
 					return verifiedCodexTurnStateProbe{state: accepted, proxyURL: proxyURL, sid: sid, verifiedModel: firstNonEmptyString(verifyModel, responseModel), routeCapture: routeCapture}, nil
 				}
@@ -992,7 +1002,11 @@ func (h *CodexTurnStateHarvester) probe(ctx context.Context, account *auth.Accou
 // 改变探针成败。proxyURL 含凭据，只用于拨号，绝不写进日志、用量日志或 admin JSON。
 func (h *CodexTurnStateHarvester) publishProbeWinner(ctx context.Context, account *auth.Account, model string, winner verifiedCodexTurnStateProbe) {
 	winner.exitIP = codexTurnStateExitIP(ctx, winner.proxyURL)
-	h.recordTicketWithBinding(account, model, winner.state, "probe", true, winner.proxyURL, winner.sid, winner.verifiedModel, winner.exitIP)
+	if winner.routeCapture != nil {
+		h.recordTicketWithBinding(account, model, winner.state, "probe", true, winner.proxyURL, winner.sid, winner.verifiedModel, winner.exitIP, capturedTicketCookies(winner.routeCapture))
+	} else {
+		h.recordTicketWithBinding(account, model, winner.state, "probe", true, winner.proxyURL, winner.sid, winner.verifiedModel, winner.exitIP)
+	}
 	BindCapturedCodexRouteCookies(account, model, winner.routeCapture)
 }
 
@@ -1064,7 +1078,7 @@ func (h *CodexTurnStateHarvester) recordTicket(account *auth.Account, model, sta
 	h.recordTicketWithBinding(account, model, state, source, enqueuePersistence, "", "", "", "")
 }
 
-func (h *CodexTurnStateHarvester) recordTicketWithBinding(account *auth.Account, model, state, source string, enqueuePersistence bool, proxyURL, proxySID, verifiedModel, exitIP string) {
+func (h *CodexTurnStateHarvester) recordTicketWithBinding(account *auth.Account, model, state, source string, enqueuePersistence bool, proxyURL, proxySID, verifiedModel, exitIP string, pairedCookies ...[]auth.CodexRouteCookie) {
 	if h == nil || account == nil {
 		return
 	}
@@ -1084,6 +1098,18 @@ func (h *CodexTurnStateHarvester) recordTicketWithBinding(account *auth.Account,
 		ExpiresAt: now.Add(time.Duration(cfg.TTLSeconds) * time.Second), Source: source,
 		ProxyURL: strings.TrimSpace(proxyURL), ProxySID: strings.TrimSpace(proxySID),
 		VerifiedModel: strings.TrimSpace(verifiedModel), ExitIP: strings.TrimSpace(exitIP), FernetBlocks: blocks,
+	}
+	if len(pairedCookies) > 0 {
+		if auth.CodexTicketCookieHeader(pairedCookies[0], CodexBaseURL+"/responses", now) == "" {
+			return
+		}
+		ticket.RouteCookies = append([]auth.CodexRouteCookie(nil), pairedCookies[0]...)
+		ticket.ProxyURL = "" // acquisition provenance is not a business egress binding
+		for _, c := range ticket.RouteCookies {
+			if c.Expires > 0 && time.Unix(c.Expires, 0).Before(ticket.ExpiresAt) {
+				ticket.ExpiresAt = time.Unix(c.Expires, 0)
+			}
+		}
 	}
 	if issued, healthy := healthyTicketAge(state, now); healthy {
 		_, hard := effectiveTicketWindows(cfg)
@@ -1369,6 +1395,9 @@ func (h *CodexTurnStateHarvester) fireTicketProbe(ctx context.Context, account *
 	applyCodexRequestHeaders(req, account, token, req.Header.Get("session_id"), "", nil, http.Header{})
 	applyCodexTurnStateHarvestIdentity(req.Header, model)
 	applyTicketReplayHeader(req.Header, candidate)
+	if candidate == "" {
+		setPairedRouteCookie(req.Header, "")
+	}
 	if candidate != "" {
 		ApplyCodexRouteCookies(attemptCtx, req.Header, account, logicalEndpoint, model)
 	}
@@ -1383,6 +1412,9 @@ func (h *CodexTurnStateHarvester) fireTicketProbe(ctx context.Context, account *
 		}
 		applyCodexTurnStateHarvestIdentity(req.Header, model)
 		applyTicketReplayHeader(req.Header, candidate)
+		if candidate == "" {
+			setPairedRouteCookie(req.Header, "")
+		}
 		if candidate != "" {
 			ApplyCodexRouteCookies(attemptCtx, req.Header, account, logicalEndpoint, model)
 		}
@@ -1407,6 +1439,9 @@ func (h *CodexTurnStateHarvester) fireTicketProbe(ctx context.Context, account *
 		_ = resp.Body.Close()
 		// Redact before shortening the summary, so truncation cannot expose a token prefix.
 		cleanBody := redactTicketDiagnostic(string(body), token, proxyURL, candidate)
+		for _, cookie := range req.Cookies() {
+			cleanBody = strings.ReplaceAll(cleanBody, cookie.Value, "[redacted]")
+		}
 		detail := ticketErrorSummary([]byte(cleanBody), resp.Header.Get("Content-Type"))
 		return "", resp.StatusCode, "", &codexTicketHTTPError{status: resp.StatusCode, retryAfter: ticketRetryAfter(resp.Header.Get("Retry-After"), time.Now()), detail: fmt.Sprintf("phase=%s request_id=%q cf_ray=%q retry_after=%q detail=%q", phase, resp.Header.Get("x-request-id"), resp.Header.Get("cf-ray"), resp.Header.Get("Retry-After"), detail)}
 	}
