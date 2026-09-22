@@ -1258,6 +1258,9 @@ func (m *Manager) createConnection(
 
 	// 拨号连接
 	conn, resp, err := dialer.DialContext(ctx, wsURL, headers)
+	if resp != nil {
+		proxy.ObserveCodexRouteResponseCookies(ctx, account, wsURL, resp.Header)
+	}
 	if err != nil {
 		m.sessions.Delete(poolKey)
 		session.Close()

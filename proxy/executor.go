@@ -678,15 +678,15 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 
 	wirePayload := prepareCodexHTTPWirePayload(requestBody, account, sessionID, headers)
 	requestBody = wirePayload.body
-	endpoint := CodexBaseURL + "/responses"
+	logicalEndpoint := CodexBaseURL + "/responses"
 
 	// 票据绑定出口优先：上游认可的 turn state 与铸造它的粘性出口必须一致。
 	if boundProxy := CodexTurnStateProxyFromContext(ctx); boundProxy != "" {
 		proxyURL = boundProxy
 	}
 	// 出口链路统一由 ResolveCodexEgress 决定(Resin > 代理 > 直连,见 egress.go)。
-	egress := ResolveCodexEgress(account, endpoint, proxyURL)
-	endpoint = egress.URL
+	egress := ResolveCodexEgress(account, logicalEndpoint, proxyURL)
+	endpoint := egress.URL
 	client := egress.Client()
 
 	send := func() (*http.Response, error) {
@@ -696,6 +696,9 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		}
 
 		egress.ApplyHeaders(req.Header)
+		model := strings.TrimSpace(gjson.GetBytes(requestBody, "model").String())
+		ApplyCodexRouteCookies(ctx, req.Header, account, logicalEndpoint, model)
+		req = req.WithContext(WithCodexRouteCookieScope(req.Context(), logicalEndpoint, model))
 		logCodexFingerprintDebug("http", account, egress.DialProxyURL, req.Header)
 
 		if err := ConsumeAPIKeyModelRequestQuota(ctx, gjson.GetBytes(requestBody, "model").String()); err != nil {
@@ -997,15 +1000,15 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 	}
 
 	// compact 端点
-	endpoint := CodexBaseURL + "/responses/compact"
+	logicalEndpoint := CodexBaseURL + "/responses/compact"
 
 	// 票据绑定出口优先：compact 与普通轮次共用同一条粘性出口。
 	if boundProxy := CodexTurnStateProxyFromContext(ctx); boundProxy != "" {
 		proxyURL = boundProxy
 	}
 	// 出口链路统一由 ResolveCodexEgress 决定(Resin > 代理 > 直连,见 egress.go)。
-	egress := ResolveCodexEgress(account, endpoint, proxyURL)
-	endpoint = egress.URL
+	egress := ResolveCodexEgress(account, logicalEndpoint, proxyURL)
+	endpoint := egress.URL
 	client := egress.Client()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(requestBody))
@@ -1015,6 +1018,9 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 
 	applyCodexRequestHeaders(req, account, accessToken, cacheKey, apiKey, deviceCfg, headers)
 	applyCodexTurnStateInjectionHeader(ctx, req.Header)
+	compactModel := strings.TrimSpace(gjson.GetBytes(requestBody, "model").String())
+	ApplyCodexRouteCookies(ctx, req.Header, account, logicalEndpoint, compactModel)
+	req = req.WithContext(WithCodexRouteCookieScope(req.Context(), logicalEndpoint, compactModel))
 	// routing hint 由网关按最终出站 body 合成，须在账号自定义头之后设置。
 	ApplyCodexRoutingHint(req.Header, account, requestBody)
 

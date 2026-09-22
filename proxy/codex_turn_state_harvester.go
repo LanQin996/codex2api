@@ -136,6 +136,8 @@ const (
 	codexTurnStateMaxPendingCaptures   = 20000
 	codexTurnStatePendingTTL           = 2 * time.Hour
 	codexTurnStateWorkerCount          = 64
+	codexTurnStatePremintAge           = 200 * time.Second
+	codexTurnStateMintLifetime         = 240 * time.Second
 )
 
 type codexTurnStateProbeKey struct {
@@ -149,6 +151,7 @@ type verifiedCodexTurnStateProbe struct {
 	sid           string
 	verifiedModel string
 	exitIP        string
+	routeCapture  *codexRouteCookieCapture
 }
 
 type codexTurnStateProbeStopError struct {
@@ -204,6 +207,7 @@ type codexTurnStatePendingCapture struct {
 	expiresAt     time.Time
 	candidate     string
 	responseModel string
+	routeCapture  *codexRouteCookieCapture
 }
 
 type codexTurnStatePendingContextKey struct{}
@@ -346,9 +350,11 @@ func BindCodexTurnStateRequest(ctx context.Context, account *auth.Account, model
 		return ctx
 	}
 	now := time.Now()
-	if account.CodexTurnStateTicketInjection(model, cfg.TargetLength, now) == "" || h.ticketNeedsRefresh(account, model, now, cfg) {
+	missingTicket := account.CodexTurnStateTicketInjection(model, cfg.TargetLength, now) == ""
+	if missingTicket || h.ticketNeedsRefresh(account, model, now, cfg) {
 		h.enqueueProbe(codexTurnStateProbeKey{accountID: account.ID(), model: strings.ToLower(model)}, now)
 	}
+	ctx, routeCapture := WithCodexRouteCookieCapture(ctx)
 	id := h.nextID.Add(1)
 	h.pendingMu.Lock()
 	h.prunePendingLocked(now)
@@ -367,7 +373,7 @@ func BindCodexTurnStateRequest(ctx context.Context, account *auth.Account, model
 			delete(h.pending, oldest)
 		}
 	}
-	h.pending[id] = &codexTurnStatePendingCapture{key: codexTurnStateProbeKey{accountID: account.ID(), model: strings.ToLower(model)}, createdAt: now, expiresAt: now.Add(codexTurnStatePendingTTL)}
+	h.pending[id] = &codexTurnStatePendingCapture{key: codexTurnStateProbeKey{accountID: account.ID(), model: strings.ToLower(model)}, createdAt: now, expiresAt: now.Add(codexTurnStatePendingTTL), routeCapture: routeCapture}
 	h.pendingMu.Unlock()
 	return context.WithValue(ctx, codexTurnStatePendingContextKey{}, id)
 }
@@ -442,10 +448,31 @@ func CommitCodexTurnStateRequest(ctx context.Context) {
 	pending := h.pending[id]
 	delete(h.pending, id)
 	h.pendingMu.Unlock()
-	if pending == nil || pending.candidate == "" {
+	if pending == nil {
 		return
 	}
 	if account := h.store.FindByID(pending.key.accountID); account != nil {
+		// A healthy ticket's Fernet lifetime is shorter than the configurable
+		// cache TTL. Ignore an incidental longer replacement while it is still
+		// inside that real window; the background probe owns rotation.
+		account.Mu().RLock()
+		current := account.CodexTurnStateTickets[pending.key.model]
+		account.Mu().RUnlock()
+		if pending.candidate == "" {
+			MergeCapturedCodexRouteCookies(account, pending.key.model, pending.routeCapture)
+			return
+		}
+		previousState := current.State
+		commitRouteCookies := func() {
+			if pending.candidate != previousState {
+				BindCapturedCodexRouteCookies(account, pending.key.model, pending.routeCapture)
+				return
+			}
+			MergeCapturedCodexRouteCookies(account, pending.key.model, pending.routeCapture)
+		}
+		if issued, healthy := healthyTicketAge(current.State, time.Now()); healthy && time.Since(issued) < codexTurnStateMintLifetime && len(pending.candidate) > len(current.State) {
+			return
+		}
 		if pending.responseModel != "" && !responseModelMatches(pending.key.model, pending.responseModel) {
 			h.store.DropAccountCodexTurnStateTicket(account.DBID, pending.key.model)
 			h.enqueueProbe(pending.key, time.Now())
@@ -468,9 +495,11 @@ func CommitCodexTurnStateRequest(ctx context.Context) {
 				return
 			}
 			h.recordTicket(account, pending.key.model, pending.candidate, "response", true)
+			commitRouteCookies()
 			return
 		}
 		h.recordTicketWithBinding(account, pending.key.model, pending.candidate, "response", true, bound, codexTurnStateProxySID(bound), pending.responseModel, "")
+		commitRouteCookies()
 	}
 }
 
@@ -508,6 +537,8 @@ func (h *CodexTurnStateHarvester) persistAccountTickets(ctx context.Context, acc
 	if account == nil || h.db == nil {
 		return
 	}
+	h.persistMu.Lock()
+	defer h.persistMu.Unlock()
 	account.Mu().RLock()
 	tickets := make(map[string]auth.CodexTurnStateTicket, len(account.CodexTurnStateTickets))
 	for model, ticket := range account.CodexTurnStateTickets {
@@ -581,6 +612,10 @@ func (h *CodexTurnStateHarvester) nextRefreshWait(cfg *CodexTurnStateTicketConfi
 				continue
 			}
 			due := ticket.ExpiresAt.Add(-refreshBefore)
+			if issued, healthy := healthyTicketAge(ticket.State, now); healthy {
+				premint, _ := effectiveTicketWindows(cfg)
+				due = issued.Add(premint)
+			}
 			if !due.After(now) {
 				continue // Already queued or deferred; do not spin on a past deadline.
 			}
@@ -834,7 +869,43 @@ func (h *CodexTurnStateHarvester) ticketNeedsRefresh(account *auth.Account, mode
 	account.Mu().RLock()
 	ticket, ok := account.CodexTurnStateTickets[strings.ToLower(strings.TrimSpace(model))]
 	account.Mu().RUnlock()
-	return !ok || ticket.NeedsVerification || ticket.ExpiresAt.Before(now.Add(time.Duration(cfg.RefreshBeforeSeconds)*time.Second))
+	if !ok || ticket.NeedsVerification {
+		return true
+	}
+	if issued, healthy := healthyTicketAge(ticket.State, now); healthy {
+		premint, hard := effectiveTicketWindows(cfg)
+		return !issued.Add(hard).After(now) || !issued.Add(premint).After(now)
+	}
+	return ticket.ExpiresAt.Before(now.Add(time.Duration(cfg.RefreshBeforeSeconds) * time.Second))
+}
+
+func healthyTicketAge(state string, now time.Time) (time.Time, bool) {
+	issued, ok := auth.CodexTurnStateTicketIssuedAt(state)
+	if !ok || issued.IsZero() || issued.Unix() <= 0 || issued.After(now) {
+		return time.Time{}, false
+	}
+	blocks, ok := auth.CodexTurnStateFernetBlocks(state)
+	return issued, ok && (blocks == 10 || blocks == 12)
+}
+
+func effectiveTicketWindows(cfg *CodexTurnStateTicketConfig) (premint, hard time.Duration) {
+	premint, hard = codexTurnStatePremintAge, codexTurnStateMintLifetime
+	if cfg == nil {
+		return premint, hard
+	}
+	if ttl := time.Duration(cfg.TTLSeconds) * time.Second; ttl > 0 && ttl < hard {
+		hard = ttl
+	}
+	if cfg.RefreshBeforeSeconds > 0 {
+		configured := time.Duration(cfg.RefreshBeforeSeconds) * time.Second
+		if configured < premint {
+			premint = configured
+		}
+	}
+	if premint >= hard {
+		premint = hard
+	}
+	return premint, hard
 }
 
 func (h *CodexTurnStateHarvester) probe(ctx context.Context, account *auth.Account, model string, cfg *CodexTurnStateTicketConfig) error {
@@ -866,14 +937,15 @@ func (h *CodexTurnStateHarvester) probe(ctx context.Context, account *auth.Accou
 				return verifiedCodexTurnStateProbe{}, err
 			}
 			sessionID := codexTicketProbeSessionID()
-			state, status, responseModel, err := h.fireTicketProbe(attemptCtx, account, token, model, cfg, proxyURL, sessionID, "")
+			probeCtx, routeCapture := WithCodexRouteCookieCapture(attemptCtx)
+			state, status, responseModel, err := h.fireTicketProbe(probeCtx, account, token, model, cfg, proxyURL, sessionID, "")
 			if err == nil && status == http.StatusOK && auth.ValidCodexTurnStateTicketValue(state, cfg.TargetLength) && responseModelMatches(model, responseModel) {
 				// Replay the candidate on the same session and egress. An accepted
 				// ticket may rotate; retain a valid replacement instead of demanding equality.
-				verifyState, verifyStatus, verifyModel, verifyErr := h.fireTicketProbe(attemptCtx, account, token, model, cfg, proxyURL, sessionID, state)
+				verifyState, verifyStatus, verifyModel, verifyErr := h.fireTicketProbe(probeCtx, account, token, model, cfg, proxyURL, sessionID, state)
 				accepted, ok := acceptedCodexTicket(state, verifyState, verifyStatus, model, verifyModel, cfg.TargetLength)
 				if verifyErr == nil && ok {
-					return verifiedCodexTurnStateProbe{state: accepted, proxyURL: proxyURL, sid: sid, verifiedModel: firstNonEmptyString(verifyModel, responseModel)}, nil
+					return verifiedCodexTurnStateProbe{state: accepted, proxyURL: proxyURL, sid: sid, verifiedModel: firstNonEmptyString(verifyModel, responseModel), routeCapture: routeCapture}, nil
 				}
 				if verifyErr != nil {
 					lastErr = verifyErr
@@ -921,6 +993,7 @@ func (h *CodexTurnStateHarvester) probe(ctx context.Context, account *auth.Accou
 func (h *CodexTurnStateHarvester) publishProbeWinner(ctx context.Context, account *auth.Account, model string, winner verifiedCodexTurnStateProbe) {
 	winner.exitIP = codexTurnStateExitIP(ctx, winner.proxyURL)
 	h.recordTicketWithBinding(account, model, winner.state, "probe", true, winner.proxyURL, winner.sid, winner.verifiedModel, winner.exitIP)
+	BindCapturedCodexRouteCookies(account, model, winner.routeCapture)
 }
 
 // codexTurnStateExitIP 在铸造票据的那条出口上查一次出口 IP：只有它允许离开本进程，
@@ -1011,6 +1084,12 @@ func (h *CodexTurnStateHarvester) recordTicketWithBinding(account *auth.Account,
 		ExpiresAt: now.Add(time.Duration(cfg.TTLSeconds) * time.Second), Source: source,
 		ProxyURL: strings.TrimSpace(proxyURL), ProxySID: strings.TrimSpace(proxySID),
 		VerifiedModel: strings.TrimSpace(verifiedModel), ExitIP: strings.TrimSpace(exitIP), FernetBlocks: blocks,
+	}
+	if issued, healthy := healthyTicketAge(state, now); healthy {
+		_, hard := effectiveTicketWindows(cfg)
+		if hardExpiry := issued.Add(hard); hardExpiry.Before(ticket.ExpiresAt) {
+			ticket.ExpiresAt = hardExpiry
+		}
 	}
 	account.Mu().Lock()
 	if account.CodexTurnStateTickets == nil {
@@ -1274,7 +1353,9 @@ func (h *CodexTurnStateHarvester) fireTicketProbe(ctx context.Context, account *
 	}
 	attemptCtx, cancel := context.WithTimeout(ctx, headerTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, CodexBaseURL+"/responses", bytes.NewReader(body))
+	logicalEndpoint := CodexBaseURL + "/responses"
+	attemptCtx = WithCodexRouteCookieScope(attemptCtx, logicalEndpoint, model)
+	req, err := http.NewRequestWithContext(attemptCtx, http.MethodPost, logicalEndpoint, bytes.NewReader(body))
 	if err != nil {
 		return "", 0, "", err
 	}
@@ -1288,6 +1369,9 @@ func (h *CodexTurnStateHarvester) fireTicketProbe(ctx context.Context, account *
 	applyCodexRequestHeaders(req, account, token, req.Header.Get("session_id"), "", nil, http.Header{})
 	applyCodexTurnStateHarvestIdentity(req.Header, model)
 	applyTicketReplayHeader(req.Header, candidate)
+	if candidate != "" {
+		ApplyCodexRouteCookies(attemptCtx, req.Header, account, logicalEndpoint, model)
+	}
 	var client *http.Client
 	if codexTicketSharedProtocolEnabled() {
 		// Share the native /responses wire builder and transport selection.
@@ -1299,6 +1383,9 @@ func (h *CodexTurnStateHarvester) fireTicketProbe(ctx context.Context, account *
 		}
 		applyCodexTurnStateHarvestIdentity(req.Header, model)
 		applyTicketReplayHeader(req.Header, candidate)
+		if candidate != "" {
+			ApplyCodexRouteCookies(attemptCtx, req.Header, account, logicalEndpoint, model)
+		}
 		client = getPooledClient(account, proxyURL)
 	} else {
 		client = NewUTLSHttpClient(proxyURL)
@@ -1313,6 +1400,7 @@ func (h *CodexTurnStateHarvester) fireTicketProbe(ctx context.Context, account *
 	if err != nil {
 		return "", 0, "", &codexTurnStateStageError{stage: "proxy/upstream_request", err: errors.New(redactTicketDiagnostic(err.Error(), token, proxyURL, candidate))}
 	}
+	ObserveCodexRouteResponseCookies(attemptCtx, account, logicalEndpoint, resp.Header)
 	log.Printf("[codex-turn-state-probe] account=%d phase=%s model=%s sid=%s status=%d length=%d elapsed_ms=%d request_id=%q cf_ray=%q ua=%q version=%q", account.ID(), phase, model, codexTurnStateProxySID(proxyURL), resp.StatusCode, len(strings.TrimSpace(resp.Header.Get(codexTurnStateHeader))), time.Since(started).Milliseconds(), resp.Header.Get("x-request-id"), resp.Header.Get("cf-ray"), req.Header.Get("User-Agent"), req.Header.Get("Version"))
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
