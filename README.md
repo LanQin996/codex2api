@@ -167,6 +167,8 @@ Antigravity accounts are managed as a dedicated Google channel with browser/impo
 
 ## Documentation
 
+For the experimental Linux/Docker Excel upstream, see [Excel bridge deployment](docs/EXCEL_BRIDGE.md). It uses a separate bridge container with the existing OpenAI Responses account type and an explicitly imported session.
+
 | Document | Description | Path |
 | --- | --- | --- |
 | [Chinese README](README.zh-CN.md) | Main Chinese project overview | `README.zh-CN.md` |

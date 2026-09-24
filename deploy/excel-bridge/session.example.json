@@ -1,0 +1,7 @@
+{
+  "headers": {
+    "authorization": "Bearer REPLACE_WITH_YOUR_OWN_EXCEL_SESSION_TOKEN",
+    "chatgpt-account-id": "REPLACE_WITH_YOUR_ACCOUNT_ID",
+    "x-openai-account-user-id": "REPLACE_WITH_YOUR_ACCOUNT_USER_ID"
+  }
+}

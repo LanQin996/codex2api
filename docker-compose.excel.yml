@@ -1,0 +1,36 @@
+# Overlay for either docker-compose.yml or docker-compose.sqlite.yml.
+services:
+  codex2api:
+    networks:
+      - excel-bridge-net
+  excel-bridge:
+    build:
+      context: ./deploy/excel-bridge
+    environment:
+      EXCEL_BRIDGE_API_KEY: ${EXCEL_BRIDGE_API_KEY:?Set a random bridge key of at least 32 characters}
+    volumes:
+      - type: bind
+        source: ${EXCEL_SESSION_DIR:?Set an absolute directory containing session.json}
+        target: /run/excel
+        read_only: true
+        bind:
+          create_host_path: false
+    # No host ports: only codex2api and this container share this network.
+    networks:
+      - excel-bridge-net
+    read_only: true
+    tmpfs:
+      - /tmp:uid=10001,gid=10001,mode=0700
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+networks:
+  excel-bridge-net:
+    driver: bridge

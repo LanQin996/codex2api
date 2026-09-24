@@ -1,0 +1,8 @@
+The image downloads GHCP Proxy from https://github.com/Nonary/ghcp_proxy
+at commit ad23ce2db3b5212c0355762d981c3877322fb160.
+Its source is distributed under the Unlicense; the original LICENSE is
+retained at /opt/ghcp/LICENSE in the image.
+
+bridge.py is a codex2api deployment adapter. It reuses the pinned project's
+Excel protocol handling, not its desktop lifecycle or management endpoints.
+This is an experimental, unofficial integration, not an OpenAI-supported API.

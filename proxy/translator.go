@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/codex2api/auth"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -2373,6 +2374,13 @@ func ensureCodexReasoningInclude(body map[string]any) {
 }
 
 func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOptions) ([]byte, string) {
+	if auth.IsExcelModel(gjson.GetBytes(rawBody, "model").String()) {
+		// Excel owns its own schema/metadata transform. The Codex pipeline strips
+		// metadata and rewrites tool history, so it must never process this route.
+		body, _ := sjson.SetBytes(rawBody, "stream", true)
+		body, _ = sjson.SetBytes(body, "store", false)
+		return body, gjson.GetBytes(body, "input").Raw
+	}
 	var body map[string]any
 	if err := json.Unmarshal(rawBody, &body); err != nil {
 		return rawBody, ""

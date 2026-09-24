@@ -348,6 +348,9 @@ func isSparkPlanCandidate(planType string) bool {
 // 的 OpenAI Responses 中转账号。Grok、Antigravity、Claude 以及仍走 HTTP 的中转账号继续排除。
 func accountFilterForResponsesWebSocket(model string) auth.AccountFilter {
 	model = strings.TrimSpace(model)
+	if auth.IsExcelModel(model) {
+		return func(*auth.Account) bool { return false }
+	}
 	codex := accountFilterForModel(model)
 	return func(account *auth.Account) bool {
 		if account != nil && account.OpenAIResponsesUsesUpstreamWebsocket() {
@@ -3991,7 +3994,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	if releaseAPIKeyConcurrency != nil {
 		defer releaseAPIKeyConcurrency()
 	}
-	allowCodexAccounts := modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db))
+	allowCodexAccounts := auth.IsExcelModel(effectiveModel) || modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db))
 	var accountFilter auth.AccountFilter
 	if nativeRemoteCompactionV2 {
 		accountFilter = accountFilterForInlineCompactionModelWithOriginal(logModel, effectiveModel, allowCodexAccounts)
@@ -4162,7 +4165,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		attemptLogEffectiveModel := logEffectiveModel
 		// relay/Grok 账号默认走 HTTP，这里排除全局强制 WS，避免日志把它们错标成 via_websocket。
 		// 打开了上游 WebSocket 的 OpenAI Responses 中转账号在体积判断之后单独改回 WS。
-		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !account.IsRelayStyle()
+		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !account.IsRelayStyle() && !auth.IsExcelModel(attemptEffectiveModel)
 		// 生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）；
 		// 自然语言生图意图也需保留 image_generation 工具（issue #288）。
 		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(rawBody) {

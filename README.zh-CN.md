@@ -220,6 +220,8 @@ Antigravity 作为独立 Google 渠道管理，支持浏览器/导入 OAuth 凭�
 
 ## 完整文档
 
+Linux/Docker Excel 上游可使用独立桥接容器接入现有 OpenAI Responses 账号，配置见 [Excel 桥接部署](docs/EXCEL_BRIDGE.md)（实验性，需自行导入有效会话）。
+
 | 文档 | 说明 | 路径 |
 |------|------|------|
 | [API 文档](docs/API.md) | 所有 API 端点、请求/响应示例、错误码说明 | `docs/API.md` |
