@@ -15,3 +15,9 @@ services:
   excel-bridge:
     environment:
       EXCEL_ACCOUNT_ROUTES: "1"
+      EXCEL_TOOL_CACHE_PATH: /var/lib/excel-bridge/native-calls.sqlite3
+      EXCEL_TOOL_CACHE_TTL_SECONDS: "604800"
+    volumes:
+      - excel-tool-history:/var/lib/excel-bridge
+volumes:
+  excel-tool-history:

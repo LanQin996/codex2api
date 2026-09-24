@@ -21,6 +21,8 @@ WORKDIR /app
 COPY --from=source /src/*.py /src/requirements.txt /src/LICENSE /opt/ghcp/
 RUN pip install --no-cache-dir -r /opt/ghcp/requirements.txt
 COPY bridge.py /app/bridge.py
+RUN mkdir -p /var/lib/excel-bridge && chown 10001:10001 /var/lib/excel-bridge \
+    && chmod 700 /var/lib/excel-bridge
 USER 10001:10001
 EXPOSE 8000
 CMD ["uvicorn", "bridge:production_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--no-access-log"]

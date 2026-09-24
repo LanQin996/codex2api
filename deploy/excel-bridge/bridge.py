@@ -9,7 +9,10 @@ import json
 import os
 import copy
 import hashlib
+import logging
+import sqlite3
 import threading
+import time
 from collections import OrderedDict
 from contextvars import ContextVar
 from contextlib import asynccontextmanager
@@ -22,6 +25,93 @@ MAX_BODY = 16 * 1024 * 1024
 MAX_SESSION = 128 * 1024
 request_store = ContextVar("excel_store")
 request_scope = ContextVar("excel_scope")
+logger = logging.getLogger("excel_bridge")
+
+
+class NativeCallStore:
+    """Keep exact native calls across restarts; expire whole idle sessions."""
+
+    def __init__(self, path, ttl_seconds=7 * 86400, clock=time.time):
+        if ttl_seconds <= 0:
+            raise ValueError("Excel history TTL must be positive")
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        os.close(fd)
+        os.chmod(path, 0o600)
+        self.lock = threading.Lock()
+        self.clock = clock
+        self.ttl = ttl_seconds
+        self.next_prune = 0
+        self.db = sqlite3.connect(str(path), timeout=10, check_same_thread=False)
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA foreign_keys=ON")
+        self.db.executescript("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                scope TEXT PRIMARY KEY, touched REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS calls (
+                scope TEXT NOT NULL REFERENCES sessions(scope) ON DELETE CASCADE,
+                call_id TEXT NOT NULL, item TEXT NOT NULL,
+                PRIMARY KEY (scope, call_id)
+            );
+            CREATE INDEX IF NOT EXISTS sessions_touched ON sessions(touched);
+            CREATE INDEX IF NOT EXISTS calls_id ON calls(call_id);
+        """)
+
+    @staticmethod
+    def key(scope):
+        return json.dumps(scope, separators=(",", ":"))
+
+    def remember(self, scope, item):
+        key, now = self.key(scope), self.clock()
+        payload = json.dumps(item, ensure_ascii=False, separators=(",", ":"))
+        with self.lock, self.db:
+            if now >= self.next_prune:
+                self.db.execute("DELETE FROM sessions WHERE touched <= ?", (now - self.ttl,))
+                self.next_prune = now + 3600
+            self.db.execute("DELETE FROM sessions WHERE scope = ? AND touched <= ?",
+                            (key, now - self.ttl))
+            self.db.execute("INSERT INTO sessions VALUES (?, ?) ON CONFLICT(scope) "
+                            "DO UPDATE SET touched=excluded.touched", (key, now))
+            self.db.execute("INSERT INTO calls VALUES (?, ?, ?) ON CONFLICT(scope, call_id) "
+                            "DO UPDATE SET item=excluded.item", (key, item["call_id"], payload))
+
+    def recall(self, scope, call_id):
+        key, now = self.key(scope), self.clock()
+        with self.lock, self.db:
+            row = self.db.execute(
+                "SELECT c.item, s.touched FROM calls c JOIN sessions s USING(scope) "
+                "WHERE c.scope = ? AND c.call_id = ? AND s.touched > ?",
+                (key, call_id, now - self.ttl),
+            ).fetchone()
+            if row is None:
+                return None
+            if now - row[1] >= min(60, self.ttl / 2):
+                self.db.execute("UPDATE sessions SET touched = ? WHERE scope = ?", (now, key))
+            return json.loads(row[0])
+
+    def miss_reason(self, scope, call_id):
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT c.scope, s.touched FROM calls c JOIN sessions s USING(scope) "
+                "WHERE c.call_id = ?", (call_id,),
+            ).fetchall()
+        for key, touched in rows:
+            other = tuple(json.loads(key))
+            if other == tuple(scope):
+                return "session_expired" if touched <= self.clock() - self.ttl else "unknown"
+            if other[:2] == tuple(scope[:2]):
+                return "credential_changed"
+        for key, _ in rows:
+            other = tuple(json.loads(key))
+            if other[1] == scope[1] and other[0] != scope[0]:
+                return "account_changed"
+        return "scope_changed" if rows else "record_missing"
+
+    def close(self):
+        with self.lock:
+            self.db.close()
 
 
 class ScopedStore:
@@ -29,16 +119,21 @@ class ScopedStore:
         return getattr(request_store.get(), name)
 
 
-def install_scoped_backend(backend):
+def install_scoped_backend(backend, cache_path=None, ttl_seconds=7 * 86400):
     """Replace upstream globals with request-local credentials and scoped cache."""
     module = backend.excel_upstream
     module.excel_session_store = ScopedStore()
     cache = OrderedDict()
     lock = threading.Lock()
+    disk = NativeCallStore(cache_path, ttl_seconds) if cache_path else None
+    module._excel_native_cache = disk
 
     def remember(item):
         call_id = item.get("call_id")
         if not isinstance(call_id, str) or not call_id:
+            return
+        if disk is not None:
+            disk.remember(request_scope.get(), item)
             return
         key = (request_scope.get(), call_id)
         with lock:
@@ -48,6 +143,10 @@ def install_scoped_backend(backend):
                 cache.popitem(last=False)
 
     def recall(call_id):
+        if not isinstance(call_id, str) or not call_id:
+            return None
+        if disk is not None:
+            return disk.recall(request_scope.get(), call_id)
         key = (request_scope.get(), call_id)
         with lock:
             value = cache.get(key)
@@ -103,6 +202,9 @@ def create_app(backend, key, session_path, *, scoped=False):
         if client is not None:
             await client.aclose()
             backend._EXCEL_UPSTREAM_CLIENT = None
+        cache = getattr(backend.excel_upstream, "_excel_native_cache", None)
+        if cache is not None:
+            cache.close()
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
 
@@ -168,11 +270,23 @@ def create_app(backend, key, session_path, *, scoped=False):
                 return error(409, "Excel session does not match the selected OAuth account")
             generation = hashlib.sha256(headers["authorization"].encode()).hexdigest()
             request_scope.set((account, scope, generation))
-            # Never fabricate a native tool identity after restart, eviction,
-            # credential rotation or a cross-session replay.
+            # Never fabricate native identities. Durable records survive restarts,
+            # while credential, account and session isolation remain intact.
             for item in body.get("input", []) if isinstance(body.get("input"), list) else []:
-                if isinstance(item, dict) and item.get("type") in {"function_call", "custom_tool_call"}:
-                    if backend.excel_upstream._remembered_native_call(item.get("call_id")) is None:
+                if isinstance(item, dict) and item.get("type") in {
+                    "function_call", "custom_tool_call", "function_call_output", "custom_tool_call_output"
+                }:
+                    call_id = item.get("call_id")
+                    if not isinstance(call_id, str) or not call_id:
+                        return error(400, "Tool history requires a non-empty string call_id")
+                    if backend.excel_upstream._remembered_native_call(call_id) is None:
+                        cache = getattr(backend.excel_upstream, "_excel_native_cache", None)
+                        reason = cache.miss_reason(request_scope.get(), call_id) if cache else "memory_record_missing"
+                        logger.warning(
+                            "excel_history_miss account=%s scope_hash=%s call_hash=%s reason=%s",
+                            account, hashlib.sha256(scope.encode()).hexdigest()[:12],
+                            hashlib.sha256(call_id.encode()).hexdigest()[:12], reason,
+                        )
                         return error(409, "Excel tool history expired or belongs to another session; start a new conversation")
             body["prompt_cache_key"] = hashlib.sha256(
                 (account + ":" + scope).encode()
@@ -218,7 +332,11 @@ def production_app():
     # This adapter always uses explicitly supplied session headers, on every OS.
     scoped = os.environ.get("EXCEL_ACCOUNT_ROUTES", "0") == "1"
     if scoped:
-        install_scoped_backend(proxy)
+        cache_path = os.environ.get("EXCEL_TOOL_CACHE_PATH")
+        ttl_seconds = int(os.environ.get("EXCEL_TOOL_CACHE_TTL_SECONDS", str(7 * 86400)))
+        install_scoped_backend(proxy, cache_path=cache_path, ttl_seconds=ttl_seconds)
+        if not cache_path:
+            logger.warning("Excel history is memory-only; configure EXCEL_TOOL_CACHE_PATH for restart safety")
     else:
         proxy.excel_upstream.excel_session_store = proxy.excel_upstream.ExcelSessionStore()
     proxy.excel_session_capture.refresh_macos_excel_session = lambda *a, **kw: None

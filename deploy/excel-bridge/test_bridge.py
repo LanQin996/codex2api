@@ -138,6 +138,122 @@ def test_scoped_native_cache_isolation():
     assert module._remembered_native_call("same-id")["id"] == "native-id"
 
 
+def test_durable_cache_restart_and_isolation(tmp_path):
+    from bridge import NativeCallStore
+    path = tmp_path / "private" / "calls.sqlite3"
+    scope = ("42", "conversation-a", "generation-1")
+    item = {"call_id": "call-a", "id": "native-a", "arguments": "exact arguments"}
+    first = NativeCallStore(path)
+    first.remember(scope, item)
+    first.close()
+    second = NativeCallStore(path)
+    try:
+        assert second.recall(scope, "call-a") == item
+        result = second.recall(scope, "call-a")
+        result["arguments"] = "mutated"
+        assert second.recall(scope, "call-a") == item
+        for other, reason in [
+            (("43", scope[1], scope[2]), "account_changed"),
+            ((scope[0], "conversation-b", scope[2]), "scope_changed"),
+            ((scope[0], scope[1], "generation-2"), "credential_changed"),
+        ]:
+            assert second.recall(other, "call-a") is None
+            assert second.miss_reason(other, "call-a") == reason
+        assert second.miss_reason(scope, "unknown") == "record_missing"
+    finally:
+        second.close()
+
+
+def test_durable_cache_survives_global_4096_limit(tmp_path):
+    from bridge import NativeCallStore
+    cache = NativeCallStore(tmp_path / "calls.sqlite3")
+    scope = ("42", "session", "generation")
+    try:
+        for i in range(4100):
+            cache.remember(scope, {"call_id": str(i), "id": "native-" + str(i)})
+        assert cache.recall(scope, "0")["id"] == "native-0"
+        assert cache.recall(scope, "4099")["id"] == "native-4099"
+    finally:
+        cache.close()
+
+
+def test_durable_cache_expires_idle_session_not_old_calls(tmp_path):
+    from bridge import NativeCallStore
+    now = [1000]
+    cache = NativeCallStore(tmp_path / "calls.sqlite3", ttl_seconds=100, clock=lambda: now[0])
+    scope = ("42", "session", "generation")
+    try:
+        cache.remember(scope, {"call_id": "old"})
+        now[0] += 70
+        assert cache.recall(scope, "old") is not None
+        now[0] += 70
+        assert cache.recall(scope, "old") is not None
+        now[0] += 101
+        assert cache.recall(scope, "old") is None
+        assert cache.miss_reason(scope, "old") == "session_expired"
+        cache.remember(scope, {"call_id": "new"})
+        assert cache.recall(scope, "old") is None  # Cannot revive expired records.
+        assert cache.recall(scope, "new") is not None
+    finally:
+        cache.close()
+
+
+def test_durable_cache_shared_connections(tmp_path):
+    from bridge import NativeCallStore
+    first = NativeCallStore(tmp_path / "calls.sqlite3")
+    second = NativeCallStore(tmp_path / "calls.sqlite3")
+    scope = ("42", "session", "generation")
+    try:
+        first.remember(scope, {"call_id": "first"})
+        assert second.recall(scope, "first") is not None
+        second.remember(scope, {"call_id": "second"})
+        assert first.recall(scope, "second") is not None
+    finally:
+        first.close()
+        second.close()
+
+
+@pytest.mark.parametrize("kind", ["function_call", "custom_tool_call", "function_call_output", "custom_tool_call_output"])
+def test_scoped_http_history_survives_restart(tmp_path, kind, caplog):
+    from bridge import install_scoped_backend
+
+    class RequestStore(Store):
+        def request_headers(self, **kwargs):
+            return dict(self.headers)
+
+    module = SimpleNamespace(ExcelSessionStore=RequestStore, is_excel_model=lambda _: True)
+    calls = []
+
+    async def handler(request, body):
+        calls.append(body)
+        module._remember_native_call({"call_id": "call-native", "id": "fc-native"})
+        return JSONResponse({"output": []})
+
+    backend = SimpleNamespace(excel_upstream=module, _handle_excel_responses=handler)
+    headers = {**AUTH, "X-Excel-Account": "42", "X-Excel-Session": "stable-session",
+               "X-Excel-Credential-Mode": "oauth", "X-Excel-Access-Token": "fake-secret",
+               "X-Excel-ChatGPT-Account": "upstream-account"}
+    path = tmp_path / "calls.sqlite3"
+    install_scoped_backend(backend, cache_path=path)
+    with TestClient(create_app(backend, KEY, "unused", scoped=True)) as client:
+        assert client.post("/v1/responses", headers=headers, json={"model": "test-excel"}).status_code == 200
+    install_scoped_backend(backend, cache_path=path)
+    body = {"model": "test-excel", "input": [{"type": kind, "call_id": "call-native"}]}
+    with TestClient(create_app(backend, KEY, "unused", scoped=True)) as client:
+        assert client.post("/v1/responses", headers=headers, json=body).status_code == 200
+        for name, value in [("X-Excel-Account", "43"), ("X-Excel-Session", "other"),
+                            ("X-Excel-Access-Token", "rotated-secret")]:
+            assert client.post("/v1/responses", headers={**headers, name: value}, json=body).status_code == 409
+        for call_id in [None, [], {}, ""]:
+            body["input"][0]["call_id"] = call_id
+            assert client.post("/v1/responses", headers=headers, json=body).status_code == 400
+    assert len(calls) == 2
+    assert "account_changed" in caplog.text
+    assert "credential_changed" in caplog.text
+    assert "fake-secret" not in caplog.text
+    assert "call-native" not in caplog.text
+
+
 @pytest.mark.parametrize("scoped", [False, True])
 @pytest.mark.parametrize("model", ["gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol"])
 @pytest.mark.parametrize("tool_fields", [
@@ -216,15 +332,18 @@ def test_pinned_backend_roundtrip(tmp_path, monkeypatch, scoped, tool_fields, mo
         assert len(captured) == 2
 
 
+@pytest.mark.parametrize("durable", [False, True])
 @pytest.mark.parametrize("kind", ["function", "custom"])
-def test_native_officejs_identity_restored_for_tool_output(kind):
+def test_native_officejs_identity_restored_for_tool_output(kind, durable, tmp_path):
     source = os.environ.get("EXCEL_UPSTREAM_SOURCE")
     if not source:
         pytest.skip("Set EXCEL_UPSTREAM_SOURCE to the pinned ghcp_proxy checkout")
     sys.path.insert(0, source)
     module = importlib.import_module("excel_upstream")
     from bridge import install_scoped_backend, request_scope
-    install_scoped_backend(SimpleNamespace(excel_upstream=module))
+    backend = SimpleNamespace(excel_upstream=module)
+    cache_path = tmp_path / "native.sqlite3" if durable else None
+    install_scoped_backend(backend, cache_path=cache_path)
     request_scope.set(("account", "session", "generation"))
     tool = {"type": kind, "name": "local_tool"}
     envelope = {"name": "local_tool"}
@@ -243,6 +362,9 @@ def test_native_officejs_identity_restored_for_tool_output(kind):
     assert client is not None
     assert client["name"] == "local_tool"
     assert client["call_id"] == native["call_id"]
+    if durable:
+        module._excel_native_cache.close()
+        install_scoped_backend(backend, cache_path=cache_path)
     # Codex commonly omits the original item ID when replaying its local call.
     client.pop("id", None)
     output = {
@@ -259,3 +381,5 @@ def test_native_officejs_identity_restored_for_tool_output(kind):
     assert len(results) == 1
     assert results[0]["call_id"] == native["call_id"]
     assert results[0]["output"] == "local execution result"
+    if durable:
+        module._excel_native_cache.close()
