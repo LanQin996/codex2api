@@ -1646,6 +1646,8 @@ func isDashboardRateLimitedAccount(status string, cooldownReason string) bool {
 // ==================== Accounts ====================
 
 type accountResponse struct {
+	ExcelRouteMode string `json:"excel_route_mode"`
+	ExcelBridgeConfigured bool `json:"excel_bridge_configured"`
 	CodexLastRefreshAt      string `json:"codex_last_refresh_at,omitempty"`
 	CodexRefreshError       string `json:"codex_refresh_error,omitempty"`
 	UpstreamRequestIDHeader string `json:"upstream_request_id_header"`
@@ -2172,6 +2174,7 @@ func (h *Handler) listAccountsLite(c *gin.Context, ctx context.Context) {
 }
 
 type updateAccountSchedulerReq struct {
+	ExcelRouteMode json.RawMessage `json:"excel_route_mode"`
 	UpstreamRequestIDHeader json.RawMessage `json:"upstream_request_id_header"`
 	ScoreBiasOverride       json.RawMessage `json:"score_bias_override"`
 	BaseConcurrencyOverride json.RawMessage `json:"base_concurrency_override"`
@@ -2332,6 +2335,13 @@ func parseAccountSchedulerUpdate(req updateAccountSchedulerReq) (accountSchedule
 		return accountSchedulerUpdate{}, err
 	}
 	credentialUpdates := make(map[string]interface{})
+	if len(req.ExcelRouteMode) > 0 {
+		var mode string
+		if json.Unmarshal(req.ExcelRouteMode, &mode) != nil || !auth.ValidExcelRouteMode(mode) {
+			return accountSchedulerUpdate{}, fmt.Errorf("excel_route_mode must be off, oauth or session_file")
+		}
+		credentialUpdates[auth.ExcelRouteCredentialKey] = mode
+	}
 	if requestIDHeader.Set {
 		credentialUpdates[auth.UpstreamRequestIDHeaderCredentialKey] = strings.TrimSpace(requestIDHeader.Value)
 	}
@@ -2710,6 +2720,17 @@ func (h *Handler) UpdateAccountScheduler(c *gin.Context) {
 		}
 	}
 
+	if mode, ok := update.CredentialUpdates[auth.ExcelRouteCredentialKey].(string); ok && mode != "off" {
+		row, err := h.db.GetAccountByID(ctx, id)
+		if err != nil || !excelEligibleRow(row) {
+			writeError(c, http.StatusBadRequest, "Excel 路由仅支持 Codex OAuth 账号")
+			return
+		}
+		if !excelBridgeConfigured() {
+			writeError(c, http.StatusBadRequest, "尚未配置 Excel bridge：请部署账号路由桥接服务并设置 EXCEL_BRIDGE_URL / EXCEL_BRIDGE_API_KEY")
+			return
+		}
+	}
 	if err := h.db.UpdateAccountSchedulerMetadata(ctx, id, update.ScoreBiasOverride, update.BaseConcurrencyOverride, update.SkipWarmTier, update.AllowedAPIKeyIDs, database.OptionalStringSlice{Set: update.Tags.Set, Values: update.Tags.Values}, update.GroupIDs, update.ProxyURL, update.CredentialUpdates); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			writeError(c, http.StatusNotFound, "账号不存在")
@@ -2813,6 +2834,9 @@ func (h *Handler) applyAccountSchedulerRuntimeUpdate(id int64, update accountSch
 	}
 	if update.CodexFingerprintMode.Set {
 		h.store.ApplyAccountCodexFingerprintMode(id, update.CodexFingerprintMode.Value)
+	}
+	if mode, ok := update.CredentialUpdates[auth.ExcelRouteCredentialKey].(string); ok {
+		h.store.ApplyAccountExcelRouteMode(id, mode)
 	}
 	if update.Timezone.Set {
 		h.store.ApplyAccountTimezone(id, update.Timezone.Value)

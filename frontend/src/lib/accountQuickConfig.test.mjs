@@ -18,6 +18,16 @@ const listRow = {
   group_ids: [1],
 };
 
+test("Excel route loads, saves and explicitly turns off", () => {
+  const form = formStateFromAccount({ id: 42, excel_route_mode: "oauth", excel_bridge_configured: true });
+  assert.equal(form.excelRouteMode, "oauth");
+  assert.equal(form.excelBridgeConfigured, true);
+  assert.equal(buildQuickConfigSavePayload(form, true).payload.excel_route_mode, "oauth");
+  form.excelRouteMode = "off";
+  assert.equal(buildQuickConfigSavePayload(form, true).payload.excel_route_mode, "off");
+  assert.equal(buildQuickConfigSavePayload(form, false).ok, false);
+});
+
 const detailedRow = {
   id: 42,
   detail_loaded: true,

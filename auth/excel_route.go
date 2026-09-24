@@ -14,6 +14,26 @@ type ExcelRoute struct {
 	CredentialMode string `json:"credential_mode"`
 }
 
+const ExcelRouteCredentialKey = "excel_route_mode"
+
+func ValidExcelRouteMode(mode string) bool {
+	return mode == "off" || mode == "oauth" || mode == "session_file"
+}
+
+func (a *Account) ExcelRouteMode() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.excelRouteMode
+}
+
+func (s *Store) ApplyAccountExcelRouteMode(id int64, mode string) {
+	if a := s.FindByID(id); a != nil {
+		a.mu.Lock()
+		a.excelRouteMode = mode
+		a.mu.Unlock()
+	}
+}
+
 func IsExcelModel(model string) bool {
 	switch strings.ToLower(strings.TrimSpace(model)) {
 	case "gpt-5.6-luna-excel", "gpt-5.6-terra-excel", "gpt-5.6-sol-excel":
@@ -25,6 +45,9 @@ func IsExcelModel(model string) bool {
 func (a *Account) ExcelRoute() (ExcelRoute, bool) {
 	if a == nil || a.IsRelayStyle() || a.IsCodexAgentIdentity() {
 		return ExcelRoute{}, false
+	}
+	if mode := a.ExcelRouteMode(); mode != "" {
+		return ExcelRoute{CredentialMode: mode}, mode == "oauth" || mode == "session_file"
 	}
 	path := strings.TrimSpace(os.Getenv("EXCEL_ROUTES_FILE"))
 	if path == "" {

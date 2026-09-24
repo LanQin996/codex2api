@@ -32,6 +32,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
+import { Select } from "@/components/ui/select";
 import {
   Sheet,
   SheetBody,
@@ -193,6 +194,7 @@ export default function AccountQuickConfigSheet({
   };
 
   const fingerprintMode = form?.fingerprintMode ?? "off";
+  const excelMode = form?.excelRouteMode ?? "off";
   const scoreMode = form?.scoreMode ?? "default";
   const concurrencyMode = form?.concurrencyMode ?? "default";
 
@@ -280,6 +282,32 @@ export default function AccountQuickConfigSheet({
             <div className="rounded-lg border border-border/50 bg-muted/20 p-2.5 text-xs text-muted-foreground">
               {fingerprintDetails[fingerprintMode]}
             </div>
+          </div>
+
+          <div className="rounded-xl border border-border/70 bg-card p-4 shadow-2xs space-y-3.5">
+            <div className="flex items-center justify-between gap-3">
+              <label htmlFor="excel-route-enabled" className="text-sm font-semibold">Excel 上游（实验性）</label>
+              <Switch id="excel-route-enabled"
+                checked={excelMode !== "off"}
+                disabled={!detailsReady || saving || (!form?.excelBridgeConfigured && excelMode === "off")}
+                onCheckedChange={(enabled) => patchForm({ excelRouteMode: enabled ? "oauth" : "off" })} />
+            </div>
+            <p className="text-xs text-muted-foreground">保存后立即生效，与此 OAuth 账号共用调度身份。关闭不会影响普通 Codex 请求。</p>
+            {!form?.excelBridgeConfigured && <p role="status" className="text-xs text-amber-600">服务器尚未配置 Excel bridge，暂不能开启。需先部署账号路由桥接服务；无需手写 routes.json。</p>}
+            {excelMode !== "off" && <>
+              <label className="block text-xs font-medium" htmlFor="excel-credential-mode">Excel 凭证来源</label>
+              <Select id="excel-credential-mode"
+                disabled={!detailsReady || saving} value={excelMode}
+                onValueChange={(value) => patchForm({ excelRouteMode: value as "oauth" | "session_file" })}
+                options={[
+                  { value: "oauth", label: "使用此账号 OAuth（跟随 Token 刷新）" },
+                  { value: "session_file", label: "服务器独立会话文件" },
+                ]} />
+              <p className="text-xs text-muted-foreground">{excelMode === "oauth"
+                ? "无需另填 Token；上游是否接受该账号仍需实际调用验证。"
+                : `需预先在桥接凭证目录放置 ${account.id}.json，且登录账号必须一致。`}</p>
+              <p className="text-xs text-muted-foreground break-all">客户端模型：gpt-5.6-sol-excel / gpt-5.6-luna-excel / gpt-5.6-terra-excel</p>
+            </>}
           </div>
 
           <div className="rounded-xl border border-border/70 bg-card p-4 shadow-2xs space-y-3.5">
