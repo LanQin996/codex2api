@@ -650,7 +650,9 @@ func (h *Handler) modelValidator(supportedModels []string) api.ValidationRule {
 			return nil
 		}
 		model := value.String()
-		if validModels[model] || h.modelSupportedByAccountMapping(model) {
+		// Excel aliases are transport routes, not entries in the Codex upstream
+		// model catalog. Account eligibility is still enforced by the scheduler.
+		if validModels[model] || auth.IsExcelModel(model) || h.modelSupportedByAccountMapping(model) {
 			return nil
 		}
 		return &api.ValidationError{

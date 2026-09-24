@@ -13,6 +13,24 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestExcelAliasesPassIngressModelValidation(t *testing.T) {
+	h := &Handler{}
+	validate := h.modelValidator([]string{"gpt-6-astra"})
+	for _, model := range []string{"gpt-6-astra-excel", "gpt-6-sol-excel", "gpt-5.6-sol-excel", "gpt-5.6-luna-excel", "gpt-5.6-terra-excel"} {
+		if err := validate(gjson.Parse(`"`+model+`"`), "model"); err != nil {
+			t.Fatalf("Excel alias rejected before routing: %s: %v", model, err)
+		}
+		if accountFilterForModel(model)(&auth.Account{DBID: 999}) {
+			t.Fatalf("unconfigured account admitted for %s", model)
+		}
+	}
+	for _, model := range []string{"gpt-6-astra-execl", "unknown-excel"} {
+		if err := validate(gjson.Parse(`"`+model+`"`), "model"); err == nil {
+			t.Fatalf("unknown alias accepted: %s", model)
+		}
+	}
+}
+
 func TestExcelTransportUsesCurrentOAuthWithoutCodexHeaders(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "routes.json")
 	if err := os.WriteFile(path, []byte(`{"42":{"credential_mode":"oauth"}}`), 0600); err != nil {
