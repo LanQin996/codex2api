@@ -4021,7 +4021,30 @@ func (h *Handler) Responses(c *gin.Context) {
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
 	// Excel native tool IDs belong to the account that produced them. Never
 	// borrow a second Excel account on capacity overflow or retry.
-	if boundID, bound := h.store.SessionAffinityAccountID(affinityKey); bound {
+	if auth.IsExcelModel(effectiveModel) && hasExcelToolHistory(codexBody) {
+		sessionID := resolveUpstreamSessionID(apiKeyID, sessionIdentity.upstreamSeed, sessionIdentity.explicitUpstreamID, false)
+		clientKey := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
+		owner, err := resolveExcelHistoryOwner(c.Request.Context(), codexBody, sessionID, clientKey)
+		canMigrate := os.Getenv("EXCEL_HISTORY_MIGRATION") == "1" && excelHistoryCanMigrate(codexBody)
+		if err != nil && !canMigrate {
+			log.Printf("Excel history owner lookup failed: %v", err)
+			c.JSON(http.StatusConflict, gin.H{"error": gin.H{
+				"type": "invalid_request_error", "code": "excel_history_unavailable",
+				"message": "Original Excel tool history cannot be resolved; retry later or start a new conversation if history was lost",
+			}})
+			return
+		}
+		if canMigrate {
+			c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), excelMigrationContextKey{}, owner))
+		} else {
+			previousFilter := accountFilter
+			accountFilter = func(a *auth.Account) bool {
+				return a.ID() == owner && (previousFilter == nil || previousFilter(a))
+			}
+		}
+		// Persisted native-call ownership supersedes stale in-memory affinity.
+		turnContinuationPinned = false
+	} else if boundID, bound := h.store.SessionAffinityAccountID(affinityKey); bound {
 		accountFilter = pinExcelContinuationFilter(effectiveModel, rawBody, boundID, accountFilter)
 	}
 	// resolveCompactionAffinity 只在已知来源相互冲突时报错；缓存故障按未知

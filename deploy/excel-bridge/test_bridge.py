@@ -63,6 +63,218 @@ def test_derived_turn_stable_for_tool_loop(tmp_path):
 KEY = "test-only-bridge-key-" + "x" * 32
 AUTH = {"Authorization": "Bearer " + KEY}
 
+def test_image_attachments_cover_tool_results(monkeypatch):
+    import asyncio
+    import bridge
+    calls = []
+    def upload(backend, part):
+        calls.append(part["image_url"])
+        return {"type": "input_image", "file_id": "file-test", "detail": "auto"}
+    monkeypatch.setattr(bridge, "upload_inline_image", upload)
+    image = {"type": "input_image", "image_url": "data:image/png;base64,eA=="}
+    body = {"input": [
+        {"role": "user", "content": [image]},
+        {"type": "custom_tool_call_output", "call_id": "a", "output": [image]},
+    ]}
+    result = asyncio.run(bridge.prepare_image_attachments(None, body))
+    assert len(calls) == 2
+    assert result["input"][1]["output"][0]["file_id"] == "file-test"
+    assert "image_url" in body["input"][0]["content"][0]
+
+
+def test_migrated_image_remains_image(tmp_path):
+    from bridge import NativeCallStore, migrate_completed_history
+    cache = NativeCallStore(tmp_path / "images.db")
+    body = {"input": [
+        {"type": "custom_tool_call", "call_id": "a", "name": "view_image", "input": "path"},
+        {"type": "custom_tool_call_output", "call_id": "a", "output": [
+            {"type": "input_image", "image_url": "data:image/png;base64,eA=="}]},
+    ]}
+    try:
+        result = migrate_completed_history(body, cache, ("21", "session", "token"))
+        content = result["input"][0]["content"]
+        assert content[1]["type"] == "input_image"
+        assert "data:image" not in content[0]["text"]
+        assert body["input"][1]["output"][0]["image_url"] == content[1]["image_url"]
+    finally:
+        cache.close()
+
+
+def test_attachment_upload_cache_is_scoped(monkeypatch):
+    import bridge
+    bridge.attachment_cache.clear()
+    requests = []
+    class Reply:
+        status_code = 200
+        content = b'{"openai_file_id":"file-test"}'
+        def json(self): return json.loads(self.content)
+    class Opener:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def post(self, endpoint, **kwargs):
+            requests.append(SimpleNamespace(full_url=endpoint, data=kwargs["content"]))
+            return Reply()
+    monkeypatch.setattr(bridge.httpx, "Client", lambda **kwargs: Opener())
+    headers = {"authorization": "Bearer first", "chatgpt-account-id": "a"}
+    backend = SimpleNamespace(excel_upstream=SimpleNamespace(
+        RESPONSES_URL="https://example.test/basispoints/api/responses",
+        excel_session_store=SimpleNamespace(request_headers=lambda **kw: headers)))
+    part = {"type": "input_image", "image_url": "data:image/png;base64,eA==", "detail": "original"}
+    result = bridge.upload_inline_image(backend, part)
+    assert result == {"type": "input_image", "file_id": "file-test", "detail": "auto"}
+    bridge.upload_inline_image(backend, part)
+    assert len(requests) == 1
+    assert requests[0].full_url == "https://example.test/basispoints/api/attachments"
+    assert b'name="file"' in requests[0].data
+    headers["authorization"] = "Bearer second"
+    bridge.upload_inline_image(backend, part)
+    assert len(requests) == 2
+    with pytest.raises(ValueError):
+        bridge.upload_inline_image(backend, {**part, "file_id": "already"})
+
+def test_wire_shape_never_contains_user_text():
+    from bridge import wire_shape
+    body = {"input": [
+        {"role": "user", "content": [{"type": "input_text", "text": "private-token"}]},
+        {"type": "private-token", "content": [{"type": "private-token"}]},
+    ], "reasoning_effort": "private-token", "tools": [{"name": "private-token"}]}
+    shape = wire_shape(body)
+    assert "private-token" not in json.dumps(shape)
+    assert shape["input_count"] == 2
+    assert shape["tools_present"] is True
+    assert shape["item_types"] == {"message": 1, "other": 1}
+
+def test_migration_checkpoint_survives_restart_and_new_tool(tmp_path):
+    from bridge import NativeCallStore, migrate_completed_history, replay_checkpoint
+    scope = ("21", "s", "token")
+    path = tmp_path / "migration.db"
+    body = {"input": [
+        {"role": "user", "content": "work"},
+        {"type": "reasoning", "encrypted_content": "old-private-state"},
+        {"type": "function_call", "call_id": "old", "name": "write_file", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "old", "output": "done"},
+    ]}
+    db = NativeCallStore(path)
+    rebuilt = migrate_completed_history(body, db, scope)
+    assert not any(x.get("type") in {"reasoning", "function_call", "function_call_output"} for x in rebuilt["input"])
+    assert "already completed" in json.dumps(rebuilt)
+    marker = rebuilt["_excel_checkpoint"]
+    db.close()
+    db = NativeCallStore(path)
+    continued = json.loads(json.dumps(body))
+    continued["input"].append({"type": "function_call", "call_id": "new", "name": "read_file", "arguments": "{}"})
+    result = replay_checkpoint(continued, db, scope)
+    assert result["input"][-1]["call_id"] == "new"
+    assert result["_excel_checkpoint"] == marker
+    changed = json.loads(json.dumps(body))
+    changed["input"][-1]["output"] = "different"
+    with pytest.raises(ValueError):
+        migrate_completed_history(changed, db, scope)
+    with pytest.raises(ValueError):
+        migrate_completed_history(continued, db, scope)
+    db.close()
+
+
+@pytest.mark.parametrize("history", [
+    [{"type": "function_call", "call_id": "a", "name": "pay", "arguments": "{}"}],
+    [{"type": "function_call_output", "call_id": "a", "output": "done"}],
+    [{"type": "item_reference", "id": "opaque"}],
+])
+def test_migration_rejects_incomplete_history(history):
+    from bridge import completed_tool_pairs
+    with pytest.raises(ValueError):
+        completed_tool_pairs(history)
+
+
+def test_http_migration_and_followup(tmp_path, monkeypatch):
+    from bridge import install_scoped_backend
+    monkeypatch.setenv("EXCEL_HISTORY_MIGRATION", "1")
+
+    class RequestStore(Store):
+        def request_headers(self, **kwargs):
+            return dict(self.headers)
+
+    module = SimpleNamespace(ExcelSessionStore=RequestStore, is_excel_model=lambda _: True)
+    captured = []
+
+    async def handler(request, body):
+        captured.append(body)
+        module._remember_native_call({"call_id": "new", "id": "native-new"})
+        return JSONResponse({"output": []})
+
+    backend = SimpleNamespace(excel_upstream=module, _handle_excel_responses=handler)
+    install_scoped_backend(backend, cache_path=tmp_path / "cache.db")
+    headers = {**AUTH, "X-Excel-Account": "21", "X-Excel-Session": "session",
+               "X-Excel-Credential-Mode": "oauth", "X-Excel-Access-Token": "fake",
+               "X-Excel-ChatGPT-Account": "workspace", "X-Excel-Migrate": "1"}
+    body = {"model": "test-excel", "input": [
+        {"role": "user", "content": "work"},
+        {"type": "function_call", "name": "write_file", "arguments": "{}", "call_id": "old"},
+        {"type": "function_call_output", "call_id": "old", "output": "done"},
+    ]}
+    with TestClient(create_app(backend, KEY, "unused", scoped=True)) as client:
+        assert client.post("/v1/responses", headers=headers, json=body).status_code == 200
+        assert not any(x.get("type") == "function_call" for x in captured[0]["input"])
+        first_key = captured[0]["prompt_cache_key"]
+        headers["X-Excel-Migrate"] = "auto"
+        assert client.post("/v1/responses", headers=headers, json=body).status_code == 200
+        assert captured[-1]["prompt_cache_key"] == first_key
+        body["input"].extend([
+            {"type": "function_call", "name": "read_file", "arguments": "{}", "call_id": "new"},
+            {"type": "function_call_output", "call_id": "new", "output": "read"},
+        ])
+        assert client.post("/v1/responses", headers=headers, json=body).status_code == 200
+        assert captured[-1]["input"][-2]["call_id"] == "new"
+        assert captured[-1]["prompt_cache_key"] == first_key
+        # A different account starts a new checkpoint instead of reusing native IDs.
+        headers["X-Excel-Account"] = "19"
+        headers["X-Excel-Migrate"] = "1"
+        assert client.post("/v1/responses", headers=headers, json=body).status_code == 200
+        assert captured[-1]["prompt_cache_key"] != first_key
+        assert not any(x.get("type") == "function_call" for x in captured[-1]["input"])
+        body["input"].append({"type": "function_call", "name": "pay", "arguments": "{}", "call_id": "pending"})
+        assert client.post("/v1/responses", headers=headers, json=body).status_code == 409
+
+
+def test_history_owner_requires_complete_single_scope(tmp_path):
+    from bridge import NativeCallStore
+    cache = NativeCallStore(tmp_path / "owner.sqlite3")
+    try:
+        cache.remember(("21", "session", "generation"), {"call_id": "a"})
+        cache.remember(("21", "session", "generation"), {"call_id": "b"})
+        assert cache.owner("session", ["a", "b"]) == "21"
+        assert cache.owner("other-session", ["a"]) is None
+        assert cache.owner("session", ["a", "missing"]) is None
+        cache.remember(("19", "session", "generation"), {"call_id": "a"})
+        assert cache.owner("session", ["a"]) is None
+        assert cache.owner("session", ["a", "b"]) == "21"
+        cache.remember(("19", "session", "generation"), {"call_id": "c"})
+        assert cache.owner("session", ["b", "c"]) is None
+    finally:
+        cache.close()
+
+
+def test_history_owner_endpoint_auth_and_restart(tmp_path):
+    from bridge import install_scoped_backend, request_scope
+    module = SimpleNamespace()
+    backend = SimpleNamespace(excel_upstream=module)
+    path = tmp_path / "owner.sqlite3"
+    install_scoped_backend(backend, cache_path=path)
+    request_scope.set(("21", "session", "generation"))
+    module._remember_native_call({"call_id": "a", "arguments": "secret"})
+    module._excel_native_cache.close()
+    install_scoped_backend(backend, cache_path=path)
+    with TestClient(create_app(backend, KEY, "unused", scoped=True)) as client:
+        body = {"session": "session", "call_ids": ["a"]}
+        assert client.post("/internal/history-owner", json=body).status_code == 401
+        result = client.post("/internal/history-owner", json=body, headers=AUTH)
+        assert result.json() == {"account_id": "21"}
+        assert "secret" not in result.text
+        body["session"] = "other"
+        assert client.post("/internal/history-owner", json=body, headers=AUTH).status_code == 409
+        for bad in [[], {"session": "session", "call_ids": [{}]}, {"session": "", "call_ids": ["a"]}]:
+            assert client.post("/internal/history-owner", json=bad, headers=AUTH).status_code == 400
+
 
 class Store:
     def __init__(self):

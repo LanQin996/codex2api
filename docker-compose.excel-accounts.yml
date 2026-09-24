@@ -4,6 +4,7 @@ services:
     environment:
       EXCEL_ROUTES_FILE: /run/excel-routes/routes.json
       EXCEL_BRIDGE_URL: http://excel-bridge:8000
+      EXCEL_HISTORY_MIGRATION: ${EXCEL_HISTORY_MIGRATION:-0}
       EXCEL_BRIDGE_API_KEY: ${EXCEL_BRIDGE_API_KEY:?Set EXCEL_BRIDGE_API_KEY}
     volumes:
       - type: bind
@@ -15,6 +16,7 @@ services:
   excel-bridge:
     environment:
       EXCEL_ACCOUNT_ROUTES: "1"
+      EXCEL_HISTORY_MIGRATION: ${EXCEL_HISTORY_MIGRATION:-0}
       EXCEL_TOOL_CACHE_PATH: /var/lib/excel-bridge/native-calls.sqlite3
       EXCEL_TOOL_CACHE_TTL_SECONDS: "604800"
     volumes:

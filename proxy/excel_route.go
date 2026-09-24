@@ -5,7 +5,9 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -23,6 +25,37 @@ var excelBridgeClient = &http.Client{
 	Timeout:       300 * time.Second,
 	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	Transport:     &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 32},
+}
+
+type excelMigrationContextKey struct{}
+
+func excelHistoryCanMigrate(body []byte) bool {
+	calls := map[string]string{}
+	done := map[string]bool{}
+	for _, item := range gjson.GetBytes(body, "input").Array() {
+		kind := item.Get("type").String()
+		id := item.Get("call_id").String()
+		switch kind {
+		case "compaction", "item_reference":
+			return false
+		case "function_call", "custom_tool_call":
+			field := "arguments"
+			if kind == "custom_tool_call" {
+				field = "input"
+			}
+			if id == "" || calls[id] != "" || item.Get("name").String() == "" || item.Get(field).Type != gjson.String {
+				return false
+			}
+			calls[id] = kind
+		case "function_call_output", "custom_tool_call_output":
+			out := item.Get("output")
+			if id == "" || calls[id]+"_output" != kind || done[id] || !(out.Type == gjson.String || out.IsArray()) {
+				return false
+			}
+			done[id] = true
+		}
+	}
+	return len(calls) > 0 && len(calls) == len(done)
 }
 
 func hasExcelToolHistory(body []byte) bool {
@@ -58,6 +91,64 @@ func isExcelModelAccessChanged(status int, body []byte) bool {
 		gjson.GetBytes(body, "error.code").String() == "basispoints_model_access_changed"
 }
 
+func excelSessionScope(body []byte, sessionID, clientKey string) string {
+	seed := gjson.GetBytes(body, "prompt_cache_key").String()
+	if seed == "" {
+		seed = sessionID
+	}
+	if seed == "" {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(clientKey + "\x00" + seed))
+	return hex.EncodeToString(digest[:])
+}
+
+// Lookup persisted provenance before admission; normal account filters still
+// enforce enabled state, quotas, model permissions and concurrency.
+func resolveExcelHistoryOwner(ctx context.Context, body []byte, sessionID, clientKey string) (int64, error) {
+	ids := []string{}
+	for _, item := range gjson.GetBytes(body, "input").Array() {
+		switch item.Get("type").String() {
+		case "function_call", "custom_tool_call", "function_call_output", "custom_tool_call_output":
+			id := item.Get("call_id").String()
+			if id == "" {
+				return 0, fmt.Errorf("invalid tool history")
+			}
+			ids = append(ids, id)
+		}
+	}
+	payload, err := json.Marshal(map[string]any{"session": excelSessionScope(body, sessionID, clientKey), "call_ids": ids})
+	if err != nil {
+		return 0, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		strings.TrimRight(os.Getenv("EXCEL_BRIDGE_URL"), "/")+"/internal/history-owner", bytes.NewReader(payload))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+os.Getenv("EXCEL_BRIDGE_API_KEY"))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := excelBridgeClient.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return 0, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("history lookup status %d", resp.StatusCode)
+	}
+	id := gjson.GetBytes(raw, "account_id").Int()
+	if id <= 0 {
+		return 0, fmt.Errorf("invalid history owner")
+	}
+	return id, nil
+}
+
 func executeExcelRequest(ctx context.Context, account *auth.Account, body []byte, sessionID, clientKey string) (*http.Response, error) {
 	route, enabled := account.ExcelRoute()
 	if !enabled {
@@ -73,15 +164,10 @@ func executeExcelRequest(ctx context.Context, account *auth.Account, body []byte
 		return nil, ErrInternalError("Excel requires full input history", nil)
 	}
 	// Namespace the cache key by downstream API key without revealing that key.
-	seed := gjson.GetBytes(body, "prompt_cache_key").String()
-	if seed == "" {
-		seed = sessionID
-	}
-	if seed == "" {
+	scope := excelSessionScope(body, sessionID, clientKey)
+	if scope == "" {
 		return nil, ErrInternalError("Excel requires a stable session_id or prompt_cache_key", nil)
 	}
-	digest := sha256.Sum256([]byte(clientKey + "\x00" + seed))
-	scope := hex.EncodeToString(digest[:])
 	body, err = sjson.SetBytes(body, "prompt_cache_key", scope)
 	if err != nil {
 		return nil, err
@@ -94,6 +180,13 @@ func executeExcelRequest(ctx context.Context, account *auth.Account, body []byte
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Excel-Account", fmt.Sprint(account.ID()))
 	req.Header.Set("X-Excel-Session", scope)
+	if owner, ok := ctx.Value(excelMigrationContextKey{}).(int64); ok {
+		mode := "auto"
+		if owner != account.ID() {
+			mode = "1"
+		}
+		req.Header.Set("X-Excel-Migrate", mode)
+	}
 	req.Header.Set("X-Excel-Credential-Mode", route.CredentialMode)
 	req.Header.Set("X-Excel-ChatGPT-Account", account.EffectiveAccountID())
 	if route.CredentialMode == "oauth" {

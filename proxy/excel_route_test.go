@@ -81,6 +81,44 @@ func TestExcelAliasesPassIngressModelValidation(t *testing.T) {
 	}
 }
 
+func TestExcelMigrationRequiresCompletedPairs(t *testing.T) {
+	for _, raw := range []string{
+		`{"input":"hello"}`,
+		`{"input":[{"type":"function_call","call_id":"a","name":"pay","arguments":"{}"}]}`,
+		`{"input":[{"type":"function_call_output","call_id":"a","output":"done"}]}`,
+	} {
+		if excelHistoryCanMigrate([]byte(raw)) {
+			t.Fatal("incomplete history accepted")
+		}
+	}
+	if !excelHistoryCanMigrate([]byte(`{"input":[{"type":"function_call","call_id":"a","name":"read","arguments":"{}"},{"type":"function_call_output","call_id":"a","output":"done"}]}`)) {
+		t.Fatal("completed history rejected")
+	}
+}
+func TestExcelHistoryOwnerLookupUsesSameScopeAsTransport(t *testing.T) {
+	body := []byte(`{"prompt_cache_key":"stable","input":[{"type":"function_call","call_id":"a"}]}`)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		if r.URL.Path != "/internal/history-owner" || r.Header.Get("Authorization") != "Bearer test-key" {
+			t.Error("incorrect internal lookup")
+		}
+		if gjson.GetBytes(raw, "session").String() != excelSessionScope(body, "session", "client") {
+			t.Error("lookup namespace differs from transport")
+		}
+		if gjson.GetBytes(raw, "call_ids.0").String() != "a" {
+			t.Error("missing call id")
+		}
+		_, _ = w.Write([]byte(`{"account_id":"21"}`))
+	}))
+	defer server.Close()
+	t.Setenv("EXCEL_BRIDGE_URL", server.URL)
+	t.Setenv("EXCEL_BRIDGE_API_KEY", "test-key")
+	id, err := resolveExcelHistoryOwner(context.Background(), body, "session", "client")
+	if err != nil || id != 21 {
+		t.Fatalf("owner=%d err=%v", id, err)
+	}
+}
+
 func TestExcelTransportUsesCurrentOAuthWithoutCodexHeaders(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "routes.json")
 	if err := os.WriteFile(path, []byte(`{"42":{"credential_mode":"oauth"}}`), 0600); err != nil {
