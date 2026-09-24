@@ -78,8 +78,47 @@ def test_image_attachments_cover_tool_results(monkeypatch):
     ]}
     result = asyncio.run(bridge.prepare_image_attachments(None, body))
     assert len(calls) == 2
-    assert result["input"][1]["output"][0]["file_id"] == "file-test"
+    assert result["input"][1]["call_id"] == "a"
+    assert result["input"][1]["output"][0]["type"] == "input_text"
+    assert result["input"][2]["role"] == "user"
+    assert result["input"][2]["content"][1]["file_id"] == "file-test"
     assert "image_url" in body["input"][0]["content"][0]
+    assert "image_url" in body["input"][1]["output"][0]
+
+
+@pytest.mark.parametrize("kind", ["function_call_output", "custom_tool_call_output"])
+def test_tool_images_preserve_identity_order_and_text(monkeypatch, kind):
+    import asyncio
+    import bridge
+    monkeypatch.setattr(bridge, "upload_inline_image", lambda backend, part: dict(part))
+    call = {"type": "function_call", "call_id": "a", "name": "view", "arguments": "{}"}
+    text = {"type": "input_text", "text": "Screenshot result"}
+    image = {"type": "input_image", "file_id": "file-existing", "detail": "auto"}
+    followup = {"role": "user", "content": "Describe it"}
+    body = {"model": "gpt-6-astra-excel", "input": [
+        call, {"type": kind, "id": "native-result", "call_id": "a",
+               "output": [text, image, image]}, followup,
+    ]}
+    result = asyncio.run(bridge.prepare_image_attachments(None, body))
+    assert result["input"][0] == call
+    tool_result = result["input"][1]
+    assert tool_result["type"] == kind
+    assert tool_result["id"] == "native-result"
+    assert tool_result["call_id"] == "a"
+    assert tool_result["output"][0] == text
+    assert all(part["type"] == "input_text" for part in tool_result["output"])
+    assert result["input"][2]["content"][1:] == [image, image]
+    assert result["input"][3] == followup
+    assert body["input"][1]["output"] == [text, image, image]
+    assert asyncio.run(bridge.prepare_image_attachments(None, result)) == result
+
+
+@pytest.mark.parametrize("output", ["OK", [{"type": "input_text", "text": "OK"}], []])
+def test_text_only_tool_results_are_unchanged(output):
+    import asyncio
+    import bridge
+    body = {"input": [{"type": "function_call_output", "call_id": "a", "output": output}]}
+    assert asyncio.run(bridge.prepare_image_attachments(None, body)) == body
 
 
 def test_migrated_image_remains_image(tmp_path):
