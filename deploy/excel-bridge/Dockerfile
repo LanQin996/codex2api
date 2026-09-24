@@ -9,6 +9,9 @@ RUN git init . \
     && git checkout --detach FETCH_HEAD \
     && test "$(git rev-parse HEAD)" = ad23ce2db3b5212c0355762d981c3877322fb160
 
+COPY upstream-compaction.patch /tmp/upstream-compaction.patch
+RUN git apply --check /tmp/upstream-compaction.patch && git apply /tmp/upstream-compaction.patch
+
 FROM python:3.12-slim
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 \
     PYTHONPATH=/opt/ghcp \

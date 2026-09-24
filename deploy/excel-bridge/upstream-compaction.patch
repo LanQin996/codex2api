@@ -1,0 +1,74 @@
+diff --git a/excel_upstream.py b/excel_upstream.py
+index 26c24e6..34ddeca 100644
+--- a/excel_upstream.py
++++ b/excel_upstream.py
+@@ -763,7 +763,7 @@ def _client_tool_protocol_instructions(source: dict) -> str:
+         "client tool. The inner name is never run_officejs or functions.run_officejs. "
+         "For a function tool, use this shape: outer arguments include summary, "
+         "extended_summary, destructive=false, references=[], and code equal to "
+-        '{"name":"exec_command","arguments":{"cmd":"pwd"}}. '
++        + _client_tool_transport_example(source) + ". "
+         "For a custom tool, code instead contains "
+         '{"name":"TOOL_NAME","input":"RAW_INPUT"}. '
+         "Do not put JavaScript, OfficeJS, a second run_officejs envelope, or a "
+@@ -786,6 +786,20 @@ def _client_tool_protocol_instructions(source: dict) -> str:
+     )
+ 
+ 
++def _client_tool_transport_example(source: dict) -> str:
++    allowed = client_tool_types(source)
++    if allowed.get("exec") == "custom":
++        return json.dumps({"name": "exec", "input":
++            "text(ALL_TOOLS.filter(t => /exec_command|shell_command|apply_patch/.test(t.name)));"},
++            separators=(",", ":"))
++    for name in ("exec_command", "shell_command"):
++        if name in allowed:
++            field = "cmd" if name == "exec_command" else "command"
++            return json.dumps({"name": name, "arguments": {field: "pwd"}},
++                              separators=(",", ":"))
++    return "Use an exact tool name and schema from the current catalog."
++
++
+ def _client_tool_protocol_reminder(source: dict) -> str:
+     """Compact protocol cue that stays inside the cached prompt prefix.
+ 
+@@ -810,11 +824,22 @@ def _client_tool_protocol_reminder(source: dict) -> str:
+         "below. Never set the inner name to run_officejs or functions.run_officejs, "
+         "and never nest another transport envelope. The code field is not JavaScript; serialize "
+         "the inner JSON and escape backslashes and quotes in shell commands. Example inner code: "
+-        '{"name":"exec_command","arguments":{"cmd":"pwd"}}. '
++        + _client_tool_transport_example(source) + ". "
+         "Do not merely say you will act or that access is unavailable. Client tools: "
+         + ", ".join(sorted(allowed_tools))
+         + ". Other native tools are unavailable."
+     )
++    if allowed_tools.get("exec") == "custom":
++        reminder += (
++            " The custom exec tool is a live orchestration tool, not historical data. "
++            "Its tools object exposes nested shell and filesystem tools; discover them "
++            "with ALL_TOOLS inside exec, then call the documented tools method there. "
++            "A nested tool need not appear as a separate top-level catalog entry. "
++            "Quoted completed history must not be rerun, but it does not disable current tools. "
++            "Do not ask the user to switch conversations merely because the outer tool "
++            "is named run_officejs. Check the current catalog and try its available "
++            "read-only discovery path before asserting workspace access is unavailable."
++        )
+     if "shell_command" in allowed_tools:
+         reminder += " For repository inspection transport shell_command."
+     elif "exec_command" in allowed_tools:
+@@ -1436,6 +1461,15 @@ def translate_input_items(
+                 result.append(item)
+             continue
+         if item_type in {"function_call_output", "custom_tool_call_output"}:
++            # Restore only a cached native call omitted by compaction.
++            call_id = item.get("call_id")
++            if isinstance(call_id, str) and call_id not in call_origins:
++                remembered = _remembered_native_call(call_id)
++                if remembered is not None:
++                    native_name = remembered.get("name")
++                    if isinstance(native_name, str) and native_name:
++                        call_origins[call_id] = native_name
++                        result.append(remembered)
+             result.append(_normalized_tool_output(item, call_origins))
+             continue
+         if item_type == "reasoning":

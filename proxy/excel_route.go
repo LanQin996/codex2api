@@ -36,7 +36,12 @@ func excelHistoryCanMigrate(body []byte) bool {
 		kind := item.Get("type").String()
 		id := item.Get("call_id").String()
 		switch kind {
-		case "compaction", "item_reference":
+		case "compaction":
+			encrypted := item.Get("encrypted_content")
+			if encrypted.Type != gjson.String || strings.TrimSpace(encrypted.String()) == "" {
+				return false
+			}
+		case "item_reference":
 			return false
 		case "function_call", "custom_tool_call":
 			field := "arguments"

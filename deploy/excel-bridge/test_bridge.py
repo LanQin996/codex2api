@@ -12,6 +12,22 @@ from starlette.testclient import TestClient
 from bridge import create_app
 
 
+def test_exec_only_catalog_uses_callable_discovery_example():
+    source = os.environ.get("EXCEL_UPSTREAM_SOURCE")
+    if not source:
+        pytest.skip("Set EXCEL_UPSTREAM_SOURCE")
+    sys.path.insert(0, source)
+    module = importlib.import_module("excel_upstream")
+    body = {"tools": [{"type": "custom", "name": "exec"}]}
+    example = json.loads(module._client_tool_transport_example(body))
+    assert example["name"] == "exec"
+    assert "ALL_TOOLS" in example["input"]
+    reminder = module._client_tool_protocol_reminder(body)
+    assert "nested shell and filesystem tools" in reminder
+    assert "does not disable current tools" in reminder
+    assert module._client_tool_transport_example(body) in module._client_tool_protocol_instructions(body)
+
+
 def test_reset_turn_state_preserves_unrelated_metadata():
     from bridge import reset_client_turn_state
     body = {"metadata": {"task_id": "stale", "turn_id": "changing",
@@ -253,6 +269,49 @@ def test_compacted_checkpoint_keeps_identity_without_replaying_history(tmp_path)
         cache.close()
 
 
+def test_compacted_result_recovers_only_from_exact_checkpoint(tmp_path):
+    from bridge import NativeCallStore, migrate_completed_history, replay_checkpoint
+    scope = ("21", "s", "generation")
+    path = tmp_path / "result.db"
+    call = {"type": "function_call", "call_id": "a", "name": "write", "arguments": "{}"}
+    result = {"type": "function_call_output", "call_id": "a", "output": "done"}
+    cache = NativeCallStore(path)
+    original = migrate_completed_history({"input": [call, result]}, cache, scope)
+    cache.close()
+    cache = NativeCallStore(path)
+    try:
+        compact = {"type": "compaction", "encrypted_content": "opaque"}
+        body = {"input": [compact, result]}
+        rebuilt = replay_checkpoint(body, cache, scope)
+        assert rebuilt["_excel_checkpoint"] == original["_excel_checkpoint"]
+        assert rebuilt["input"][0] == compact
+        assert "already completed" in rebuilt["input"][1]["content"][0]["text"]
+        assert body["input"] == [compact, result]
+        for other in [("22", "s", "generation"), ("21", "s", "rotated"), ("21", "other", "generation")]:
+            assert replay_checkpoint(body, cache, other) == body
+        for bad in [[{**result, "output": "changed"}], [result, result], [call]]:
+            with pytest.raises(ValueError):
+                replay_checkpoint({"input": bad}, cache, scope)
+    finally:
+        cache.close()
+
+
+def test_owner_refreshes_active_history_but_never_revives_expired(tmp_path):
+    from bridge import NativeCallStore
+    cache = NativeCallStore(tmp_path / "ttl.db", ttl_seconds=60, clock=lambda: 100)
+    try:
+        cache.remember(("21", "s", "g"), {"call_id": "a"})
+        cache.clock = lambda: 140
+        assert cache.owner("s", ["a"]) == "21"
+        cache.clock = lambda: 170
+        assert cache.owner("s", ["a"]) == "21"
+        cache.clock = lambda: 231
+        assert cache.owner("s", ["a"]) is None
+        assert cache.db.execute("PRAGMA synchronous").fetchone()[0] == 2
+    finally:
+        cache.close()
+
+
 def test_growing_migration_checkpoint_keeps_cache_identity(tmp_path):
     from bridge import NativeCallStore, migrate_completed_history
     path = tmp_path / "growing.db"
@@ -318,7 +377,8 @@ def test_migration_rejects_incomplete_history(history):
         completed_tool_pairs(history)
 
 
-def test_http_migration_and_followup(tmp_path, monkeypatch):
+@pytest.mark.parametrize("compacted", [False, True])
+def test_http_migration_and_followup(tmp_path, monkeypatch, compacted):
     from bridge import install_scoped_backend
     monkeypatch.setenv("EXCEL_HISTORY_MIGRATION", "1")
 
@@ -344,10 +404,14 @@ def test_http_migration_and_followup(tmp_path, monkeypatch):
         {"type": "function_call", "name": "write_file", "arguments": "{}", "call_id": "old"},
         {"type": "function_call_output", "call_id": "old", "output": "done"},
     ]}
+    if compacted:
+        body["input"].insert(0, {"type": "compaction", "encrypted_content": "opaque-state"})
     with TestClient(create_app(backend, KEY, "unused", scoped=True)) as client:
         assert client.post("/v1/responses", headers=headers, json=body).status_code == 200
         assert not any(x.get("type") == "function_call" for x in captured[0]["input"])
         first_key = captured[0]["prompt_cache_key"]
+        if compacted:
+            assert captured[0]["input"][0] == body["input"][0]
         headers["X-Excel-Migrate"] = "auto"
         assert client.post("/v1/responses", headers=headers, json=body).status_code == 200
         assert captured[-1]["prompt_cache_key"] == first_key
@@ -745,7 +809,8 @@ def test_pinned_backend_roundtrip(tmp_path, monkeypatch, scoped, tool_fields, mo
 
 @pytest.mark.parametrize("durable", [False, True])
 @pytest.mark.parametrize("kind", ["function", "custom"])
-def test_native_officejs_identity_restored_for_tool_output(kind, durable, tmp_path):
+@pytest.mark.parametrize("compacted", [False, True])
+def test_native_officejs_identity_restored_for_tool_output(kind, durable, tmp_path, compacted):
     source = os.environ.get("EXCEL_UPSTREAM_SOURCE")
     if not source:
         pytest.skip("Set EXCEL_UPSTREAM_SOURCE to the pinned ghcp_proxy checkout")
@@ -782,10 +847,14 @@ def test_native_officejs_identity_restored_for_tool_output(kind, durable, tmp_pa
         "type": "function_call_output" if kind == "function" else "custom_tool_call_output",
         "call_id": client["call_id"], "output": "local execution result",
     }
+    compact = {"type": "compaction", "encrypted_content": "opaque-state"}
     wire = module.prepare_responses_body({
         "model": "gpt-5.6-sol-excel", "tools": [tool],
-        "input": [{"role": "user", "content": "run tool"}, client, output],
+        "input": [compact, output] if compacted else [
+            {"role": "user", "content": "run tool"}, client, output],
     })
+    if compacted:
+        assert compact in wire["input"]
     calls = [item for item in wire["input"] if item.get("type") == "function_call"]
     results = [item for item in wire["input"] if item.get("type") == "function_call_output"]
     assert calls == [native]  # Exact name, arguments, native item ID and call_id.

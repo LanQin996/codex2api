@@ -301,7 +301,11 @@ def completed_tool_pairs(items):
             continue
         kind = item.get("type")
         if kind not in TOOL_CALL_TYPES | TOOL_RESULT_TYPES:
-            if kind in {"item_reference", "compaction"}:
+            if kind == "compaction":
+                encrypted = item.get("encrypted_content")
+                if not isinstance(encrypted, str) or not encrypted.strip():
+                    raise ValueError("Invalid compaction state")
+            if kind == "item_reference":
                 raise ValueError("Opaque history cannot migrate")
             continue
         call_id = item.get("call_id")
@@ -361,7 +365,22 @@ def replay_checkpoint(body, cache, scope):
     ]
     if not selected:
         return {**body, "_excel_checkpoint": checkpoint_id}
-    calls, results = completed_tool_pairs(selected)
+    # Compaction can retain a result while dropping its completed call. Only
+    # restore that call from this exact scope's immutable checkpoint; never
+    # invent a result, consult another scope, or resurrect absent history.
+    present_calls = {item["call_id"] for item in selected
+                     if item.get("type") in TOOL_CALL_TYPES}
+    restored = []
+    for item in selected:
+        call_id = item["call_id"]
+        if item.get("type") in TOOL_RESULT_TYPES and call_id not in present_calls:
+            stored = json.loads(saved[call_id])
+            if stored.get("result") != item:
+                raise ValueError("Checkpoint history changed")
+            restored.append(stored["call"])
+            present_calls.add(call_id)
+        restored.append(item)
+    calls, results = completed_tool_pairs(restored)
     output = []
     for item in body["input"]:
         if not isinstance(item, dict):
@@ -460,6 +479,7 @@ class NativeCallStore:
         self.next_prune = 0
         self.db = sqlite3.connect(str(path), timeout=10, check_same_thread=False)
         self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS sessions (
@@ -481,6 +501,7 @@ class NativeCallStore:
                 scope TEXT PRIMARY KEY REFERENCES sessions(scope) ON DELETE CASCADE,
                 identity TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS checkpoints_id ON checkpoints(call_id);
         """)
 
     @staticmethod
@@ -608,8 +629,8 @@ class NativeCallStore:
     def owner(self, session, call_ids):
         """Find one exact persisted scope covering all calls, never cross sessions."""
         candidates = None
-        with self.lock:
-            for call_id in call_ids:
+        with self.lock, self.db:
+            for call_id in set(call_ids):
                 rows = self.db.execute(
                     "SELECT c.scope FROM (SELECT scope,call_id FROM calls UNION "
                     "SELECT scope,call_id FROM checkpoints) c JOIN sessions s USING(scope) "
@@ -620,9 +641,13 @@ class NativeCallStore:
                 candidates = scopes if candidates is None else candidates & scopes
                 if not candidates:
                     return None
-        if len(candidates or ()) != 1:
-            return None
-        return json.loads(next(iter(candidates)))[0]
+            if len(candidates or ()) != 1:
+                return None
+            key = next(iter(candidates))
+            now = self.clock()
+            self.db.execute("UPDATE sessions SET touched=? WHERE scope=? AND touched<=?",
+                            (now, key, now - min(60, self.ttl / 2)))
+            return json.loads(key)[0]
 
 
 class ScopedStore:
@@ -644,7 +669,12 @@ def install_scoped_backend(backend, cache_path=None, ttl_seconds=7 * 86400):
         if not isinstance(call_id, str) or not call_id:
             return
         if disk is not None:
-            disk.remember(request_scope.get(), item)
+            try:
+                disk.remember(request_scope.get(), item)
+            except sqlite3.Error:
+                # Fail closed; do not silently acknowledge an unpersisted call.
+                logger.error("excel_history_persist_failed reason=sqlite_error")
+                raise
             return
         key = (request_scope.get(), call_id)
         with lock:

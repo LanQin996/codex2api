@@ -95,6 +95,16 @@ func TestExcelMigrationRequiresCompletedPairs(t *testing.T) {
 		t.Fatal("completed history rejected")
 	}
 }
+func TestExcelMigrationPreservesValidCompaction(t *testing.T) {
+	pair := `{"type":"function_call","call_id":"a","name":"read","arguments":"{}"},{"type":"function_call_output","call_id":"a","output":"done"}`
+	for _, state := range []string{`{"type":"compaction","encrypted_content":"opaque"}`, `{"type":"compaction"}`, `{"type":"compaction","encrypted_content":" "}`, `{"type":"item_reference","id":"opaque"}`} {
+		want := gjson.Get(state, "encrypted_content").String() == "opaque"
+		if got := excelHistoryCanMigrate([]byte(`{"input":[` + state + `,` + pair + `]}`)); got != want {
+			t.Fatalf("migration=%v want=%v for %s", got, want, state)
+		}
+	}
+}
+
 func TestExcelHistoryOwnerLookupUsesSameScopeAsTransport(t *testing.T) {
 	body := []byte(`{"prompt_cache_key":"stable","input":[{"type":"function_call","call_id":"a"}]}`)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
