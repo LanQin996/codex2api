@@ -25,6 +25,39 @@ var excelBridgeClient = &http.Client{
 	Transport:     &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 32},
 }
 
+func hasExcelToolHistory(body []byte) bool {
+	for _, item := range gjson.GetBytes(body, "input").Array() {
+		switch item.Get("type").String() {
+		case "function_call", "custom_tool_call", "function_call_output", "custom_tool_call_output":
+			return true
+		}
+	}
+	return false
+}
+
+// Restrict only Excel continuations; ordinary Codex requests retain their
+// existing overflow/failover behavior. Keep the filter for the entire retry loop.
+func pinExcelContinuationFilter(model string, body []byte, accountID int64, filter auth.AccountFilter) auth.AccountFilter {
+	if accountID == 0 || !hasExcelToolHistory(body) {
+		return filter
+	}
+	return func(account *auth.Account) bool {
+		target := model
+		if mapped, ok := ResolveAccountModelMapping(account, model); ok {
+			target = mapped
+		}
+		if auth.IsExcelModel(target) && account.ID() != accountID {
+			return false
+		}
+		return filter == nil || filter(account)
+	}
+}
+
+func isExcelModelAccessChanged(status int, body []byte) bool {
+	return status == http.StatusForbidden &&
+		gjson.GetBytes(body, "error.code").String() == "basispoints_model_access_changed"
+}
+
 func executeExcelRequest(ctx context.Context, account *auth.Account, body []byte, sessionID, clientKey string) (*http.Response, error) {
 	route, enabled := account.ExcelRoute()
 	if !enabled {

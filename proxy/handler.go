@@ -4019,6 +4019,11 @@ func (h *Handler) Responses(c *gin.Context) {
 	accountFilter = excludeClaudeAccountsFilter(accountFilter)
 	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
+	// Excel native tool IDs belong to the account that produced them. Never
+	// borrow a second Excel account on capacity overflow or retry.
+	if boundID, bound := h.store.SessionAffinityAccountID(affinityKey); bound {
+		accountFilter = pinExcelContinuationFilter(effectiveModel, rawBody, boundID, accountFilter)
+	}
 	// resolveCompactionAffinity 只在已知来源相互冲突时报错；缓存故障按未知
 	// 来源处理，保持正常调度。
 	compactionAffinity, compactionAffinityErr := h.resolveCompactionAffinity(c.Request.Context(), rawBody)
@@ -8427,6 +8432,18 @@ func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []by
 }
 
 func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, body []byte, resp *http.Response, model string) codex429Decision {
+	// An Excel model entitlement error must not put the whole OAuth account
+	// into payment_required: other Excel/Codex models may still be usable.
+	if isExcelModelAccessChanged(statusCode, body) {
+		if h.store == nil || model == "" {
+			return codex429Decision{}
+		}
+		cooldown := h.store.MarkModelCooldown(account, model, 5*time.Minute, "excel_model_access_changed")
+		return codex429Decision{
+			Scope: rateLimitScopeModel, Reason: "excel_model_access_changed",
+			Model: model, ResetAt: cooldown.ResetAt, Cooldown: time.Until(cooldown.ResetAt),
+		}
+	}
 	// Grok 上游的错误语义与 Codex 不同（免费额度耗尽/超支限制/Retry-After），单独映射。
 	if account.IsGrokAPI() {
 		return h.applyGrokCooldownForModel(account, statusCode, body, resp, model)

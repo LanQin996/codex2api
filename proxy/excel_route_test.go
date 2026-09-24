@@ -10,8 +10,58 @@ import (
 	"testing"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/database"
 	"github.com/tidwall/gjson"
 )
+
+func TestExcelContinuationPinnedAcrossOverflow(t *testing.T) {
+	for _, kind := range []string{"function_call", "custom_tool_call", "function_call_output", "custom_tool_call_output"} {
+		body := []byte(`{"input":[{"type":"` + kind + `","call_id":"call"}]}`)
+		filter := pinExcelContinuationFilter("gpt-6-sol-excel", body, 42, nil)
+		if !filter(&auth.Account{DBID: 42}) || filter(&auth.Account{DBID: 43}) {
+			t.Fatalf("Excel continuation escaped original account: %s", kind)
+		}
+		normal := pinExcelContinuationFilter("gpt-6-sol", body, 42, nil)
+		if !normal(&auth.Account{DBID: 43}) {
+			t.Fatal("ordinary Codex failover changed")
+		}
+	}
+	filter := pinExcelContinuationFilter("gpt-6-sol-excel", []byte(`{"input":"hello"}`), 42,
+		func(a *auth.Account) bool { return a.ID() == 43 })
+	if !filter(&auth.Account{DBID: 43}) || filter(&auth.Account{DBID: 42}) {
+		t.Fatal("fresh request filter was changed")
+	}
+	filter = pinExcelContinuationFilter("gpt-6-sol-excel",
+		[]byte(`{"input":[{"type":"function_call"}]}`), 42, func(*auth.Account) bool { return false })
+	if filter(&auth.Account{DBID: 42}) {
+		t.Fatal("pin bypassed account eligibility")
+	}
+}
+
+func TestExcelModel403DoesNotDisableWholeAccount(t *testing.T) {
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2})
+	account := &auth.Account{DBID: 42, AccessToken: "test", Status: auth.StatusReady}
+	store.AddAccount(account)
+	before := account.RuntimeStatus()
+	h := &Handler{store: store}
+	body := []byte(`{"error":{"code":"basispoints_model_access_changed"}}`)
+	d := h.applyCooldownForModel(account, http.StatusForbidden, body, nil, "gpt-6-sol-excel")
+	if d.Scope != rateLimitScopeModel || d.Model != "gpt-6-sol-excel" {
+		t.Fatalf("wrong cooldown: %+v", d)
+	}
+	if account.RuntimeStatus() != before {
+		t.Fatalf("whole account cooled down: %s", account.RuntimeStatus())
+	}
+	if store.WithModelCooldownFilterContext(context.Background(), "gpt-6-sol-excel", nil)(account) {
+		t.Fatal("denied model remains eligible")
+	}
+	if !store.WithModelCooldownFilterContext(context.Background(), "gpt-5.6-sol-excel", nil)(account) {
+		t.Fatal("unrelated model was cooled down")
+	}
+	if isExcelModelAccessChanged(http.StatusForbidden, []byte(`{"error":{"message":"access denied"}}`)) {
+		t.Fatal("generic 403 misclassified")
+	}
+}
 
 func TestExcelAliasesPassIngressModelValidation(t *testing.T) {
 	h := &Handler{}

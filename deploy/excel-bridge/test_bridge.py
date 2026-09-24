@@ -11,6 +11,55 @@ from starlette.testclient import TestClient
 
 from bridge import create_app
 
+
+def test_reset_turn_state_preserves_unrelated_metadata():
+    from bridge import reset_client_turn_state
+    body = {"metadata": {"task_id": "stale", "turn_id": "changing",
+                         "agent_iteration": "999", "customer_tag": "keep"}}
+    reset_client_turn_state(body)
+    assert body["metadata"] == {"customer_tag": "keep"}
+
+
+def test_upstream_error_diagnostics_are_redacted(caplog):
+    from bridge import log_upstream_failure
+    response = JSONResponse({"error": {"code": "basispoints_model_access_changed",
+                                       "message": "Bearer private-token"}}, status_code=403)
+    log_upstream_failure(response, {"model": "gpt-6-sol-excel"}, "42")
+    assert "basispoints_model_access_changed" in caplog.text
+    assert "gpt-6-sol-excel" in caplog.text
+    assert "private-token" not in caplog.text
+    caplog.clear()
+    response = JSONResponse({"error": {"code": {"secret": "private-token"}}}, status_code=500)
+    log_upstream_failure(response, {"model": "bad\nprivate-token"}, "42")
+    assert "private-token" not in caplog.text
+
+
+def test_derived_turn_stable_for_tool_loop(tmp_path):
+    source = os.environ.get("EXCEL_UPSTREAM_SOURCE")
+    if not source:
+        pytest.skip("Set EXCEL_UPSTREAM_SOURCE to the pinned ghcp_proxy checkout")
+    sys.path.insert(0, source)
+    from bridge import reset_client_turn_state
+    module = importlib.import_module("excel_upstream")
+
+    def prepare(items):
+        body = {"model": "gpt-5.6-sol-excel", "prompt_cache_key": "stable",
+                "input": items, "metadata": {"task_id": "wrong", "turn_id": "wrong",
+                                            "agent_iteration": "999"}}
+        reset_client_turn_state(body)
+        return module.prepare_responses_body(body)["metadata"]
+
+    first = [{"role": "user", "content": "do work"}]
+    continued = first + [{"type": "function_call_output", "call_id": "test", "output": "done"}]
+    a, b = prepare(first), prepare(continued)
+    assert a["task_id"] == b["task_id"] != "wrong"
+    assert a["turn_id"] == b["turn_id"] != "wrong"
+    assert int(b["agent_iteration"]) > int(a["agent_iteration"])
+    assert prepare(continued) == b
+    next_turn = prepare(continued + [{"role": "user", "content": "next question"}])
+    assert next_turn["task_id"] == b["task_id"]
+    assert next_turn["turn_id"] != b["turn_id"]
+
 KEY = "test-only-bridge-key-" + "x" * 32
 AUTH = {"Authorization": "Bearer " + KEY}
 

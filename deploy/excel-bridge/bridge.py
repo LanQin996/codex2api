@@ -28,6 +28,42 @@ request_scope = ContextVar("excel_scope")
 logger = logging.getLogger("excel_bridge")
 
 
+def reset_client_turn_state(body):
+    """The adapter derives task/turn/iteration from session and full history."""
+    metadata = body.get("metadata")
+    if isinstance(metadata, dict):
+        for key in ("task_id", "turn_id", "agent_iteration"):
+            metadata.pop(key, None)
+
+
+def log_upstream_failure(response, body, account):
+    """Log bounded structural diagnostics, never upstream messages or payloads."""
+    if response.status_code < 400:
+        return
+    code = "unknown"
+    raw = getattr(response, "body", None)
+    if isinstance(raw, bytes) and len(raw) <= 65536:
+        try:
+            payload = json.loads(raw)
+            error_obj = payload.get("error") if isinstance(payload, dict) else None
+            candidate = error_obj.get("code") if isinstance(error_obj, dict) else None
+            # Only known codes: arbitrary upstream strings could contain secrets.
+            if isinstance(candidate, str) and candidate in {
+                "basispoints_model_access_changed", "rate_limit_exceeded",
+                "insufficient_quota", "invalid_api_key", "model_not_found",
+            }:
+                code = candidate
+        except (ValueError, UnicodeError):
+            pass
+    model = body.get("model")
+    if not isinstance(model, str) or len(model) > 80 or not all(
+        ch.isascii() and (ch.isalnum() or ch in "-._") for ch in model
+    ):
+        model = "unknown"
+    logger.warning("excel_upstream_failure account=%s model=%s status=%s code=%s",
+                   account, model, response.status_code, code)
+
+
 class NativeCallStore:
     """Keep exact native calls across restarts; expire whole idle sessions."""
 
@@ -291,16 +327,13 @@ def create_app(backend, key, session_path, *, scoped=False):
             body["prompt_cache_key"] = hashlib.sha256(
                 (account + ":" + scope).encode()
             ).hexdigest()
-            # Derive iteration from current history rather than trusting stale
-            # caller state. Preserve other metadata and explicit task/turn IDs.
-            metadata = body.get("metadata")
-            if isinstance(metadata, dict):
-                metadata.pop("agent_iteration", None)
         elif not load_session(session_path, backend):
             return error(503, "Excel session unavailable or expired; replace session.json")
+        reset_client_turn_state(body)
         # The upstream handler obtains a snapshot of session headers before
         # its first await. One worker preserves its native tool-call cache.
         response = await backend._handle_excel_responses(request, body)
+        log_upstream_failure(response, body, account if scoped else "session_file")
         return response
 
     class AuthenticatedApp:
