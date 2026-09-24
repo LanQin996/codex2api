@@ -146,6 +146,57 @@ async def prepare_image_attachments(backend, body):
     result["input"] = rebuilt
     return result
 request_wire_shape = ContextVar("excel_wire_shape", default=None)
+request_cache_diagnostic = ContextVar("excel_cache_diagnostic", default=None)
+cache_diagnostic_history = OrderedDict()
+cache_diagnostic_lock = threading.Lock()
+
+
+def cache_diagnostic_snapshot(body):
+    """Retain only hashes and counts, never prompt text or credentials."""
+    def digest(value):
+        return hashlib.sha256(json.dumps(value, ensure_ascii=False,
+                                        separators=(",", ":")).encode()).hexdigest()
+    scope = request_scope.get(None)
+    key = digest([scope, body.get("model"), body.get("prompt_cache_key")])
+    items = body.get("input")
+    hashes = [digest(item) for item in items] if isinstance(items, list) else []
+    stable = {k: v for k, v in body.items() if k not in {"input", "metadata"}}
+    with cache_diagnostic_lock:
+        previous = cache_diagnostic_history.get(key)
+        common = 0
+        if previous:
+            for a, b in zip(previous, hashes):
+                if a != b:
+                    break
+                common += 1
+        cache_diagnostic_history[key] = hashes[:10000]
+        cache_diagnostic_history.move_to_end(key)
+        while len(cache_diagnostic_history) > 256:
+            cache_diagnostic_history.popitem(last=False)
+    return {"trace": uuid.uuid4().hex, "scope_hash": digest(scope)[:20],
+            "account": scope[0] if scope else None,
+            "key_hash": key[:20], "cache_key_present": bool(body.get("prompt_cache_key")),
+            "settings_hash": digest(stable)[:20], "items": len(hashes),
+            "previous_items": len(previous) if previous is not None else None,
+            "common_prefix_items": common,
+            "prefix_hash": digest(hashes[:4])[:20]}
+
+
+def log_cache_usage(snapshot, payload):
+    response = payload.get("response")
+    if not isinstance(response, dict):
+        return
+    usage = response.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+    details = usage.get("input_tokens_details")
+    details = details if isinstance(details, dict) else {}
+    record = dict(snapshot or {})
+    record["cached_field_present"] = "cached_tokens" in details
+    for key, value in (("input_tokens", usage.get("input_tokens")),
+                       ("output_tokens", usage.get("output_tokens")),
+                       ("cached_tokens", details.get("cached_tokens"))):
+        record[key] = value if type(value) is int else None
+    logger.warning("excel_cache_usage %s", json.dumps(record, sort_keys=True))
 
 
 def wire_shape(body):
@@ -198,10 +249,42 @@ def install_wire_diagnostics(backend):
     def prepare(*args, **kwargs):
         body = original(*args, **kwargs)
         request_wire_shape.set(wire_shape(body))
+        request_cache_diagnostic.set(cache_diagnostic_snapshot(body))
         return body
 
     prepare._excel_diagnostic = True
     backend.excel_upstream.prepare_responses_body = prepare
+    original_transform = backend._excel_tool_stream_transform
+
+    def make_transform(source_body):
+        downstream = original_transform(source_body)
+        snapshot = request_cache_diagnostic.get()
+
+        async def transform(byte_iter):
+            async def observed():
+                pending = b""
+                async for chunk in byte_iter:
+                    pending += chunk
+                    while bytes([10]) in pending:
+                        line, pending = pending.split(bytes([10]), 1)
+                        if line.startswith(b"data:"):
+                            try:
+                                event = json.loads(line[5:].strip())
+                                if isinstance(event, dict) and event.get("type") in {
+                                    "response.completed", "response.incomplete", "response.failed"
+                                }:
+                                    log_cache_usage(snapshot, event)
+                            except (ValueError, UnicodeError):
+                                pass
+                    if len(pending) > MAX_BODY:
+                        pending = b""
+                    yield chunk
+            stream = observed()
+            async for chunk in downstream(stream) if downstream else stream:
+                yield chunk
+        return transform
+
+    backend._excel_tool_stream_transform = make_transform
 
 
 TOOL_CALL_TYPES = {"function_call", "custom_tool_call"}
@@ -266,6 +349,9 @@ def replay_checkpoint(body, cache, scope):
     saved = cache.checkpoint_items(scope)
     if not saved:
         return body
+    # Compaction may remove every checkpointed pair from the submitted history.
+    # Keep the checkpoint's task identity without resurrecting compacted items.
+    checkpoint_id = cache.checkpoint_identity(scope, saved)
     # Verify every replayed pair against the immutable client logical history.
     selected = [
         item for item in body.get("input", [])
@@ -274,7 +360,7 @@ def replay_checkpoint(body, cache, scope):
         and item.get("type") in TOOL_CALL_TYPES | TOOL_RESULT_TYPES
     ]
     if not selected:
-        return body
+        return {**body, "_excel_checkpoint": checkpoint_id}
     calls, results = completed_tool_pairs(selected)
     output = []
     for item in body["input"]:
@@ -315,9 +401,7 @@ def replay_checkpoint(body, cache, scope):
     rebuilt = dict(body)
     rebuilt["input"] = output
     # A distinct deterministic upstream task/cache identity for the new checkpoint.
-    rebuilt["_excel_checkpoint"] = hashlib.sha256(
-        json.dumps(sorted(saved), separators=(",", ":")).encode()
-    ).hexdigest()
+    rebuilt["_excel_checkpoint"] = checkpoint_id
     return rebuilt
 
 
@@ -393,6 +477,10 @@ class NativeCallStore:
                 call_id TEXT NOT NULL, payload TEXT NOT NULL,
                 PRIMARY KEY (scope, call_id)
             );
+            CREATE TABLE IF NOT EXISTS checkpoint_identities (
+                scope TEXT PRIMARY KEY REFERENCES sessions(scope) ON DELETE CASCADE,
+                identity TEXT NOT NULL
+            );
         """)
 
     @staticmethod
@@ -462,6 +550,23 @@ class NativeCallStore:
                             "DO UPDATE SET touched=excluded.touched", (key, now))
             self.db.executemany("INSERT OR IGNORE INTO checkpoints VALUES (?,?,?)",
                                 [(key, call_id, payload) for call_id, payload in entries.items()])
+
+    def checkpoint_identity(self, scope, saved):
+        # Freeze the first observed migration identity. Growing the set of
+        # completed calls must not change task_id/prompt_cache_key every turn.
+        # Existing sessions preserve their current hash at upgrade time.
+        candidate = hashlib.sha256(
+            json.dumps(sorted(saved), separators=(",", ":")).encode()
+        ).hexdigest()
+        key = self.key(scope)
+        with self.lock, self.db:
+            self.db.execute(
+                "INSERT OR IGNORE INTO checkpoint_identities VALUES (?, ?)",
+                (key, candidate),
+            )
+            return self.db.execute(
+                "SELECT identity FROM checkpoint_identities WHERE scope=?", (key,)
+            ).fetchone()[0]
 
     def checkpoint_items(self, scope):
         key, now = self.key(scope), self.clock()

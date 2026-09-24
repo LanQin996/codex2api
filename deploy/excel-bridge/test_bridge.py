@@ -61,6 +61,48 @@ def test_derived_turn_stable_for_tool_loop(tmp_path):
     assert next_turn["turn_id"] != b["turn_id"]
 
 KEY = "test-only-bridge-key-" + "x" * 32
+
+def test_cache_diagnostics_prefix_and_redaction(caplog):
+    import bridge
+    bridge.cache_diagnostic_history.clear()
+    token = bridge.request_scope.set(("21", "private-session", "private-token"))
+    try:
+        body = {"model": "test", "prompt_cache_key": "private-key",
+                "input": [{"role": "user", "content": "private-prompt"}]}
+        a = bridge.cache_diagnostic_snapshot(body)
+        b = bridge.cache_diagnostic_snapshot({**body, "input": body["input"] + ["next"]})
+        assert a["previous_items"] is None
+        assert b["common_prefix_items"] == b["previous_items"] == 1
+        bridge.log_cache_usage(b, {"response": {"usage": {"input_tokens": 100}}})
+        assert '"cached_field_present": false' in caplog.text
+        assert '"cached_tokens": null' in caplog.text
+        bridge.log_cache_usage(b, {"response": {"usage": {"input_tokens_details": {"cached_tokens": 0}}}})
+        assert '"cached_field_present": true' in caplog.text
+        assert '"cached_tokens": 0' in caplog.text
+        assert "private-" not in caplog.text
+    finally:
+        bridge.request_scope.reset(token)
+
+
+def test_cache_diagnostics_stream_preserves_chunks(caplog):
+    import asyncio
+    import bridge
+    upstream = SimpleNamespace(prepare_responses_body=lambda body: body)
+    backend = SimpleNamespace(excel_upstream=upstream, _excel_tool_stream_transform=lambda body: None)
+    bridge.install_wire_diagnostics(backend)
+    upstream.prepare_responses_body({"input": [], "prompt_cache_key": "stable"})
+    payload = {"type": "response.completed", "response": {"usage": {"input_tokens": 100,
+               "input_tokens_details": {"cached_tokens": 64}}}}
+    raw = b"data: " + json.dumps(payload).encode() + bytes([10, 10])
+    chunks = [raw[:8], raw[8:31], raw[31:]]
+    async def source():
+        for chunk in chunks:
+            yield chunk
+    async def collect():
+        return [chunk async for chunk in backend._excel_tool_stream_transform({})(source())]
+    assert asyncio.run(collect()) == chunks
+    assert '"cached_tokens": 64' in caplog.text
+
 AUTH = {"Authorization": "Bearer " + KEY}
 
 def test_image_attachments_cover_tool_results(monkeypatch):
@@ -182,6 +224,57 @@ def test_wire_shape_never_contains_user_text():
     assert shape["input_count"] == 2
     assert shape["tools_present"] is True
     assert shape["item_types"] == {"message": 1, "other": 1}
+
+def test_compacted_checkpoint_keeps_identity_without_replaying_history(tmp_path):
+    from bridge import NativeCallStore, migrate_completed_history, replay_checkpoint
+    scope = ("21", "session", "generation")
+    path = tmp_path / "compacted.db"
+    original = {"input": [
+        {"type": "function_call", "call_id": "old", "name": "write_file", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "old", "output": "done"},
+    ]}
+    with_store = NativeCallStore(path)
+    marker = migrate_completed_history(original, with_store, scope)["_excel_checkpoint"]
+    with_store.close()
+    cache = NativeCallStore(path)
+    try:
+        body = {"input": [
+            {"type": "compaction", "encrypted_content": "opaque-state"},
+            {"role": "user", "content": [{"type": "input_image", "file_id": "file-test"}]},
+        ], "tools": [{"type": "function", "name": "probe"}]}
+        before = json.loads(json.dumps(body))
+        rebuilt = replay_checkpoint(body, cache, scope)
+        assert rebuilt["_excel_checkpoint"] == marker
+        assert rebuilt["input"] == before["input"]
+        assert rebuilt["tools"] == before["tools"]
+        assert body == before
+        assert replay_checkpoint(body, cache, ("22", "session", "generation")) == body
+    finally:
+        cache.close()
+
+
+def test_growing_migration_checkpoint_keeps_cache_identity(tmp_path):
+    from bridge import NativeCallStore, migrate_completed_history
+    path = tmp_path / "growing.db"
+    scope = ("21", "stable-session", "generation")
+    body = {"input": []}
+    marker = None
+    for i in range(3):
+        body["input"].extend([
+            {"type": "function_call", "call_id": str(i), "name": "read", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": str(i), "output": "done"},
+        ])
+        cache = NativeCallStore(path)
+        try:
+            result = migrate_completed_history(body, cache, scope)
+            if marker is None:
+                marker = result["_excel_checkpoint"]
+            assert result["_excel_checkpoint"] == marker
+            assert len(cache.checkpoint_items(scope)) == i + 1
+            assert len(result["input"]) == i + 1
+        finally:
+            cache.close()
+
 
 def test_migration_checkpoint_survives_restart_and_new_tool(tmp_path):
     from bridge import NativeCallStore, migrate_completed_history, replay_checkpoint
