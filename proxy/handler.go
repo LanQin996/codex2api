@@ -1501,6 +1501,14 @@ func (h *Handler) logUsage(input *database.UsageLogInput) {
 	// Non-Grok and unresolved accounts deliberately remain legacy/unscoped (0).
 	input = database.SnapshotUsageLogBilling(input)
 	h.populateUsageCredentialGeneration(input)
+	// Keep the fork's legacy field and upstream's response-model audit in sync.
+	// The upstream observer prefers terminal declarations over earlier events.
+	if input.UpstreamResponseModel != "" {
+		input.UpstreamModel = input.UpstreamResponseModel
+	} else if input.UpstreamModel != "" {
+		input.UpstreamResponseModel = input.UpstreamModel
+		input.UpstreamModelMismatch = upstreamModelMismatch(upstreamSentModelForAudit(input.EffectiveModel, input.Model), input.UpstreamModel)
+	}
 	h.noteUpstreamModelMismatch(input)
 	// scope 维度预算（issue #439）在日志落库前先吃到这笔消耗，抵掉窗口聚合缓存的滞后。
 	h.recordAPIKeyScopeUsage(input)
@@ -4568,6 +4576,7 @@ func (h *Handler) Responses(c *gin.Context) {
 			var firstTokenMs int
 			var usage *UsageInfo
 			var actualServiceTier string
+			var upstreamModel string
 			responseModelObserver := &upstreamResponseModelObserver{}
 			ttftRecorded := false
 			// contentTokenSeen is deliberately strict and independent from the
@@ -4744,6 +4753,7 @@ func (h *Handler) Responses(c *gin.Context) {
 					nonStreamResponseBody = append([]byte(nil), respBody...)
 					usage = extractUsageFromResult(gjson.GetBytes(respBody, "usage"))
 					actualServiceTier = gjson.GetBytes(respBody, "service_tier").String()
+					upstreamModel = upstreamModelFromPayload(respBody)
 					observeUpstreamResponseModelBody(responseModelObserver, respBody)
 					imageLogInfo = imageUsageLogInfoFromResponseJSON(respBody)
 					gotTerminal = true
@@ -5013,7 +5023,6 @@ func (h *Handler) Responses(c *gin.Context) {
 		durationMs := int(time.Since(start).Milliseconds())
 
 		if reqErr != nil {
-			AbortCodexTurnStateRequest(upstreamCtx)
 			if apiKeyModelRequestError(reqErr) != nil {
 				ttftGuard.Stop()
 				h.store.Release(account)
@@ -5102,10 +5111,6 @@ func (h *Handler) Responses(c *gin.Context) {
 			}
 			retryAfter := normalizedRetryAfter(resp.Header.Get("Retry-After"))
 			errBody, _ := readAllWithContinuousRetryKeepalive(readCtx, resp.Body)
-			if explicitlyRejectedTicket(errBody) {
-				rejectManagedTicketFromContext(upstreamCtx)
-			}
-			AbortCodexTurnStateRequest(upstreamCtx)
 			rememberContinuousRetryHTTPFailure(c.Request.Context(), resp, errBody)
 			resp.Body.Close()
 			if continuousRetryCommitExpired(c, continuousRetryProtocolResponses) {
@@ -5214,7 +5219,6 @@ func (h *Handler) Responses(c *gin.Context) {
 			h.sendFinalUpstreamError(c, resp.StatusCode, errBody)
 			return
 		}
-		StageCodexTurnStateResponse(upstreamCtx, resp.Header)
 
 		if !isStream || !continuousRetryBuffersAttempts(continuousRetryPolicy) {
 			relayCodexTurnStateResponseHeader(c, affinityKey, account, attemptEffectiveModel, resp.Header)
@@ -5230,6 +5234,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		var firstTokenMs int
 		var usage *UsageInfo
 		var actualServiceTier string
+		var upstreamModel string
 		responseModelObserver := &upstreamResponseModelObserver{}
 		ttftRecorded := false
 		gotTerminal := false // 是否收到 response.completed 或 response.failed
@@ -5724,7 +5729,6 @@ func (h *Handler) Responses(c *gin.Context) {
 					return
 				}
 			} else {
-				CommitCodexTurnStateRequest(upstreamCtx)
 				for _, payload := range compactionProvenancePayloads {
 					h.recordCompactionProvenanceFromPayload(context.Background(), account, payload)
 				}
@@ -5732,9 +5736,6 @@ func (h *Handler) Responses(c *gin.Context) {
 					cacheCompletedResponseWithOutputItems(respCacheOwner, []byte(expandedInputRaw), completedResponseData, completedResponseOutputItems)
 				}
 			}
-		}
-		if outcome.logStatusCode != http.StatusOK {
-			AbortCodexTurnStateRequest(upstreamCtx)
 		}
 		_ = streamAttempt.Close()
 
@@ -7332,6 +7333,7 @@ func (h *Handler) ChatCompletions(c *gin.Context) {
 		var firstTokenMs int
 		var usage *UsageInfo
 		var actualServiceTier string
+		var upstreamModel string
 		responseModelObserver := &upstreamResponseModelObserver{}
 		ttftRecorded := false
 		// TTFT may use loose structural progress, but retry safety is based on

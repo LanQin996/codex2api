@@ -25,9 +25,6 @@ const codexTurnStateProvenanceTTL = time.Hour
 
 type codexTurnStateOrigin struct {
 	accountID int64
-	// proxyURL 是本次向该会话下发 blob 时实际使用的绑定出口（空表示没有绑定出口）。
-	// 客户端回带该 blob 时出站必须回到同一条出口，绑定才算成立。
-	proxyURL  string
 	expiresAt time.Time
 }
 
@@ -37,8 +34,8 @@ var (
 )
 
 // relayCodexTurnStateResponseHeader 把上游响应的 turn-state 写入下游响应头,
-// 并记录铸造账号与该次尝试的绑定出口。上游没有该头时主动清除 writer 上可能残留的
-// 上一 failover attempt 的值——否则换号重试后旧账号的 blob 会粘到新账号的响应上,正是本
+// 并记录铸造账号。上游没有该头时主动清除 writer 上可能残留的上一 failover
+// attempt 的值——否则换号重试后旧账号的 blob 会粘到新账号的响应上,正是本
 // 文件要防止的跨账号矛盾。(流式响应一旦提交,对 writer 头的改动是无害空操作。)
 func relayCodexTurnStateResponseHeader(c *gin.Context, affinityKey string, account *auth.Account, model string, headers http.Header) {
 	if c == nil {
@@ -53,7 +50,7 @@ func relayCodexTurnStateResponseHeader(c *gin.Context, affinityKey string, accou
 		return
 	}
 	c.Header(codexTurnStateHeader, token)
-	noteCodexTurnStateProvenance(affinityKey, account, proxyURL)
+	noteCodexTurnStateProvenance(affinityKey, account)
 }
 
 // commitResponsesStreamAttempt publishes the winning account's turn-state only
@@ -92,7 +89,7 @@ func (h *Handler) commitResponsesStreamAttempt(c *gin.Context, attempt *continuo
 		return err
 	}
 	if stagedHeader && token != "" {
-		noteCodexTurnStateProvenance(affinityKey, account, boundProxy)
+		noteCodexTurnStateProvenance(affinityKey, account)
 	}
 	return nil
 }
@@ -108,8 +105,17 @@ func guardCodexTurnStateEcho(affinityKey string, account *auth.Account, headers 
 	if strings.TrimSpace(headers.Get(codexTurnStateHeader)) == "" {
 		return
 	}
-	origin, ok := codexTurnStateOriginForAffinity(affinityKey)
+	raw, ok := codexTurnStateOrigins.Load(affinityKey)
 	if !ok {
+		return
+	}
+	origin, ok := raw.(codexTurnStateOrigin)
+	if !ok {
+		codexTurnStateOrigins.Delete(affinityKey)
+		return
+	}
+	if !origin.expiresAt.IsZero() && time.Now().After(origin.expiresAt) {
+		codexTurnStateOrigins.Delete(affinityKey)
 		return
 	}
 	if origin.accountID != account.ID() {
@@ -165,7 +171,6 @@ func noteCodexTurnStateProvenance(affinityKey string, account *auth.Account) {
 	}
 	codexTurnStateOrigins.Store(affinityKey, codexTurnStateOrigin{
 		accountID: account.ID(),
-		proxyURL:  strings.TrimSpace(proxyURL),
 		expiresAt: time.Now().Add(codexTurnStateProvenanceTTL),
 	})
 	sweepCodexTurnStateOrigins()

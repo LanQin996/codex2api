@@ -141,9 +141,6 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	// Resin 模式下 WS 地址改写为反代路径,拨号侧(createConnection)同样按它跳过代理。
 	egress := proxy.ResolveCodexRequestEgress(ctx, account, wsURL, effectiveProxyURL(account, proxyOverride), true)
 	wsURL = egress.URL
-	// 出口在 beginUpstreamTrace 之后才定稿（票据绑定出口 / Resin 覆盖），用量日志
-	// 按最终拨号出口重刷，否则 WS 行只会显示入参代理，看不出真实出口。
-	proxy.NoteUpstreamTraceProxy(ctx, egress.DialProxyURL, true)
 
 	// 准备请求头
 	// 跨账号回声守卫在握手头装配末尾剥离已知来自其他账号的 turn state。
@@ -180,23 +177,15 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	// 续链亲和：上游无服务端存储时，previous_response_id 的上下文只存活在产出
 	// 该响应的那条 WS 连接里。带续链 ID 的请求优先取回原连接（独占成功才用），
 	// 否则落到随机槽位会触发上游 "previous response not found"。
-	// 出口优先于此处的亲和：本次尝试被票据绑定出口时（ticketBoundProxy 非空），偏好
-	// 连接只在它与绑定出口一致时才可用；不一致就放弃亲和、回落到下面的常规 acquire，
-	// 在绑定出口上新建连接。运维决策是"保票据"——票据在别的出口必被上游拒收，而续链
-	// 丢了最多让上游回 previous response not found，代价更小。
 	// 同线程上的后台副请求（request_kind=memory、guardian 子代理）另成一道，
 	// 不与用户在飞轮次同键排队；Desktop 走 HTTP 时元数据只在请求体里。
 	poolSessionID := proxy.ResolveCodexWebsocketTransportSessionKeyWithBody(sessionID, ginHeaders, wsBody)
-	routeFingerprint := proxy.CodexRouteCookieFingerprint(headers)
-	if routeFingerprint != "" {
-		poolSessionID += ":route:" + routeFingerprint
-	}
 	var wc *WsConnection
 	var pr *PendingRequest
 	var err2 error
 	acquireStart := time.Now()
 	if prevRespID := strings.TrimSpace(gjson.GetBytes(wsBody, "previous_response_id").String()); prevRespID != "" {
-		if pwc, ppr, slotKey := e.manager.AcquirePreferredConnection(prevRespID, account.ID(), apiKey, ticketBoundProxy, routeFingerprint); pwc != nil {
+		if pwc, ppr, slotKey := e.manager.AcquirePreferredConnection(prevRespID, account.ID(), apiKey); pwc != nil {
 			wc, pr, poolSessionID = pwc, ppr, slotKey
 		}
 	}
@@ -215,9 +204,9 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		poolSessionID = proxy.ScopeCodexFingerprintTransportKey(poolSessionID, account, ginHeaders)
 		baseKey = proxy.ScopeCodexFingerprintTransportKey(baseKey, account, ginHeaders)
 		if proxy.IsStatelessWebsocketSessionID(sessionID) && baseKey != "" && !statelessOneShotEnabled() {
-			wc, pr, poolSessionID, err2 = e.manager.AcquireReusableConnection(ctx, account, wsURL, baseKey, sessionID, statelessConnectionSlots(), headers, effectiveProxyOverride)
+			wc, pr, poolSessionID, err2 = e.manager.AcquireReusableConnection(ctx, account, wsURL, baseKey, sessionID, statelessConnectionSlots(), headers, proxyOverride)
 		} else {
-			wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, poolSessionID, headers, effectiveProxyOverride)
+			wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, poolSessionID, headers, proxyOverride)
 		}
 	}
 	// 取连耗时（busy 排队 + 探活 + 握手）计入本 attempt 的 ws_acquire_ms（issue #413）
@@ -257,7 +246,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		}
 
 		reacquireStart := time.Now()
-		wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, poolSessionID, headers, effectiveProxyOverride)
+		wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, poolSessionID, headers, proxyOverride)
 		proxy.AddWsAcquireDuration(ctx, time.Since(reacquireStart))
 		if err2 != nil {
 			return nil, err2

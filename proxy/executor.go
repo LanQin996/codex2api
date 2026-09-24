@@ -688,13 +688,12 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		return nil, ErrNoAvailableAccount()
 	}
 
-	wirePayload := prepareCodexHTTPWirePayload(requestBody, account, sessionID, headers)
-	requestBody = wirePayload.body
-	logicalEndpoint := CodexBaseURL + "/responses"
+	// ==================== Codex 请求体优化 ====================
+	// 参考 CLIProxyAPI/codex_executor.go + sub2api 的实现
 
-	// 票据绑定出口优先：上游认可的 turn state 与铸造它的粘性出口必须一致。
-	if boundProxy := CodexTurnStateProxyFromContext(ctx); boundProxy != "" {
-		proxyURL = boundProxy
+	// 1. 确保 instructions 字段存在（Codex 后端要求）
+	if !gjson.GetBytes(requestBody, "instructions").Exists() {
+		requestBody, _ = sjson.SetBytes(requestBody, "instructions", "")
 	}
 
 	// 2. 清理可能导致上游报错的多余字段
@@ -719,6 +718,8 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	}
 
 	endpoint := CodexBaseURL + "/responses"
+
+	requestBody, headers = prepareCodexProtocolMetadata(requestBody, account, cacheKey, headers)
 
 	// 出站字节在选客户端之前定稿：send() 会因 Agent Identity 401 重注册而重放，
 	// 两次重放必须发同一份字节。routing hint 等需要读字段的改写点继续用明文
@@ -795,9 +796,6 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		}
 
 		egress.ApplyHeaders(req.Header)
-		model := strings.TrimSpace(gjson.GetBytes(requestBody, "model").String())
-		ApplyCodexRouteCookies(ctx, req.Header, account, logicalEndpoint, model)
-		req = req.WithContext(WithCodexRouteCookieScope(req.Context(), logicalEndpoint, model))
 		logCodexFingerprintDebug("http", account, egress.DialProxyURL, req.Header)
 
 		if err := ConsumeAPIKeyModelRequestQuota(ctx, requestModel); err != nil {
@@ -938,6 +936,46 @@ func ExecuteOpenAIResponsesRequest(ctx context.Context, account *auth.Account, r
 		openAIResponsesCodexMetadataRequired.Store(capabilityKey, struct{}{})
 	}
 	return retryResp, nil
+}
+
+// ExecuteOpenAIResponsesBillingRequest probes the optional Sub2API-compatible
+// billing declaration exposed by a Responses relay. The probe uses the same
+// account transport, proxy and custom headers as normal Responses traffic.
+func ExecuteOpenAIResponsesBillingRequest(ctx context.Context, account *auth.Account, proxyOverride string) (*http.Response, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if account == nil || !account.IsOpenAIResponsesAPI() {
+		return nil, ErrNoAvailableAccount()
+	}
+	baseURL, apiKey := account.OpenAIResponsesCredentials()
+	account.Mu().RLock()
+	proxyURL := account.ProxyURL
+	account.Mu().RUnlock()
+	if proxyOverride != "" {
+		proxyURL = proxyOverride
+	}
+	if baseURL == "" || apiKey == "" {
+		return nil, ErrNoAvailableAccount()
+	}
+
+	endpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/sub2api/billing")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, ErrInternalError("创建倍率探测请求失败", err)
+	}
+	applyOpenAIResponsesRequestHeaders(req, account, apiKey, nil)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Del("Content-Type")
+
+	resp, err := getPooledClient(account, proxyURL).Do(req)
+	if err != nil {
+		if shouldRecyclePooledClient(err) {
+			recyclePooledClient(account, proxyURL)
+		}
+		return nil, ErrUpstream(0, "请求上游倍率接口失败", err)
+	}
+	return resp, nil
 }
 
 func openAIResponsesCodexMetadataCapabilityKey(account *auth.Account, baseURL string) string {
@@ -1110,15 +1148,11 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 	}
 
 	// compact 端点
-	logicalEndpoint := CodexBaseURL + "/responses/compact"
+	endpoint := CodexBaseURL + "/responses/compact"
 
-	// 票据绑定出口优先：compact 与普通轮次共用同一条粘性出口。
-	if boundProxy := CodexTurnStateProxyFromContext(ctx); boundProxy != "" {
-		proxyURL = boundProxy
-	}
 	// 出口链路统一由 ResolveCodexEgress 决定(Resin > 代理 > 直连,见 egress.go)。
-	egress := ResolveCodexEgress(account, logicalEndpoint, proxyURL)
-	endpoint := egress.URL
+	egress := ResolveCodexEgress(account, endpoint, proxyURL)
+	endpoint = egress.URL
 	client := egress.Client()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(requestBody))

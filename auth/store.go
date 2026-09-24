@@ -210,16 +210,6 @@ type Account struct {
 	// 改写请求体 environment_context 里的时区与日期（见 proxy/codex_environment_context.go）；
 	// 空 = 不绑定、透传下游值。Claude 账号沿用同一凭据键做身份标签。
 	Timezone string
-	// CodexTurnState* 见 codex_turn_state.go：凭据级 X-Codex-Turn-State 强制注入的值、
-	// 模型名单与设置时刻。空值 = 不注入。
-	CodexTurnState        string
-	CodexTurnStateModels  string
-	CodexTurnStateSetAt   time.Time
-	CodexTurnStateTickets map[string]CodexTurnStateTicket
-	// Model-scoped route cookies are kept outside the ticket value. The
-	// account-id keyed jar survives runtime account snapshot replacement.
-	codexRouteCookies map[string][]CodexRouteCookie
-	localRouteCookies *routeCookieJar
 	// ClaudeFingerprintMode 见 claude_fingerprint_mode.go:Claude Code 出站身份头
 	// 收敛模式(preserve/force;空=跟随全局默认)。
 	ClaudeFingerprintMode string
@@ -1441,17 +1431,6 @@ func (a *Account) IsAvailable() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
 
-	return a.isAvailableLocked(time.Now())
-}
-
-// IsAvailableForTicketMaintenance keeps credential, health and quota checks while
-// allowing administratively paused accounts to maintain tickets without dispatch.
-func (a *Account) IsAvailableForTicketMaintenance() bool {
-	if a == nil || atomic.LoadInt32(&a.Disabled) != 0 {
-		return false
-	}
-	a.mu.RLock()
-	defer a.mu.RUnlock()
 	return a.isAvailableLocked(time.Now())
 }
 

@@ -150,6 +150,9 @@ func geminiNativeToAntigravityEnvelope(rawBody []byte, project, model string) ([
 	antigravityApplyNativeGeminiThinkingConfig(request, model, wireModel)
 	antigravityNormalizeNativeGeminiResponseSchema(request)
 	antigravitySanitizeNativeGeminiThoughtSignatures(request, wireModel)
+	// Strip client scaffolding before the session id is derived from the
+	// contents, so the id stays stable across turns.
+	antigravityNormalizeNativeGeminiContents(request)
 	contents, _ := request["contents"].([]any)
 	request["sessionId"] = antigravitySessionID(nil, contents)
 	envelope := map[string]any{
@@ -372,19 +375,70 @@ func antigravityObfuscateNativeGeminiSystemInstruction(request map[string]any) {
 	if !ok {
 		return
 	}
-	for index, part := range parts {
+	kept := make([]any, 0, len(parts))
+	for _, part := range parts {
 		partMap, ok := part.(map[string]any)
 		if !ok {
+			kept = append(kept, part)
 			continue
 		}
 		text, ok := partMap["text"].(string)
-		if !ok || strings.TrimSpace(text) == "" {
+		if !ok {
+			kept = append(kept, part)
+			continue
+		}
+		text = normalizeClientScaffolding(text)
+		if text == "" {
 			continue
 		}
 		partMap["text"] = antigravityObfuscateSystemInstruction(text)
-		parts[index] = partMap
+		kept = append(kept, partMap)
 	}
-	systemInstruction["parts"] = parts
+	if len(kept) == 0 {
+		delete(request, "systemInstruction")
+		return
+	}
+	systemInstruction["parts"] = kept
+}
+
+// antigravityNormalizeNativeGeminiContents neutralizes client scaffolding in
+// native Gemini contents in place. Parts are rewritten rather than dropped so
+// the envelope keeps the exact shape the caller sent; an emptied text part
+// becomes an empty string, which is a shape this codebase already produces
+// elsewhere.
+func antigravityNormalizeNativeGeminiContents(request map[string]any) {
+	if !clientScaffoldingStripEnabled() {
+		return
+	}
+	contents, ok := request["contents"].([]any)
+	if !ok || len(contents) == 0 {
+		return
+	}
+	for index, raw := range contents {
+		content, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		parts, ok := content["parts"].([]any)
+		if !ok {
+			continue
+		}
+		for partIndex, rawPart := range parts {
+			part, ok := rawPart.(map[string]any)
+			if !ok {
+				continue
+			}
+			text, ok := part["text"].(string)
+			if !ok {
+				continue
+			}
+			part["text"] = normalizeClientScaffolding(text)
+			parts[partIndex] = part
+		}
+		content["parts"] = parts
+		contents[index] = content
+	}
+	request["contents"] = contents
 }
 
 func antigravitySanitizeNativeGeminiTools(request map[string]any, nameMap map[string]string) {

@@ -57,6 +57,9 @@ import type {
   AccountPageStatsResponse,
   AccountLiveStateResponse,
   ChartAggregation,
+  ChannelMonitorConfig,
+  ChannelMonitorBillingRatesResponse,
+  ChannelMonitorListResponse,
   CreateAccountResponse,
   CreateAPIKeyResponse,
   CreateAPIKeyRequest,
@@ -130,6 +133,7 @@ import type {
   CodexUserAgentCatalog,
   CodexUserAgentPreview,
   UpdateAccountSchedulerRequest,
+  UpdateChannelMonitorConfigRequest,
   UpdateAPIKeyRequest,
   UpdatePromptFilterNewAPIBindingRequest,
   UpdateOAuthAccountRequest,
@@ -593,8 +597,6 @@ export const api = {
   },
   deletePortalImageAsset: (apiKey: string, id: number) =>
     requestImageStudioPortal<MessageResponse>(`/assets/${id}`, apiKey, { method: 'DELETE' }),
-  reacquireCodexTurnState: (accountID: number, model: string) =>
-    request<{ queued: number }>('/settings/codex-turn-state/probe', { method: 'POST', body: JSON.stringify({ account_id: accountID, model }) }),
   getStats: () => request<StatsResponse>('/stats'),
   // channel is a first-class upstream provider filter; omit for all accounts.
   // view: 'lite' — 只返回身份/绑定字段,跳过用量富化(代理绑定弹窗等场景)。
@@ -658,6 +660,22 @@ export const api = {
       `/accounts/${id}/openai-responses/balance${force ? '?refresh=1' : ''}`,
       { signal, timeoutMs: 25_000 },
     ),
+  getChannelMonitorConfig: (id: number, signal?: AbortSignal) =>
+    request<ChannelMonitorConfig>(`/accounts/${id}/channel-monitor`, { signal }),
+  updateChannelMonitorConfig: (id: number, data: UpdateChannelMonitorConfigRequest) =>
+    request<ChannelMonitorConfig>(`/accounts/${id}/channel-monitor`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  getChannelMonitors: (signal?: AbortSignal) =>
+    request<ChannelMonitorListResponse>('/channel-monitors', { signal }),
+  getChannelMonitorBillingRates: (signal?: AbortSignal) =>
+    request<ChannelMonitorBillingRatesResponse>('/channel-monitors/billing-rates', { signal }),
+  probeChannelMonitor: (id: number) =>
+    request<MessageResponse>(`/channel-monitors/${id}/probe`, {
+      method: 'POST',
+      timeoutMs: 80_000,
+    }),
   addGrokAccount: (data: AddGrokAccountRequest) =>
     request<CreateAccountResponse>('/accounts/grok', { method: 'POST', body: JSON.stringify(data) }),
   fetchGrokModels: (data: AddGrokAccountRequest) =>
@@ -860,11 +878,6 @@ export const api = {
     }),
   refreshAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}/refresh`, { method: 'POST' }),
-  refreshCodexTurnStateTickets: (id: number, model?: string) =>
-    request<{ queued: number }>('/settings/codex-turn-state/probe', {
-      method: 'POST',
-      body: JSON.stringify({ account_id: id, ...(model ? { model } : {}) }),
-    }),
   getAccount: (id: number, signal?: AbortSignal) =>
     request<AccountRow>(`/accounts/${id}`, { signal }),
   forceUsageProbe: () =>

@@ -2883,7 +2883,7 @@ export default function Usage() {
                                 → {log.effective_model}
                               </Badge>
                             )}
-                            {log.upstream_model && (() => {
+                            {!log.upstream_response_model && log.upstream_model && (() => {
                               const mismatch = isUpstreamModelMismatch(log.effective_model || log.model, log.upstream_model)
                               return (
                                 <Badge

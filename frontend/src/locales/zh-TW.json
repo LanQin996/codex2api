@@ -207,7 +207,8 @@
     }
   },
   "nav": {
-    "qualityTest": "降智檢測"
+    "qualityTest": "降智檢測",
+    "channelMonitor": "渠道監控"
   },
   "imageStudioPortal": {
     "quota": {

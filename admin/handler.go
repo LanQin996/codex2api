@@ -109,7 +109,11 @@ type Handler struct {
 	antigravitySyncAccount     func(context.Context, int64) antigravityRefreshItem
 	antigravityCapabilityProbe antigravityCapabilityExecutor
 	// Claude / Antigravity 渠道连通性测试配置的进程内缓存（首次读库，PUT 刷新）。
-	channelTestCfg atomic.Pointer[database.ChannelTestConfig]
+	channelTestCfg        atomic.Pointer[database.ChannelTestConfig]
+	channelMonitorWake    chan struct{}
+	channelMonitorSlots   chan struct{}
+	channelMonitorRunning sync.Map
+	channelMonitorID      string
 
 	// 导入触发的用量采样队列。固定数量 worker 消费任务，避免“一账号一 goroutine”
 	// 在大文件导入时堆出成千上万个阻塞协程。
@@ -166,23 +170,21 @@ type Handler struct {
 
 	// 「主动重置次数」消耗操作的工作区级互斥锁（workspace -> *sync.Mutex），
 	// 串行化同一上游工作区的并发重置，避免重复消耗与次数计数竞态。
-	resetCreditLocks               sync.Map
-	resetCreditLastSuccess         sync.Map
-	resetCreditSuccessfulIDs       sync.Map
-	autoResetCreditsWake           chan struct{}
-	codexTurnStateRenewalStartOnce sync.Once
-	codexTurnStateRenewalWG        sync.WaitGroup
-	autoResetCreditsStartOnce      sync.Once
-	autoResetCreditsWG             sync.WaitGroup
-	autoActivate5hWake             chan struct{}
-	autoActivate5hStartOnce        sync.Once
-	autoActivate5hWG               sync.WaitGroup
-	resetCreditPostMu              sync.Mutex
-	resetCreditPostWG              sync.WaitGroup
-	resetCreditPostCtx             context.Context
-	resetCreditPostCancel          context.CancelFunc
-	resetCreditPostClosed          bool
-	settingsUpdateMu               sync.Mutex
+	resetCreditLocks          sync.Map
+	resetCreditLastSuccess    sync.Map
+	resetCreditSuccessfulIDs  sync.Map
+	autoResetCreditsWake      chan struct{}
+	autoResetCreditsStartOnce sync.Once
+	autoResetCreditsWG        sync.WaitGroup
+	autoActivate5hWake        chan struct{}
+	autoActivate5hStartOnce   sync.Once
+	autoActivate5hWG          sync.WaitGroup
+	resetCreditPostMu         sync.Mutex
+	resetCreditPostWG         sync.WaitGroup
+	resetCreditPostCtx        context.Context
+	resetCreditPostCancel     context.CancelFunc
+	resetCreditPostClosed     bool
+	settingsUpdateMu          sync.Mutex
 
 	// 重复账号合并互斥锁：串行化 mergeRefreshedDuplicateIntoExisting，
 	// 防止并发导入同一身份的多个账号时互相合并、把双方都软删（账号丢失）。
@@ -1030,6 +1032,9 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 		chartCacheData:       make(map[string]*chartCacheEntry),
 		accountListCache:     make(map[string]*accountListSnapshot),
 		accountAnalysisCache: make(map[string]*accountAnalysisCacheEntry),
+		channelMonitorWake:   make(chan struct{}, 1),
+		channelMonitorSlots:  make(chan struct{}, 4),
+		channelMonitorID:     fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano()),
 	}
 	if handler.imageProxy != nil {
 		handler.imageProxy.SetRuntimeCache(tc)
@@ -1124,6 +1129,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/openai-responses/models", h.FetchOpenAIResponsesModels)
 	api.PATCH("/accounts/:id/openai-responses", h.UpdateOpenAIResponsesAccount)
 	api.GET("/accounts/:id/openai-responses/balance", h.GetOpenAIResponsesBalance)
+	api.GET("/accounts/:id/channel-monitor", h.GetChannelMonitorConfig)
+	api.PUT("/accounts/:id/channel-monitor", h.UpdateChannelMonitorConfig)
 	api.POST("/accounts/grok", h.AddGrokAccount)
 	api.POST("/accounts/grok/models", h.FetchGrokModels)
 	api.POST("/accounts/grok/batch-models", h.BatchUpdateGrokModels)
@@ -1172,6 +1179,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.POST("/accounts/:id/models/sync-upstream", h.SyncAccountUpstreamModels)
 	api.POST("/accounts/:id/models/probe", h.ProbeAccountModels)
 	api.PATCH("/accounts/:id/scheduler", h.UpdateAccountScheduler)
+	api.GET("/channel-monitors", h.ListChannelMonitors)
+	api.GET("/channel-monitors/billing-rates", h.ListChannelMonitorBillingRates)
+	api.POST("/channel-monitors/:id/probe", h.ProbeChannelMonitorNow)
 	api.DELETE("/accounts/:id", h.DeleteAccount)
 	api.GET("/accounts/health-bars", h.GetAccountHealthBars)
 	api.GET("/accounts/recycle-bin", h.ListRecycleBinAccounts)
@@ -1270,8 +1280,6 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/ops/errors/summary", h.GetOpsErrorSummary)
 	api.GET("/settings", h.GetSettings)
 	api.PUT("/settings", h.UpdateSettings)
-	api.GET("/settings/codex-turn-state/status", h.GetCodexTurnStateStatus)
-	api.POST("/settings/codex-turn-state/probe", h.ProbeCodexTurnState)
 	api.GET("/settings/codex-user-agent/catalog", h.GetCodexUserAgentCatalog)
 	api.POST("/settings/codex-user-agent/preview", h.PreviewCodexUserAgent)
 	api.GET("/settings/claude-config", h.GetClaudeConfig)
@@ -1785,6 +1793,7 @@ type accountResponse struct {
 	Tags                          []string                    `json:"tags"`
 	GroupIDs                      []int64                     `json:"group_ids"`
 	Note                          string                      `json:"note"`
+	ModelMismatches               []modelMismatchResponse     `json:"model_mismatches,omitempty"`
 	// 图片配额信息
 	ImageQuotaRemaining *int   `json:"image_quota_remaining,omitempty"`
 	ImageQuotaTotal     *int   `json:"image_quota_total,omitempty"`
@@ -9142,87 +9151,74 @@ func (h *Handler) DeleteAPIKey(c *gin.Context) {
 // ==================== Settings ====================
 
 type settingsResponse struct {
-	ResponsesCooldownMode               string   `json:"responses_cooldown_mode"`
-	ResponsesCooldownSeconds            int      `json:"responses_cooldown_seconds"`
-	CodexTurnStateAutoEnabled           bool     `json:"codex_turn_state_auto_enabled"`
-	CodexTurnStateHarvestProxyURL       string   `json:"codex_turn_state_harvest_proxy_url"`
-	CodexTurnStateManagedModels         []string `json:"codex_turn_state_managed_models"`
-	CodexTurnStateProbeModels           []string `json:"codex_turn_state_probe_models"`
-	CodexTurnStateTargetLength          int      `json:"codex_turn_state_target_length"`
-	CodexTurnStateTTLSeconds            int      `json:"codex_turn_state_ttl_seconds"`
-	CodexTurnStateRefreshBeforeSeconds  int      `json:"codex_turn_state_refresh_before_seconds"`
-	CodexTurnStateProbeIntervalSeconds  int      `json:"codex_turn_state_probe_interval_seconds"`
-	CodexTurnStateAttemptTimeoutSeconds int      `json:"codex_turn_state_attempt_timeout_seconds"`
-	CodexTurnStateConcurrency           int      `json:"codex_turn_state_concurrency"`
-	CodexTurnStatePreserveExisting      bool     `json:"codex_turn_state_preserve_existing"`
-	CodexTurnStateFailClosed            bool     `json:"codex_turn_state_fail_closed"`
-	CodexTurnStateTicketProxySticky     bool     `json:"codex_turn_state_ticket_proxy_sticky"`
-	SiteName                            string   `json:"site_name"`
-	SiteLogo                            string   `json:"site_logo"`
-	BackgroundImage                     string   `json:"background_image"`
-	BackgroundOpacity                   int      `json:"background_opacity"`
-	BackgroundBlur                      int      `json:"background_blur"`
-	BackgroundGlassOpacity              int      `json:"background_glass_opacity"`
-	BackgroundGlassBlur                 int      `json:"background_glass_blur"`
-	MaxConcurrency                      int      `json:"max_concurrency"`
-	GlobalRPM                           int      `json:"global_rpm"`
-	TestModel                           string   `json:"test_model"`
-	CodexImagesMainModel                string   `json:"codex_images_main_model"`
-	CodexImagesDefaultMainModel         string   `json:"codex_images_default_main_model"`
-	TestContent                         string   `json:"test_content"`
-	TestConcurrency                     int      `json:"test_concurrency"`
-	BackgroundRefreshIntervalMinutes    int      `json:"background_refresh_interval_minutes"`
-	UsageProbeMaxAgeMinutes             int      `json:"usage_probe_max_age_minutes"`
-	UsageProbeConcurrency               int      `json:"usage_probe_concurrency"`
-	UsageProbeResponsesFallbackEnabled  bool     `json:"usage_probe_responses_fallback_enabled"`
-	RecoveryProbeIntervalMinutes        int      `json:"recovery_probe_interval_minutes"`
-	LazyMode                            bool     `json:"lazy_mode"`
-	CodexOAuthKeepaliveEnabled          bool     `json:"codex_oauth_keepalive_enabled"`
-	ProxyURL                            string   `json:"proxy_url"`
-	PgMaxConns                          int      `json:"pg_max_conns"`
-	RedisPoolSize                       int      `json:"redis_pool_size"`
-	AutoCleanUnauthorized               bool     `json:"auto_clean_unauthorized"`
-	AutoCleanRateLimited                bool     `json:"auto_clean_rate_limited"`
-	AdminSecret                         string   `json:"admin_secret"`
-	AdminAuthSource                     string   `json:"admin_auth_source"`
-	AutoCleanFullUsage                  bool     `json:"auto_clean_full_usage"`
-	AutoCleanError                      bool     `json:"auto_clean_error"`
-	AutoCleanExpired                    bool     `json:"auto_clean_expired"`
-	AutoResetCreditsEnabled             bool     `json:"auto_reset_credits_enabled"`
-	AutoResetCreditsBeforeExpiryMin     int      `json:"auto_reset_credits_before_expiry_min"`
-	AutoActivate5hWindowEnabled         bool     `json:"auto_activate_5h_window_enabled"`
-	ProxyPoolEnabled                    bool     `json:"proxy_pool_enabled"`
-	FastSchedulerEnabled                bool     `json:"fast_scheduler_enabled"`
-	SchedulerEngine                     string   `json:"scheduler_engine"`
-	CodexForceWebsocket                 bool     `json:"codex_force_websocket"`
-	CodexRequestCompression             bool     `json:"codex_request_compression"`
-	CodexWSWeakNetworkMode              bool     `json:"codex_ws_weak_network_mode"`
-	CodexWSKeepaliveEnabled             bool     `json:"codex_ws_keepalive_enabled"`
-	CodexWSKeepaliveIntervalSec         int      `json:"codex_ws_keepalive_interval_sec"`
-	CodexWSHideUpstreamErrors           bool     `json:"codex_ws_hide_upstream_errors"`
-	CodexWSSilentRetryEnabled           bool     `json:"codex_ws_silent_retry_enabled"`
-	CodexWSSilentMaxRetries             int      `json:"codex_ws_silent_max_retries"`
-	CodexWSSizeRouterEnabled            bool     `json:"codex_ws_size_router_enabled"`
-	CodexWSBusyAcquireMaxWaitSec        int      `json:"codex_ws_busy_acquire_max_wait_sec"`
-	CodexWSBusyOverflowEnabled          bool     `json:"codex_ws_busy_overflow_enabled"`
-	CodexWSBusyPatienceSec              int      `json:"codex_ws_busy_patience_sec"`
-	CodexWSStatelessSlots               int      `json:"codex_ws_stateless_slots"`
-	GithubTokenConfigured               bool     `json:"github_token_configured"`
-	GithubProxyURL                      string   `json:"github_proxy_url"`
-	CodexOverloadPauseEnabled           bool     `json:"codex_overload_pause_enabled"`
-	CodexOverloadThresholdPercent       int      `json:"codex_overload_threshold_percent"`
-	CodexOverloadPauseMinutes           int      `json:"codex_overload_pause_minutes"`
-	CodexOverloadWindowMinutes          int      `json:"codex_overload_window_minutes"`
-	OverflowAutoCompactEnabled          bool     `json:"overflow_auto_compact_enabled"`
-	CompactViaResponsesEnabled          bool     `json:"compact_via_responses_enabled"`
-	CodexPreflightSSEPassthroughEnabled bool     `json:"codex_preflight_sse_passthrough_enabled"`
-	FirstTokenExcludesWsAcquire         bool     `json:"first_token_excludes_ws_acquire"`
-	CodexContinueThinkingEnabled        bool     `json:"codex_continue_thinking_enabled"`
-	CodexContinueMaxRounds              int      `json:"codex_continue_max_rounds"`
-	UTLSShutdownTimeoutMinutes          int      `json:"utls_shutdown_timeout_minutes"`
-	CodexCLIVersionSyncEnabled          bool     `json:"codex_cli_version_sync_enabled"`
-	CodexCLIVersionSyncIntervalHours    int      `json:"codex_cli_version_sync_interval_hours"`
-	CodexSyncedCLIVersion               string   `json:"codex_synced_cli_version"`
+	ResponsesCooldownMode               string `json:"responses_cooldown_mode"`
+	ResponsesCooldownSeconds            int    `json:"responses_cooldown_seconds"`
+	SiteName                            string `json:"site_name"`
+	SiteLogo                            string `json:"site_logo"`
+	BackgroundImage                     string `json:"background_image"`
+	BackgroundOpacity                   int    `json:"background_opacity"`
+	BackgroundBlur                      int    `json:"background_blur"`
+	BackgroundGlassOpacity              int    `json:"background_glass_opacity"`
+	BackgroundGlassBlur                 int    `json:"background_glass_blur"`
+	MaxConcurrency                      int    `json:"max_concurrency"`
+	GlobalRPM                           int    `json:"global_rpm"`
+	TestModel                           string `json:"test_model"`
+	CodexImagesMainModel                string `json:"codex_images_main_model"`
+	CodexImagesDefaultMainModel         string `json:"codex_images_default_main_model"`
+	TestContent                         string `json:"test_content"`
+	TestConcurrency                     int    `json:"test_concurrency"`
+	BackgroundRefreshIntervalMinutes    int    `json:"background_refresh_interval_minutes"`
+	UsageProbeMaxAgeMinutes             int    `json:"usage_probe_max_age_minutes"`
+	UsageProbeConcurrency               int    `json:"usage_probe_concurrency"`
+	UsageProbeResponsesFallbackEnabled  bool   `json:"usage_probe_responses_fallback_enabled"`
+	RecoveryProbeIntervalMinutes        int    `json:"recovery_probe_interval_minutes"`
+	LazyMode                            bool   `json:"lazy_mode"`
+	CodexOAuthKeepaliveEnabled          bool   `json:"codex_oauth_keepalive_enabled"`
+	ProxyURL                            string `json:"proxy_url"`
+	PgMaxConns                          int    `json:"pg_max_conns"`
+	RedisPoolSize                       int    `json:"redis_pool_size"`
+	AutoCleanUnauthorized               bool   `json:"auto_clean_unauthorized"`
+	AutoCleanRateLimited                bool   `json:"auto_clean_rate_limited"`
+	AdminSecret                         string `json:"admin_secret"`
+	AdminAuthSource                     string `json:"admin_auth_source"`
+	AutoCleanFullUsage                  bool   `json:"auto_clean_full_usage"`
+	AutoCleanError                      bool   `json:"auto_clean_error"`
+	AutoCleanExpired                    bool   `json:"auto_clean_expired"`
+	AutoResetCreditsEnabled             bool   `json:"auto_reset_credits_enabled"`
+	AutoResetCreditsBeforeExpiryMin     int    `json:"auto_reset_credits_before_expiry_min"`
+	AutoActivate5hWindowEnabled         bool   `json:"auto_activate_5h_window_enabled"`
+	ProxyPoolEnabled                    bool   `json:"proxy_pool_enabled"`
+	FastSchedulerEnabled                bool   `json:"fast_scheduler_enabled"`
+	SchedulerEngine                     string `json:"scheduler_engine"`
+	CodexForceWebsocket                 bool   `json:"codex_force_websocket"`
+	CodexRequestCompression             bool   `json:"codex_request_compression"`
+	CodexWSWeakNetworkMode              bool   `json:"codex_ws_weak_network_mode"`
+	CodexWSKeepaliveEnabled             bool   `json:"codex_ws_keepalive_enabled"`
+	CodexWSKeepaliveIntervalSec         int    `json:"codex_ws_keepalive_interval_sec"`
+	CodexWSHideUpstreamErrors           bool   `json:"codex_ws_hide_upstream_errors"`
+	CodexWSSilentRetryEnabled           bool   `json:"codex_ws_silent_retry_enabled"`
+	CodexWSSilentMaxRetries             int    `json:"codex_ws_silent_max_retries"`
+	CodexWSSizeRouterEnabled            bool   `json:"codex_ws_size_router_enabled"`
+	CodexWSBusyAcquireMaxWaitSec        int    `json:"codex_ws_busy_acquire_max_wait_sec"`
+	CodexWSBusyOverflowEnabled          bool   `json:"codex_ws_busy_overflow_enabled"`
+	CodexWSBusyPatienceSec              int    `json:"codex_ws_busy_patience_sec"`
+	CodexWSStatelessSlots               int    `json:"codex_ws_stateless_slots"`
+	GithubTokenConfigured               bool   `json:"github_token_configured"`
+	GithubProxyURL                      string `json:"github_proxy_url"`
+	CodexOverloadPauseEnabled           bool   `json:"codex_overload_pause_enabled"`
+	CodexOverloadThresholdPercent       int    `json:"codex_overload_threshold_percent"`
+	CodexOverloadPauseMinutes           int    `json:"codex_overload_pause_minutes"`
+	CodexOverloadWindowMinutes          int    `json:"codex_overload_window_minutes"`
+	OverflowAutoCompactEnabled          bool   `json:"overflow_auto_compact_enabled"`
+	CompactViaResponsesEnabled          bool   `json:"compact_via_responses_enabled"`
+	CodexPreflightSSEPassthroughEnabled bool   `json:"codex_preflight_sse_passthrough_enabled"`
+	FirstTokenExcludesWsAcquire         bool   `json:"first_token_excludes_ws_acquire"`
+	CodexContinueThinkingEnabled        bool   `json:"codex_continue_thinking_enabled"`
+	CodexContinueMaxRounds              int    `json:"codex_continue_max_rounds"`
+	UTLSShutdownTimeoutMinutes          int    `json:"utls_shutdown_timeout_minutes"`
+	CodexCLIVersionSyncEnabled          bool   `json:"codex_cli_version_sync_enabled"`
+	CodexCLIVersionSyncIntervalHours    int    `json:"codex_cli_version_sync_interval_hours"`
+	CodexSyncedCLIVersion               string `json:"codex_synced_cli_version"`
 	// CodexEffectiveCLIVersion 是当前实际用于出站 UA 的版本(内置常量与同步值取大),
 	// 供设置页"设为同步版本"按钮使用——同步值可能过期或为空,内置值才是下限。
 	CodexEffectiveCLIVersion       string `json:"codex_effective_cli_version"`
@@ -9344,37 +9340,9 @@ type settingsResponse struct {
 
 type rawJSON = json.RawMessage
 
-func maskCodexTurnStateProxyURL(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return ""
-	}
-	parsed, err := url.Parse(raw)
-	if err != nil || parsed.Host == "" {
-		return "***"
-	}
-	if parsed.User != nil {
-		parsed.User = url.UserPassword(parsed.User.Username(), "***")
-	}
-	return strings.Replace(parsed.String(), ":%2A%2A%2A@", ":***@", 1)
-}
-
 type updateSettingsReq struct {
 	ResponsesCooldownMode               *string                          `json:"responses_cooldown_mode"`
 	ResponsesCooldownSeconds            *int                             `json:"responses_cooldown_seconds"`
-	CodexTurnStateAutoEnabled           *bool                            `json:"codex_turn_state_auto_enabled"`
-	CodexTurnStateHarvestProxyURL       *string                          `json:"codex_turn_state_harvest_proxy_url"`
-	CodexTurnStateManagedModels         *[]string                        `json:"codex_turn_state_managed_models"`
-	CodexTurnStateProbeModels           *[]string                        `json:"codex_turn_state_probe_models"`
-	CodexTurnStateTargetLength          *int                             `json:"codex_turn_state_target_length"`
-	CodexTurnStateTTLSeconds            *int                             `json:"codex_turn_state_ttl_seconds"`
-	CodexTurnStateRefreshBeforeSeconds  *int                             `json:"codex_turn_state_refresh_before_seconds"`
-	CodexTurnStateProbeIntervalSeconds  *int                             `json:"codex_turn_state_probe_interval_seconds"`
-	CodexTurnStateAttemptTimeoutSeconds *int                             `json:"codex_turn_state_attempt_timeout_seconds"`
-	CodexTurnStateConcurrency           *int                             `json:"codex_turn_state_concurrency"`
-	CodexTurnStatePreserveExisting      *bool                            `json:"codex_turn_state_preserve_existing"`
-	CodexTurnStateFailClosed            *bool                            `json:"codex_turn_state_fail_closed"`
-	CodexTurnStateTicketProxySticky     *bool                            `json:"codex_turn_state_ticket_proxy_sticky"`
 	SiteName                            *string                          `json:"site_name"`
 	SiteLogo                            *string                          `json:"site_logo"`
 	BackgroundImage                     *string                          `json:"background_image"`
@@ -10144,11 +10112,6 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		return
 	}
 	dbSettings, _ := h.db.GetSystemSettings(ctx)
-	ticketSettings, ticketSettingsErr := h.db.GetCodexTurnStateSettings(ctx)
-	if ticketSettingsErr != nil {
-		log.Printf("读取 Codex Turn State 自动采集设置失败: %v", ticketSettingsErr)
-		ticketSettings = &database.CodexTurnStateSettings{}
-	}
 	_, adminAuthSource := h.resolveAdminSecret(c.Request.Context())
 	adminSecret := ""
 	var resinURL, resinPlatformName string
@@ -10196,19 +10159,6 @@ func (h *Handler) GetSettings(c *gin.Context) {
 	modelCooldownSettings := h.store.GetModelCooldownSettings()
 	continuousRetryPolicy := h.store.GetContinuousRetryPolicy()
 	c.JSON(http.StatusOK, settingsResponse{
-		CodexTurnStateAutoEnabled:           ticketSettings.Enabled,
-		CodexTurnStateHarvestProxyURL:       ticketSettings.HarvestProxyURL,
-		CodexTurnStateManagedModels:         ticketSettings.Models,
-		CodexTurnStateProbeModels:           ticketSettings.ProbeModels,
-		CodexTurnStateTargetLength:          ticketSettings.TargetLength,
-		CodexTurnStateTTLSeconds:            ticketSettings.TTLSeconds,
-		CodexTurnStateRefreshBeforeSeconds:  ticketSettings.RefreshBeforeSeconds,
-		CodexTurnStateProbeIntervalSeconds:  ticketSettings.ProbeIntervalSeconds,
-		CodexTurnStateAttemptTimeoutSeconds: ticketSettings.AttemptTimeoutSeconds,
-		CodexTurnStateConcurrency:           ticketSettings.Concurrency,
-		CodexTurnStatePreserveExisting:      ticketSettings.PreserveExisting,
-		CodexTurnStateFailClosed:            ticketSettings.FailClosed,
-		CodexTurnStateTicketProxySticky:     ticketSettings.TicketProxySticky,
 		antigravityOAuthSettingsView:        currentAntigravityOAuthSettingsView(),
 		SiteName:                            branding.SiteName,
 		SiteLogo:                            branding.SiteLogo,
@@ -10683,120 +10633,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		writeError(c, http.StatusInternalServerError, "读取现有设置失败："+settingsErr.Error())
 		return
 	}
-	ticketSettings, ticketSettingsErr := h.db.GetCodexTurnStateSettings(c.Request.Context())
-	if ticketSettingsErr != nil {
-		writeError(c, http.StatusInternalServerError, "读取 Codex Turn State 自动采集设置失败："+ticketSettingsErr.Error())
-		return
-	}
-	if req.CodexTurnStateHarvestProxyURL != nil {
-		proxyURL, err := normalizeCodexTurnStateProxyUpdate(*req.CodexTurnStateHarvestProxyURL, ticketSettings.HarvestProxyURL)
-		if err != nil {
-			writeError(c, http.StatusBadRequest, err.Error())
-			return
-		}
-		ticketSettings.HarvestProxyURL = proxyURL
-	}
-	if req.CodexTurnStateAutoEnabled != nil {
-		ticketSettings.Enabled = *req.CodexTurnStateAutoEnabled
-	}
-	if req.CodexTurnStateManagedModels != nil {
-		seen := make(map[string]struct{})
-		models := make([]string, 0, len(*req.CodexTurnStateManagedModels))
-		for _, model := range *req.CodexTurnStateManagedModels {
-			model = strings.TrimSpace(model)
-			if model == "" {
-				continue
-			}
-			key := strings.ToLower(model)
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			if err := security.ValidateModelName(strings.TrimSuffix(model, "*")); err != nil {
-				writeError(c, http.StatusBadRequest, "Codex Turn State 管理模型无效："+err.Error())
-				return
-			}
-			seen[key] = struct{}{}
-			models = append(models, model)
-		}
-		ticketSettings.Models = models
-	}
-	if req.CodexTurnStateProbeModels != nil {
-		seen := make(map[string]struct{})
-		models := make([]string, 0, len(*req.CodexTurnStateProbeModels))
-		for _, model := range *req.CodexTurnStateProbeModels {
-			model = strings.TrimSpace(model)
-			if model == "" {
-				continue
-			}
-			if strings.Contains(model, "*") {
-				writeError(c, http.StatusBadRequest, "Codex Turn State 探测模型不能包含通配符")
-				return
-			}
-			key := strings.ToLower(model)
-			if _, ok := seen[key]; ok {
-				continue
-			}
-			if err := security.ValidateModelName(model); err != nil {
-				writeError(c, http.StatusBadRequest, "Codex Turn State 探测模型无效："+err.Error())
-				return
-			}
-			seen[key] = struct{}{}
-			models = append(models, model)
-		}
-		ticketSettings.ProbeModels = models
-	}
-	if req.CodexTurnStateTargetLength != nil {
-		if *req.CodexTurnStateTargetLength < 32 || *req.CodexTurnStateTargetLength > 4096 {
-			writeError(c, http.StatusBadRequest, "Codex Turn State 目标长度需在 32 到 4096 之间")
-			return
-		}
-		ticketSettings.TargetLength = *req.CodexTurnStateTargetLength
-	}
-	if req.CodexTurnStateTTLSeconds != nil {
-		if *req.CodexTurnStateTTLSeconds < 60 || *req.CodexTurnStateTTLSeconds > 86400 {
-			writeError(c, http.StatusBadRequest, "Codex Turn State TTL 需在 60 到 86400 秒之间")
-			return
-		}
-		ticketSettings.TTLSeconds = *req.CodexTurnStateTTLSeconds
-	}
-	if req.CodexTurnStateRefreshBeforeSeconds != nil {
-		if *req.CodexTurnStateRefreshBeforeSeconds < 0 || *req.CodexTurnStateRefreshBeforeSeconds >= ticketSettings.TTLSeconds {
-			writeError(c, http.StatusBadRequest, "Codex Turn State 提前刷新时间必须小于 TTL")
-			return
-		}
-		ticketSettings.RefreshBeforeSeconds = *req.CodexTurnStateRefreshBeforeSeconds
-	}
-	if req.CodexTurnStateProbeIntervalSeconds != nil {
-		if *req.CodexTurnStateProbeIntervalSeconds < 1 || *req.CodexTurnStateProbeIntervalSeconds > 3600 {
-			writeError(c, http.StatusBadRequest, "Codex Turn State 探测间隔需在 1 到 3600 秒之间")
-			return
-		}
-		ticketSettings.ProbeIntervalSeconds = *req.CodexTurnStateProbeIntervalSeconds
-	}
-	if req.CodexTurnStateAttemptTimeoutSeconds != nil {
-		if *req.CodexTurnStateAttemptTimeoutSeconds < 1 || *req.CodexTurnStateAttemptTimeoutSeconds > 300 {
-			writeError(c, http.StatusBadRequest, "Codex Turn State 单次超时需在 1 到 300 秒之间")
-			return
-		}
-		ticketSettings.AttemptTimeoutSeconds = *req.CodexTurnStateAttemptTimeoutSeconds
-	}
-	if req.CodexTurnStateConcurrency != nil {
-		if *req.CodexTurnStateConcurrency < 1 || *req.CodexTurnStateConcurrency > 64 {
-			writeError(c, http.StatusBadRequest, "Codex Turn State 并发数需在 1 到 64 之间")
-			return
-		}
-		ticketSettings.Concurrency = *req.CodexTurnStateConcurrency
-	}
-	if req.CodexTurnStatePreserveExisting != nil {
-		ticketSettings.PreserveExisting = *req.CodexTurnStatePreserveExisting
-	}
-	if req.CodexTurnStateFailClosed != nil {
-		ticketSettings.FailClosed = *req.CodexTurnStateFailClosed
-	}
-	if req.CodexTurnStateTicketProxySticky != nil {
-		ticketSettings.TicketProxySticky = *req.CodexTurnStateTicketProxySticky
-	}
-	ticketSettingsChanged := req.CodexTurnStateAutoEnabled != nil || req.CodexTurnStateHarvestProxyURL != nil || req.CodexTurnStateManagedModels != nil || req.CodexTurnStateProbeModels != nil || req.CodexTurnStateTargetLength != nil || req.CodexTurnStateTTLSeconds != nil || req.CodexTurnStateRefreshBeforeSeconds != nil || req.CodexTurnStateProbeIntervalSeconds != nil || req.CodexTurnStateAttemptTimeoutSeconds != nil || req.CodexTurnStateConcurrency != nil || req.CodexTurnStatePreserveExisting != nil || req.CodexTurnStateFailClosed != nil || req.CodexTurnStateTicketProxySticky != nil
 	if existingSettings != nil {
 		currentAdminSecret = existingSettings.AdminSecret
 		siteName = database.NormalizeSiteName(existingSettings.SiteName)
@@ -12034,20 +11870,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			return
 		}
 	} else {
-		if ticketSettingsChanged {
-			if updateErr := h.db.UpdateCodexTurnStateSettings(c.Request.Context(), ticketSettings); updateErr != nil {
-				writeError(c, http.StatusInternalServerError, "保存 Codex Turn State 自动采集设置失败："+updateErr.Error())
-				return
-			}
-			proxy.SetCodexTurnStateTicketConfig(&proxy.CodexTurnStateTicketConfig{
-				Enabled: ticketSettings.Enabled, HarvestProxyURL: ticketSettings.HarvestProxyURL, Models: ticketSettings.Models, ProbeModels: ticketSettings.ProbeModels,
-				TargetLength: ticketSettings.TargetLength, TTLSeconds: ticketSettings.TTLSeconds, RefreshBeforeSeconds: ticketSettings.RefreshBeforeSeconds,
-				ProbeIntervalSeconds: ticketSettings.ProbeIntervalSeconds, AttemptTimeoutSeconds: ticketSettings.AttemptTimeoutSeconds,
-				Concurrency: ticketSettings.Concurrency, PreserveExisting: ticketSettings.PreserveExisting, FailClosed: ticketSettings.FailClosed,
-				TicketProxySticky: ticketSettings.TicketProxySticky,
-			})
-			proxy.WakeCodexTurnStateHarvester()
-		}
 		if req.SessionSlotBufferSeconds != nil {
 			h.store.SetSessionSlotBuffer(time.Duration(sessionSlotBufferSeconds) * time.Second)
 			log.Printf("设置已更新: session_slot_buffer_seconds = %d", sessionSlotBufferSeconds)
@@ -12187,16 +12009,6 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 	modelCooldownSettings := h.store.GetModelCooldownSettings()
 
 	c.JSON(http.StatusOK, settingsResponse{
-		CodexTurnStateAutoEnabled:           ticketSettings.Enabled,
-		CodexTurnStateHarvestProxyURL:       ticketSettings.HarvestProxyURL,
-		CodexTurnStateManagedModels:         ticketSettings.Models,
-		CodexTurnStateTargetLength:          ticketSettings.TargetLength,
-		CodexTurnStateTTLSeconds:            ticketSettings.TTLSeconds,
-		CodexTurnStateRefreshBeforeSeconds:  ticketSettings.RefreshBeforeSeconds,
-		CodexTurnStateProbeIntervalSeconds:  ticketSettings.ProbeIntervalSeconds,
-		CodexTurnStateAttemptTimeoutSeconds: ticketSettings.AttemptTimeoutSeconds,
-		CodexTurnStateConcurrency:           ticketSettings.Concurrency,
-		CodexTurnStateFailClosed:            ticketSettings.FailClosed,
 		antigravityOAuthSettingsView:        currentAntigravityOAuthSettingsView(),
 		SiteName:                            siteName,
 		SiteLogo:                            siteLogo,

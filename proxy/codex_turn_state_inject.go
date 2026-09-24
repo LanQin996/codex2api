@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"context"
 	"strings"
-	"sync"
-	"time"
 	"unicode/utf8"
 
 	"github.com/tidwall/gjson"

@@ -2,6 +2,95 @@ export type ToastType = 'success' | 'error' | 'warning' | 'info'
 export type ISODateString = string
 export type UpstreamChannel = 'codex' | 'grok' | 'antigravity' | 'claude'
 
+export type ChannelMonitorStatus = 'unknown' | 'operational' | 'degraded' | 'failed'
+export type ChannelMonitorBillingStatus = 'unknown' | 'ok' | 'unsupported' | 'failed'
+
+export interface ChannelMonitorConfig {
+  account_id: number
+  enabled: boolean
+  interval_minutes: number
+  model: string
+  available_models: string[]
+  last_checked_at?: ISODateString
+  next_check_at?: ISODateString
+}
+
+export interface ChannelMonitorBillingData {
+  object?: string
+  schema_version?: number
+  billing_scope?: string
+  group_rate_multiplier?: number
+  user_rate_multiplier?: number
+  resolved_rate_multiplier?: number
+  peak_rate_enabled?: boolean
+  peak_start?: string
+  peak_end?: string
+  peak_rate_multiplier?: number
+  applied_peak_multiplier?: number
+  effective_rate_multiplier?: number
+  timezone?: string
+  observed_at?: ISODateString
+}
+
+export interface ChannelMonitorBillingSnapshot {
+  status: ChannelMonitorBillingStatus
+  data?: ChannelMonitorBillingData
+  message?: string
+  http_status?: number
+  checked_at?: ISODateString
+  success_at?: ISODateString
+  next_check_at?: ISODateString
+  failure_count?: number
+}
+
+export interface ChannelMonitorCheck {
+  status: ChannelMonitorStatus
+  http_status?: number
+  latency_ms: number
+  first_token_ms: number
+  checked_at: ISODateString
+}
+
+export interface ChannelMonitorCard {
+  account_id: number
+  name: string
+  base_url: string
+  model: string
+  interval_minutes: number
+  status: ChannelMonitorStatus
+  http_status?: number
+  latency_ms: number
+  first_token_ms: number
+  message?: string
+  last_checked_at?: ISODateString
+  next_check_at?: ISODateString
+  availability_7d?: number
+  checks_7d: number
+  billing: ChannelMonitorBillingSnapshot
+  recent_checks: ChannelMonitorCheck[]
+}
+
+export interface ChannelMonitorListResponse {
+  items: ChannelMonitorCard[]
+  generated_at: ISODateString
+}
+
+export interface ChannelMonitorBillingRateItem {
+  account_id: number
+  billing: ChannelMonitorBillingSnapshot
+}
+
+export interface ChannelMonitorBillingRatesResponse {
+  items: ChannelMonitorBillingRateItem[]
+  generated_at: ISODateString
+}
+
+export interface UpdateChannelMonitorConfigRequest {
+  enabled: boolean
+  interval_minutes: number
+  model: string
+}
+
 // 管理台可见渠道设置（GET/PUT /settings/visible-channels）
 export interface ChannelTestSettings {
   test_model: string
@@ -150,6 +239,14 @@ export type CodexPassthroughMode = 'off' | 'auto' | 'always'
 export type ResponsesUpstreamTransport = 'http' | 'websocket'
 /** Codex 官方出站请求的设备指纹收敛档位，默认 off（不收敛）。 */
 export type CodexFingerprintMode = 'off' | 'device' | 'session' | 'single_machine_multi_window' | 'full'
+export interface AccountModelMismatch {
+  model: string
+  upstream_model: string
+  hit_count: number
+  first_seen_at?: ISODateString
+  last_seen_at?: ISODateString
+}
+
 export type ModelCooldownMode = 'off' | 'fixed' | 'adaptive'
 
 export type ResponseCacheWritePolicy = 'always' | 'on_demand'
@@ -459,30 +556,6 @@ export interface AccountRow {
   image_quota_total?: number
   today_used_count?: number
   image_quota_reset_at?: ISODateString
-}
-
-export interface CodexTurnStateTicketStatus {
-  model: string
-  length?: number
-  fernet_blocks?: number
-  proxy_sid?: string
-  exit_ip?: string
-  verified_model?: string
-  source?: string
-  bound?: boolean
-  state: 'ready' | 'expired' | 'refreshing' | 'missing' | string
-  captured_at?: string
-  expires_at?: string
-  remaining_seconds?: number
-  last_attempt?: string
-  last_success?: string
-  next_attempt?: string
-  attempts?: number
-  failures?: number
-  last_duration_ms?: number
-  queued?: boolean
-  in_flight?: boolean
-  last_error?: string
 }
 
 export type AccountsResponse = ApiListResponse<'accounts', AccountRow>
@@ -2064,19 +2137,6 @@ export interface SystemSettings {
 	  recovery_probe_interval_minutes: number
   lazy_mode: boolean
   codex_oauth_keepalive_enabled: boolean
-  codex_turn_state_auto_enabled: boolean
-  codex_turn_state_harvest_proxy_url: string
-  codex_turn_state_managed_models: string[]
-  codex_turn_state_probe_models: string[]
-  codex_turn_state_ticket_proxy_sticky: boolean
-  codex_turn_state_target_length: number
-  codex_turn_state_ttl_seconds: number
-  codex_turn_state_refresh_before_seconds: number
-  codex_turn_state_probe_interval_seconds: number
-  codex_turn_state_attempt_timeout_seconds: number
-  codex_turn_state_concurrency: number
-  codex_turn_state_preserve_existing: boolean
-  codex_turn_state_fail_closed: boolean
   proxy_url?: string
   pg_max_conns: number
   redis_pool_size: number
@@ -3487,6 +3547,7 @@ export interface UsageLog {
   endpoint: string
   model: string
   effective_model: string
+  upstream_model?: string
   /** 上游响应自报的模型名（未自报/历史行为空）。 */
   upstream_response_model?: string
   /** 三态：undefined/null=上游未自报无法比对；true/false=自报与实发是否一致。 */
