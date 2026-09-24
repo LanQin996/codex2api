@@ -139,7 +139,14 @@ def test_scoped_native_cache_isolation():
 
 
 @pytest.mark.parametrize("scoped", [False, True])
-def test_pinned_backend_roundtrip(tmp_path, monkeypatch, scoped):
+@pytest.mark.parametrize("tool_fields", [
+    {},
+    {"tools": [{"type": "function", "name": "local_probe", "parameters": {"type": "object"}}]},
+    {"tools": [{"type": "function", "name": "local_probe", "parameters": {"type": "object"}}], "tool_choice": "auto"},
+    {"tools": [{"type": "function", "function": {"name": "local_probe", "parameters": {"type": "object"}}}]},
+    {"tool_choice": "none"},
+])
+def test_pinned_backend_roundtrip(tmp_path, monkeypatch, scoped, tool_fields):
     """Optional integration test: real adapter code, mocked HTTP upstream."""
     source = os.environ.get("EXCEL_UPSTREAM_SOURCE")
     if not source:
@@ -168,6 +175,13 @@ def test_pinned_backend_roundtrip(tmp_path, monkeypatch, scoped):
     def upstream(request):
         body = json.loads(request.content)
         captured.append(body)
+        # Inspect the actual final HTTP payload, not just an adapter helper.
+        assert "tools" not in body
+        assert "tool_choice" not in body
+        if tool_fields.get("tools", [{}])[0].get("name") == "local_probe":
+            catalog = json.dumps(body["input"])
+            assert "local_probe" in catalog
+            assert "run_officejs" in catalog
         assert body["model"] == "gpt-5.6-sol"
         assert request.headers["chatgpt-account-id"] == "test-account"
         assert KEY not in request.headers["authorization"]
@@ -193,7 +207,53 @@ def test_pinned_backend_roundtrip(tmp_path, monkeypatch, scoped):
             })
         for streaming in (False, True):
             result = client.post("/v1/responses", headers=headers, json={
-                "model": "gpt-5.6-sol-excel", "input": "hi", "stream": streaming})
+                "model": "gpt-5.6-sol-excel", "input": "hi", "stream": streaming,
+                **tool_fields})
             assert result.status_code == 200, result.text
             assert "hello" in result.text
         assert len(captured) == 2
+
+
+@pytest.mark.parametrize("kind", ["function", "custom"])
+def test_native_officejs_identity_restored_for_tool_output(kind):
+    source = os.environ.get("EXCEL_UPSTREAM_SOURCE")
+    if not source:
+        pytest.skip("Set EXCEL_UPSTREAM_SOURCE to the pinned ghcp_proxy checkout")
+    sys.path.insert(0, source)
+    module = importlib.import_module("excel_upstream")
+    from bridge import install_scoped_backend, request_scope
+    install_scoped_backend(SimpleNamespace(excel_upstream=module))
+    request_scope.set(("account", "session", "generation"))
+    tool = {"type": kind, "name": "local_tool"}
+    envelope = {"name": "local_tool"}
+    if kind == "function":
+        tool["parameters"] = {"type": "object", "properties": {"value": {"type": "string"}}}
+        envelope["arguments"] = {"value": "test"}
+    else:
+        envelope["input"] = "test"
+    native = {
+        "type": "function_call", "id": "fc_original", "call_id": "call_original",
+        "name": "run_officejs",
+        "arguments": json.dumps({"code": json.dumps(envelope)}),
+        "status": "completed",
+    }
+    client = module.extract_native_client_tool_call({"output": [native]}, {"tools": [tool]})
+    assert client is not None
+    assert client["name"] == "local_tool"
+    assert client["call_id"] == native["call_id"]
+    # Codex commonly omits the original item ID when replaying its local call.
+    client.pop("id", None)
+    output = {
+        "type": "function_call_output" if kind == "function" else "custom_tool_call_output",
+        "call_id": client["call_id"], "output": "local execution result",
+    }
+    wire = module.prepare_responses_body({
+        "model": "gpt-5.6-sol-excel", "tools": [tool],
+        "input": [{"role": "user", "content": "run tool"}, client, output],
+    })
+    calls = [item for item in wire["input"] if item.get("type") == "function_call"]
+    results = [item for item in wire["input"] if item.get("type") == "function_call_output"]
+    assert calls == [native]  # Exact name, arguments, native item ID and call_id.
+    assert len(results) == 1
+    assert results[0]["call_id"] == native["call_id"]
+    assert results[0]["output"] == "local execution result"
