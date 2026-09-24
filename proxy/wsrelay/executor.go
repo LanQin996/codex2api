@@ -139,25 +139,19 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 
 	// 出口链路统一由 ResolveCodexWebsocketEgress 决定(Resin > 代理 > 直连):
 	// Resin 模式下 WS 地址改写为反代路径,拨号侧(createConnection)同样按它跳过代理。
-	// 票据绑定出口优先于调用方入参出口：注入侧已按票据铸造出口定稿，这里一律照办。
-	ticketBoundProxy := proxy.CodexTurnStateProxyFromContext(ctx)
-	effectiveProxyOverride := effectiveProxyURL(account, proxyOverride)
-	if ticketBoundProxy != "" {
-		effectiveProxyOverride = ticketBoundProxy
-	}
-	egress := proxy.ResolveCodexWebsocketEgress(account, wsURL, effectiveProxyOverride)
+	egress := proxy.ResolveCodexRequestEgress(ctx, account, wsURL, effectiveProxyURL(account, proxyOverride), true)
 	wsURL = egress.URL
-	// 出口在 beginUpstreamTrace 之后才定稿（票据绑定出口 / Resin 覆盖），用量日志
-	// 按最终拨号出口重刷，否则 WS 行只会显示入参代理，看不出真实出口。
-	proxy.NoteUpstreamTraceProxy(ctx, egress.DialProxyURL, true)
 
 	// 准备请求头
-	headers := e.prepareWebsocketHeaders(accessToken, account, accountIDStr, headerSessionID, apiKey, deviceCfg, ginHeaders, wsBody)
-	// 凭据级 turn state 注入在账号自定义头之后落定（帧体已由 proxy.ExecuteRequest 写入）。
-	proxy.ApplyCodexTurnStateInjectionHeader(ctx, headers)
-	wsModel := strings.TrimSpace(gjson.GetBytes(wsBody, "model").String())
-	proxy.ApplyCodexRouteCookies(ctx, headers, account, httpURL, wsModel)
-	ctx = proxy.WithCodexRouteCookieScope(ctx, httpURL, wsModel)
+	// 跨账号回声守卫在握手头装配末尾剥离已知来自其他账号的 turn state。
+	affinityKey := proxy.CodexTurnStateAffinityKeyFromContext(ctx)
+	headers := e.prepareWebsocketHeaders(ctx, accessToken, account, accountIDStr, headerSessionID, apiKey, deviceCfg, ginHeaders, wsBody, affinityKey)
+	// 握手头在复用连接上不会重发；每轮必须把最终状态同步到 response.create。
+	if state := headers.Get("X-Codex-Turn-State"); state != "" {
+		wsBody, _ = sjson.SetBytes(wsBody, "client_metadata.x-codex-turn-state", state)
+	} else {
+		wsBody, _ = sjson.DeleteBytes(wsBody, "client_metadata.x-codex-turn-state")
+	}
 	// Record the attempted handshake UA immediately so failed handshakes are
 	// still auditable. A reused connection replaces this below with the UA that
 	// was actually sent when that connection was established.
@@ -183,23 +177,15 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	// 续链亲和：上游无服务端存储时，previous_response_id 的上下文只存活在产出
 	// 该响应的那条 WS 连接里。带续链 ID 的请求优先取回原连接（独占成功才用），
 	// 否则落到随机槽位会触发上游 "previous response not found"。
-	// 出口优先于此处的亲和：本次尝试被票据绑定出口时（ticketBoundProxy 非空），偏好
-	// 连接只在它与绑定出口一致时才可用；不一致就放弃亲和、回落到下面的常规 acquire，
-	// 在绑定出口上新建连接。运维决策是"保票据"——票据在别的出口必被上游拒收，而续链
-	// 丢了最多让上游回 previous response not found，代价更小。
 	// 同线程上的后台副请求（request_kind=memory、guardian 子代理）另成一道，
 	// 不与用户在飞轮次同键排队；Desktop 走 HTTP 时元数据只在请求体里。
 	poolSessionID := proxy.ResolveCodexWebsocketTransportSessionKeyWithBody(sessionID, ginHeaders, wsBody)
-	routeFingerprint := proxy.CodexRouteCookieFingerprint(headers)
-	if routeFingerprint != "" {
-		poolSessionID += ":route:" + routeFingerprint
-	}
 	var wc *WsConnection
 	var pr *PendingRequest
 	var err2 error
 	acquireStart := time.Now()
 	if prevRespID := strings.TrimSpace(gjson.GetBytes(wsBody, "previous_response_id").String()); prevRespID != "" {
-		if pwc, ppr, slotKey := e.manager.AcquirePreferredConnection(prevRespID, account.ID(), apiKey, ticketBoundProxy, routeFingerprint); pwc != nil {
+		if pwc, ppr, slotKey := e.manager.AcquirePreferredConnection(prevRespID, account.ID(), apiKey); pwc != nil {
 			wc, pr, poolSessionID = pwc, ppr, slotKey
 		}
 	}
@@ -207,14 +193,20 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 	if baseKey == "" && headerSessionID != sessionID {
 		baseKey = headerSessionID
 	}
-	if baseKey != "" && routeFingerprint != "" {
-		baseKey += ":route:" + routeFingerprint
-	}
+	// Handshake headers (including X-Codex-Turn-State from template Apply) freeze at
+	// dial time. Isolate reusable slots by the same model string used for template
+	// lookup so a later model cannot reuse a connection whose turn-state was frozen
+	// for a different template identity. prompt_cache_key / session header isolation
+	// comments above are unchanged.
+	baseKey = reusablePoolBaseKeyWithModel(baseKey, gjson.GetBytes(wsBody, "model").String())
 	if wc == nil {
+		// A pooled handshake must belong to the same mapped conversation/thread.
+		poolSessionID = proxy.ScopeCodexFingerprintTransportKey(poolSessionID, account, ginHeaders)
+		baseKey = proxy.ScopeCodexFingerprintTransportKey(baseKey, account, ginHeaders)
 		if proxy.IsStatelessWebsocketSessionID(sessionID) && baseKey != "" && !statelessOneShotEnabled() {
-			wc, pr, poolSessionID, err2 = e.manager.AcquireReusableConnection(ctx, account, wsURL, baseKey, sessionID, statelessConnectionSlots(), headers, effectiveProxyOverride)
+			wc, pr, poolSessionID, err2 = e.manager.AcquireReusableConnection(ctx, account, wsURL, baseKey, sessionID, statelessConnectionSlots(), headers, proxyOverride)
 		} else {
-			wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, poolSessionID, headers, effectiveProxyOverride)
+			wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, poolSessionID, headers, proxyOverride)
 		}
 	}
 	// 取连耗时（busy 排队 + 探活 + 握手）计入本 attempt 的 ws_acquire_ms（issue #413）
@@ -254,7 +246,7 @@ func (e *Executor) ExecuteRequestViaWebsocket(
 		}
 
 		reacquireStart := time.Now()
-		wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, poolSessionID, headers, effectiveProxyOverride)
+		wc, pr, err2 = e.manager.AcquireConnection(ctx, account, wsURL, poolSessionID, headers, proxyOverride)
 		proxy.AddWsAcquireDuration(ctx, time.Since(reacquireStart))
 		if err2 != nil {
 			return nil, err2
@@ -338,8 +330,22 @@ func (e *Executor) prepareWebsocketBody(body []byte, sessionID string) []byte {
 	return wsBody
 }
 
-// prepareWebsocketHeaders 准备 WebSocket 请求头
-func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Account, accountID, sessionID, apiKey string, deviceCfg *proxy.DeviceProfileConfig, ginHeaders http.Header, wsBody []byte) http.Header {
+// reusablePoolBaseKeyWithModel isolates reusable WS slots by the model string used
+// for turn-state template lookup. Handshake headers freeze at dial time; without
+// this, a later model can reuse a connection whose X-Codex-Turn-State was frozen
+// for a different template identity.
+func reusablePoolBaseKeyWithModel(baseKey, model string) string {
+	baseKey = strings.TrimSpace(baseKey)
+	model = strings.TrimSpace(model)
+	if baseKey == "" || model == "" {
+		return baseKey
+	}
+	return baseKey + "|m:" + model
+}
+
+// prepareWebsocketHeaders 准备 WebSocket 请求头。
+// affinityKey 用于 turn-state 跨账号回声守卫；空串时守卫为空操作。
+func (e *Executor) prepareWebsocketHeaders(ctx context.Context, accessToken string, account *auth.Account, accountID, sessionID, apiKey string, deviceCfg *proxy.DeviceProfileConfig, ginHeaders http.Header, wsBody []byte, affinityKey string) http.Header {
 	headers := http.Header{}
 
 	// 认证头
@@ -389,6 +395,12 @@ func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Acc
 			headers.Set(name, value)
 		}
 	}
+	if headers.Get("X-Codex-Turn-State") == "" {
+		if state := strings.TrimSpace(gjson.GetBytes(wsBody, "client_metadata.x-codex-turn-state").String()); state != "" {
+			headers.Set("X-Codex-Turn-State", state)
+		}
+	}
+	proxy.GuardCodexTurnStateEcho(affinityKey, account, headers)
 	// 指纹收敛：在透传之后覆盖客户端原值，在账号自定义头之前保留运维覆盖优先级。
 	// 握手头是逐连接冻结的，复用连接沿用建连时的取值；收敛值按账号恒定，正好与
 	// 这一语义相容。off 档为空操作。
@@ -403,9 +415,7 @@ func (e *Executor) prepareWebsocketHeaders(accessToken string, account *auth.Acc
 	// （codex-rs/core/src/client.rs build_websocket_headers）与 HTTP /responses 同形，
 	// 都是 session-id / thread-id / x-client-request-id，也都不发 Conversation_id。
 	// legacy 档下该函数恢复旧的 Session_id + 清 Conversation_id 行为。
-	if sessionID = strings.TrimSpace(sessionID); sessionID != "" {
-		proxy.ApplyCodexSessionHeaders(headers, account, sessionID, ginHeaders, true)
-	}
+	proxy.ApplyCodexSessionHeaders(headers, account, sessionID, ginHeaders, true)
 	for name, value := range account.GetCustomHeaders() {
 		name = strings.TrimSpace(name)
 		if name == "" {
@@ -792,6 +802,8 @@ func websocketResponseToHTTP(ctx context.Context, wsResp *WsResponse, statusCode
 		}
 	}
 
+	// 连接握手的状态不是本轮上游响应；复用时不可重采集或回传旧快照。
+	resp.Header.Del("X-Codex-Turn-State")
 	// 设置 SSE 响应头
 	resp.Header.Set("Content-Type", "text/event-stream")
 	resp.Header.Set("Cache-Control", "no-cache")

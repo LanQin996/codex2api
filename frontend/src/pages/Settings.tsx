@@ -219,7 +219,6 @@ const LEGACY_SECTION_TABS: Record<string, SettingsTabKey> = {
 const SETTINGS_TAB_SECTION_INDEX: Record<SettingsTabKey, ReadonlyArray<{ id: string; labelKey: string; icon: ReactNode }>> = {
   codex: [
     { id: 'settings-codex-quota', labelKey: 'settings.nav.codexQuota', icon: <Gauge /> },
-    { id: 'settings-codex-turn-state', labelKey: 'settings.nav.codexTurnState', icon: <Shield /> },
     { id: 'settings-codex-transport', labelKey: 'settings.nav.codexTransport', icon: <Wifi /> },
     { id: 'settings-codex-client', labelKey: 'settings.nav.codexClient', icon: <Terminal /> },
     { id: 'settings-codex-images', labelKey: 'settings.nav.codexImages', icon: <ImageIcon /> },
@@ -2088,6 +2087,7 @@ export default function Settings() {
     { label: t('accounts.codexFingerprintModeOff'), value: 'off' },
     { label: t('accounts.codexFingerprintModeDevice'), value: 'device' },
     { label: t('accounts.codexFingerprintModeSession'), value: 'session' },
+    { label: t('accounts.codexFingerprintModeSessionIdentity'), value: 'single_machine_multi_window' },
     { label: t('accounts.codexFingerprintModeFull'), value: 'full' },
   ]
   const modelCooldownModeOptions = [
@@ -2183,19 +2183,6 @@ export default function Settings() {
 	    recovery_probe_interval_minutes: 30,
     lazy_mode: false,
     codex_oauth_keepalive_enabled: false,
-    codex_turn_state_auto_enabled: false,
-    codex_turn_state_harvest_proxy_url: '',
-    codex_turn_state_managed_models: ['gpt-6-astra', 'gpt-5.6-sol'],
-    codex_turn_state_probe_models: ['gpt-6-astra', 'gpt-5.6-sol'],
-    codex_turn_state_target_length: 292,
-    codex_turn_state_ttl_seconds: 3600,
-    codex_turn_state_refresh_before_seconds: 600,
-    codex_turn_state_probe_interval_seconds: 6,
-    codex_turn_state_attempt_timeout_seconds: 25,
-    codex_turn_state_concurrency: 1,
-    codex_turn_state_preserve_existing: true,
-    codex_turn_state_fail_closed: false,
-    codex_turn_state_ticket_proxy_sticky: false,
     pg_max_conns: 50,
     redis_pool_size: 30,
     auto_clean_unauthorized: false,
@@ -2368,8 +2355,6 @@ export default function Settings() {
   const [testingImageStorage, setTestingImageStorage] = useState(false)
   const [loadedAdminSecret, setLoadedAdminSecret] = useState('')
   const [modelList, setModelList] = useState<string[]>([])
-  const [codexTurnStateModelDraft, setCodexTurnStateModelDraft] = useState('')
-  const [codexTurnStateProbeModelDraft, setCodexTurnStateProbeModelDraft] = useState('')
   const [modelItems, setModelItems] = useState<ModelInfo[]>([])
   const [modelsLastSyncedAt, setModelsLastSyncedAt] = useState<string | undefined>()
   const [modelsSourceURL, setModelsSourceURL] = useState('')
@@ -2561,44 +2546,6 @@ export default function Settings() {
       ...extraPatch,
       [field]: value,
     } as Partial<SystemSettings>)
-  }, [autoSaveSettingsPatch])
-
-  const addCodexTurnStateModel = useCallback(() => {
-    const model = codexTurnStateModelDraft.trim()
-    if (!model) return
-    const current = settingsFormRef.current.codex_turn_state_managed_models ?? []
-    if (current.some((item) => item.toLowerCase() === model.toLowerCase())) {
-      setCodexTurnStateModelDraft('')
-      return
-    }
-    setCodexTurnStateModelDraft('')
-    void autoSaveSettingsPatch({ codex_turn_state_managed_models: [...current, model] })
-  }, [autoSaveSettingsPatch, codexTurnStateModelDraft])
-
-  const removeCodexTurnStateModel = useCallback((model: string) => {
-    const current = settingsFormRef.current.codex_turn_state_managed_models ?? []
-    void autoSaveSettingsPatch({
-      codex_turn_state_managed_models: current.filter((item) => item.toLowerCase() !== model.toLowerCase()),
-    })
-  }, [autoSaveSettingsPatch])
-
-  const addCodexTurnStateProbeModel = useCallback(() => {
-    const model = codexTurnStateProbeModelDraft.trim()
-    if (!model || model.includes('*')) return
-    const current = settingsFormRef.current.codex_turn_state_probe_models ?? []
-    if (current.some((item) => item.toLowerCase() === model.toLowerCase())) {
-      setCodexTurnStateProbeModelDraft('')
-      return
-    }
-    setCodexTurnStateProbeModelDraft('')
-    void autoSaveSettingsPatch({ codex_turn_state_probe_models: [...current, model] })
-  }, [autoSaveSettingsPatch, codexTurnStateProbeModelDraft])
-
-  const removeCodexTurnStateProbeModel = useCallback((model: string) => {
-    const current = settingsFormRef.current.codex_turn_state_probe_models ?? []
-    void autoSaveSettingsPatch({
-      codex_turn_state_probe_models: current.filter((item) => item.toLowerCase() !== model.toLowerCase()),
-    })
   }, [autoSaveSettingsPatch])
 
   // ===== Antigravity OAuth client 配置(草稿态 + 显式保存;secret 不回显,留空 = 沿用已保存值) =====
@@ -2937,7 +2884,7 @@ export default function Settings() {
       category: id.includes('image') ? 'image' : 'codex',
       source: 'builtin',
       pro_only: id === 'gpt-5.3-codex-spark',
-      api_key_auth_available: !['gpt-5.5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-6-astra'].includes(id),
+      api_key_auth_available: !['gpt-5.5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'gpt-5.6-luna', 'gpt-6-astra', 'gpt-6-sol', 'gpt-6-luna'].includes(id),
     }))
   }, [modelItems, modelList])
   const codexModelOptions = visibleModelItems
@@ -3651,121 +3598,6 @@ export default function Settings() {
                   {t('settings.codexSchedulingHintAction')}
                 </Button>
               </div>
-              </SettingsSection>
-
-              <SettingsSection id="settings-codex-turn-state" title={t('settings.codexTurnStateTitle')} description={t('settings.codexTurnStateDesc')} icon={<Shield className="size-4" />}>
-                <SettingsCard title={t('settings.codexTurnStateCardTitle')} description={t('settings.codexTurnStateCardDesc')} icon={<RefreshCw className="size-4" />}>
-                  <div className="space-y-4">
-                    <SettingField label={t('settings.codexTurnStateEnabled')} description={t('settings.codexTurnStateEnabledDesc')} layout="switch">
-                      <Switch
-                        checked={settingsForm.codex_turn_state_auto_enabled}
-                        onCheckedChange={(checked) => autoSaveBooleanField('codex_turn_state_auto_enabled', checked)}
-                      />
-                    </SettingField>
-                    <SettingField label={t('settings.codexTurnStateAutoDispatch')} description={t('settings.codexTurnStateAutoDispatchDesc')} layout="switch">
-                      <Switch
-                        checked={settingsForm.codex_turn_state_fail_closed}
-                        onCheckedChange={(checked) => autoSaveBooleanField('codex_turn_state_fail_closed', checked)}
-                      />
-                    </SettingField>
-                    <SettingField label={t('settings.codexTurnStateProxy')} description={t('settings.codexTurnStateProxyDesc')}>
-                      <Input
-                        value={settingsForm.codex_turn_state_harvest_proxy_url}
-                        placeholder={t('settings.codexTurnStateProxyPlaceholder')}
-                        onChange={(event) => setSettingsForm((form) => ({ ...form, codex_turn_state_harvest_proxy_url: event.target.value }))}
-                        onBlur={(event) => void autoSaveSettingsPatch({ codex_turn_state_harvest_proxy_url: event.target.value })}
-                      />
-                    </SettingField>
-                    <div className="space-y-2">
-                      <div className="text-sm font-medium text-foreground">{t('settings.codexTurnStateModels')}</div>
-                      <p className="text-xs leading-relaxed text-muted-foreground">{t('settings.codexTurnStateModelsDesc')}</p>
-                      <div className="flex flex-wrap gap-2">
-                        {(settingsForm.codex_turn_state_managed_models ?? []).map((model) => (
-                          <span key={model} className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/40 px-2.5 py-1 text-xs font-medium">
-                            {model}
-                            <button type="button" className="rounded-full p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground" aria-label={`${t('settings.codexTurnStateRemove')} ${model}`} onClick={() => removeCodexTurnStateModel(model)}>
-                              <X className="size-3" />
-                            </button>
-                          </span>
-                        ))}
-                      </div>
-                      <div className="flex gap-2">
-                        <Input
-                          value={codexTurnStateModelDraft}
-                          placeholder={t('settings.codexTurnStateModelPlaceholder')}
-                          onChange={(event) => setCodexTurnStateModelDraft(event.target.value)}
-                          onKeyDown={(event) => {
-                            if (event.key === 'Enter') {
-                              event.preventDefault()
-                              addCodexTurnStateModel()
-                            }
-                          }}
-                        />
-                        <Button type="button" variant="outline" onClick={addCodexTurnStateModel}>{t('settings.codexTurnStateAdd')}</Button>
-                      </div>
-                    </div>
-                    <div className="space-y-2">
-                      <div className="text-sm font-medium text-foreground">{t('settings.codexTurnStateProbeModels')}</div>
-                      <p className="text-xs leading-relaxed text-muted-foreground">{t('settings.codexTurnStateProbeModelsDesc')}</p>
-                      <div className="flex flex-wrap gap-2">
-                        {(settingsForm.codex_turn_state_probe_models ?? []).map((model) => (
-                          <span key={model} className="inline-flex items-center gap-1.5 rounded-full border border-border bg-muted/40 px-2.5 py-1 text-xs font-medium">
-                            {model}
-                            <button type="button" className="rounded-full p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground" aria-label={`${t('settings.codexTurnStateRemove')} ${model}`} onClick={() => removeCodexTurnStateProbeModel(model)}>
-                              <X className="size-3" />
-                            </button>
-                          </span>
-                        ))}
-                      </div>
-                      <div className="flex gap-2">
-                        <Input
-                          value={codexTurnStateProbeModelDraft}
-                          placeholder={t('settings.codexTurnStateProbeModelPlaceholder')}
-                          onChange={(event) => setCodexTurnStateProbeModelDraft(event.target.value)}
-                          onKeyDown={(event) => {
-                            if (event.key === 'Enter') {
-                              event.preventDefault()
-                              addCodexTurnStateProbeModel()
-                            }
-                          }}
-                        />
-                        <Button type="button" variant="outline" onClick={addCodexTurnStateProbeModel}>{t('settings.codexTurnStateAdd')}</Button>
-                      </div>
-                    </div>
-                    <SettingField label={t('settings.codexTurnStatePreserveExisting')} description={t('settings.codexTurnStatePreserveExistingDesc')} layout="switch">
-                      <Switch
-                        checked={settingsForm.codex_turn_state_preserve_existing}
-                        onCheckedChange={(checked) => autoSaveBooleanField('codex_turn_state_preserve_existing', checked)}
-                      />
-                    </SettingField>
-                    <SettingField label={t('settings.codexTurnStateTicketProxySticky')} description={t('settings.codexTurnStateTicketProxyStickyDesc')} layout="switch">
-                      <Switch
-                        checked={settingsForm.codex_turn_state_ticket_proxy_sticky}
-                        onCheckedChange={(checked) => autoSaveBooleanField('codex_turn_state_ticket_proxy_sticky', checked)}
-                      />
-                    </SettingField>
-                    <div className={SETTINGS_FIELD_GRID}>
-                      <SettingField label={t('settings.codexTurnStateTargetLength')} suffix={t('settings.unit.characters')}>
-                        <DraftNumberInput min={32} max={4096} value={settingsForm.codex_turn_state_target_length} onValueChange={(value) => setSettingsForm((form) => ({ ...form, codex_turn_state_target_length: value }))} onValueCommit={(value) => void autoSaveSettingsPatch({ codex_turn_state_target_length: value })} />
-                      </SettingField>
-                      <SettingField label={t('settings.codexTurnStateTTL')} suffix={t('settings.unit.sec')}>
-                        <DraftNumberInput min={60} max={86400} value={settingsForm.codex_turn_state_ttl_seconds} onValueChange={(value) => setSettingsForm((form) => ({ ...form, codex_turn_state_ttl_seconds: value }))} onValueCommit={(value) => void autoSaveSettingsPatch({ codex_turn_state_ttl_seconds: value })} />
-                      </SettingField>
-                      <SettingField label={t('settings.codexTurnStateRefreshBefore')} suffix={t('settings.unit.sec')}>
-                        <DraftNumberInput min={0} max={86399} value={settingsForm.codex_turn_state_refresh_before_seconds} onValueChange={(value) => setSettingsForm((form) => ({ ...form, codex_turn_state_refresh_before_seconds: value }))} onValueCommit={(value) => void autoSaveSettingsPatch({ codex_turn_state_refresh_before_seconds: value })} />
-                      </SettingField>
-                      <SettingField label={t('settings.codexTurnStateProbeInterval')} description={t('settings.codexTurnStateProbeIntervalDesc')} suffix={t('settings.unit.sec')}>
-                        <DraftNumberInput min={1} max={3600} value={settingsForm.codex_turn_state_probe_interval_seconds} onValueChange={(value) => setSettingsForm((form) => ({ ...form, codex_turn_state_probe_interval_seconds: value }))} onValueCommit={(value) => void autoSaveSettingsPatch({ codex_turn_state_probe_interval_seconds: value })} />
-                      </SettingField>
-                      <SettingField label={t('settings.codexTurnStateAttemptTimeout')} description={t('settings.codexTurnStateAttemptTimeoutDesc')} suffix={t('settings.unit.sec')}>
-                        <DraftNumberInput min={1} max={300} value={settingsForm.codex_turn_state_attempt_timeout_seconds} onValueChange={(value) => setSettingsForm((form) => ({ ...form, codex_turn_state_attempt_timeout_seconds: value }))} onValueCommit={(value) => void autoSaveSettingsPatch({ codex_turn_state_attempt_timeout_seconds: value })} />
-                      </SettingField>
-                      <SettingField label={t('settings.codexTurnStateConcurrency')} suffix={t('settings.unit.concurrency')}>
-                        <DraftNumberInput min={1} max={64} value={settingsForm.codex_turn_state_concurrency} onValueChange={(value) => setSettingsForm((form) => ({ ...form, codex_turn_state_concurrency: value }))} onValueCommit={(value) => void autoSaveSettingsPatch({ codex_turn_state_concurrency: value })} />
-                      </SettingField>
-                    </div>
-                  </div>
-                </SettingsCard>
               </SettingsSection>
 
               <SettingsSection id="settings-codex-transport" title={t('settings.nav.codexTransport')} description={t('settings.nav.codexTransportDesc')} icon={<Wifi className="size-4" />}>

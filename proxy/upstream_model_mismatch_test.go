@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -46,9 +47,9 @@ func TestUpstreamModelMatches(t *testing.T) {
 func TestUpstreamModelFromPayload(t *testing.T) {
 	cases := map[string]string{
 		`{"type":"response.completed","response":{"model":"gpt-5.4","usage":{}}}`: "gpt-5.4",
-		`{"object":"response","model":"gpt-5.4-mini"}`:                           "gpt-5.4-mini",
-		`{"type":"message_start","message":{"model":"claude-opus-5"}}`:           "claude-opus-5",
-		`{"type":"response.output_text.delta","delta":"hi"}`:                     "",
+		`{"object":"response","model":"gpt-5.4-mini"}`:                            "gpt-5.4-mini",
+		`{"type":"message_start","message":{"model":"claude-opus-5"}}`:            "claude-opus-5",
+		`{"type":"response.output_text.delta","delta":"hi"}`:                      "",
 		`{"model":123}`: "",
 	}
 	for payload, want := range cases {
@@ -115,17 +116,29 @@ func TestNoteUpstreamModelMismatchMarksAccountModel(t *testing.T) {
 func TestResponsesRelayRecordsUpstreamModelAndMismatchMark(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
-	for _, stream := range []bool{false, true} {
-		name := "non-stream"
-		if stream {
-			name = "stream"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		stream    bool
+		firstOnly bool
+	}{
+		{name: "non-stream"},
+		{name: "stream", stream: true},
+		{name: "stream-model-only-in-created", stream: true, firstOnly: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stream := tc.stream
 			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if stream {
 					w.Header().Set("Content-Type", "text/event-stream")
+					if tc.firstOnly {
+						_, _ = w.Write([]byte("event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_swap\",\"model\":\"gpt-5.4-mini\"}}\n\n"))
+					}
 					_, _ = w.Write([]byte("event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n"))
-					_, _ = w.Write([]byte("event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_swap\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"gpt-5.4-mini\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n"))
+					terminal := "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_swap\",\"object\":\"response\",\"status\":\"completed\",\"model\":\"gpt-5.4-mini\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":2,\"total_tokens\":5}}}\n\n"
+					if tc.firstOnly {
+						terminal = strings.Replace(terminal, "\"model\":\"gpt-5.4-mini\",", "", 1)
+					}
+					_, _ = w.Write([]byte(terminal))
 					return
 				}
 				w.Header().Set("Content-Type", "application/json")
@@ -174,6 +187,9 @@ func TestResponsesRelayRecordsUpstreamModelAndMismatchMark(t *testing.T) {
 				if len(logs) > 0 {
 					if logs[0].UpstreamModel != "gpt-5.4-mini" {
 						t.Fatalf("UpstreamModel = %q, want gpt-5.4-mini", logs[0].UpstreamModel)
+					}
+					if logs[0].UpstreamResponseModel != logs[0].UpstreamModel || logs[0].UpstreamModelMismatch == nil || !*logs[0].UpstreamModelMismatch {
+						t.Fatalf("upstream audit and legacy model disagree: response=%q legacy=%q mismatch=%v", logs[0].UpstreamResponseModel, logs[0].UpstreamModel, logs[0].UpstreamModelMismatch)
 					}
 					break
 				}

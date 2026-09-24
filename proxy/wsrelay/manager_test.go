@@ -725,7 +725,7 @@ func TestAcquirePreferredConnection(t *testing.T) {
 	wc := newBoundTestConn(t, manager, 7, "base#3")
 	manager.BindResponseConn("resp_chain", wc, "base#3", 7, "key-A")
 
-	got, pr, slotKey := manager.AcquirePreferredConnection("resp_chain", 7, "key-A", "")
+	got, pr, slotKey := manager.AcquirePreferredConnection("resp_chain", 7, "key-A")
 	if got != wc {
 		t.Fatal("AcquirePreferredConnection should return the bound connection")
 	}
@@ -740,27 +740,9 @@ func TestAcquirePreferredConnection(t *testing.T) {
 	}
 
 	// 连接忙(已有在途请求)时不等待,直接回退常规路径
-	got2, pr2, _ := manager.AcquirePreferredConnection("resp_chain", 7, "key-A", "")
+	got2, pr2, _ := manager.AcquirePreferredConnection("resp_chain", 7, "key-A")
 	if got2 != nil || pr2 != nil {
 		t.Fatal("busy preferred connection must not be acquired")
-	}
-}
-
-func TestAcquirePreferredConnectionRejectsRotatedRouteCookie(t *testing.T) {
-	manager := NewManager()
-	t.Cleanup(manager.Stop)
-	manager.probeFunc = func(*WsConnection) bool { return true }
-	wc := newBoundTestConn(t, manager, 7, "base#3")
-	wc.routeCookieFingerprint = "old-cookie-hash"
-	manager.BindResponseConn("resp_pair", wc, "base#3", 7, "key-A")
-	if got, pr, _ := manager.AcquirePreferredConnection("resp_pair", 7, "key-A", "", "new-cookie-hash"); got != nil || pr != nil {
-		t.Fatal("reused handshake with stale cookie")
-	}
-	if wc.session.PendingCount() != 0 {
-		t.Fatal("rejected connection acquired a lease")
-	}
-	if got, pr, _ := manager.AcquirePreferredConnection("resp_pair", 7, "key-A", "", "old-cookie-hash"); got != wc || pr == nil {
-		t.Fatal("matching cookie prevented continuation")
 	}
 }
 
@@ -793,7 +775,7 @@ func TestAcquirePreferredConnectionProbeDoesNotBlockDifferentPoolKey(t *testing.
 	}
 	slowResult := make(chan result, 1)
 	go func() {
-		wc, pending, key := manager.AcquirePreferredConnection("resp_slow", 7, "key-A", "")
+		wc, pending, key := manager.AcquirePreferredConnection("resp_slow", 7, "key-A")
 		slowResult <- result{wc: wc, pending: pending, key: key}
 	}()
 	select {
@@ -804,7 +786,7 @@ func TestAcquirePreferredConnectionProbeDoesNotBlockDifferentPoolKey(t *testing.
 
 	fastResult := make(chan result, 1)
 	go func() {
-		wc, pending, key := manager.AcquirePreferredConnection("resp_fast", 7, "key-A", "")
+		wc, pending, key := manager.AcquirePreferredConnection("resp_fast", 7, "key-A")
 		fastResult <- result{wc: wc, pending: pending, key: key}
 	}()
 	select {
@@ -832,7 +814,7 @@ func TestAcquirePreferredConnectionProbeFailureEvicts(t *testing.T) {
 	wc := newBoundTestConn(t, manager, 7, "base#0")
 	manager.BindResponseConn("resp_dead", wc, "base#0", 7, "key-A")
 
-	got, pr, _ := manager.AcquirePreferredConnection("resp_dead", 7, "key-A", "")
+	got, pr, _ := manager.AcquirePreferredConnection("resp_dead", 7, "key-A")
 	if got != nil || pr != nil {
 		t.Fatal("dead preferred connection must not be acquired")
 	}

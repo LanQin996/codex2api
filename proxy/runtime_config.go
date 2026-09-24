@@ -447,7 +447,6 @@ func currentFirstTokenTimeout() time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
-
 // codexContinueThinkingSettings 返回续想折叠开关与最大轮数（一次快照读取）。
 func codexContinueThinkingSettings() (bool, int) {
 	s := CurrentRuntimeSettings()

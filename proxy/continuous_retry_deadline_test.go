@@ -409,9 +409,17 @@ func TestContinuousRetryAffinityTimeoutCleanupPreservesOnlyExistingSameAccount(t
 			if !bindContinuousRetrySessionAffinity(ctx, store, affinityKey, current, "") {
 				t.Fatal("affinity bind was rejected before deadline")
 			}
+			// The timer cancels ctx before it runs the timeout cleanups, so
+			// ctx.Done() alone races the affinity unbind. Cleanups run in
+			// registration order; a sentinel registered after the bind fires
+			// only once the unbind has completed.
+			cleaned := make(chan struct{})
+			if !withContinuousRetryDeadlinePendingCleanup(ctx, func() {}, func() { close(cleaned) }) {
+				t.Fatal("sentinel cleanup was rejected before deadline")
+			}
 			deadline.Activate()
 			select {
-			case <-ctx.Done():
+			case <-cleaned:
 			case <-time.After(500 * time.Millisecond):
 				t.Fatal("deadline did not fire")
 			}

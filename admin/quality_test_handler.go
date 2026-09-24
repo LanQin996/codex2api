@@ -139,7 +139,7 @@ func (h *Handler) qualityTestOptionsForAccount(ctx context.Context, account *aut
 	for _, model := range candidates {
 		model = strings.TrimSpace(model)
 		// Effort aliases are proxy routing shortcuts, not upstream model IDs.
-		if !isTextConnectionModel(model) || strings.ContainsAny(model, "()") || slices.Contains(options.Models, model) {
+		if strings.EqualFold(model, "codex-auto-review") || !isTextConnectionModel(model) || strings.ContainsAny(model, "()") || slices.Contains(options.Models, model) {
 			continue
 		}
 		options.Models = append(options.Models, model)

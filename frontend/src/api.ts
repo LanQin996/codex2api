@@ -57,6 +57,9 @@ import type {
   AccountPageStatsResponse,
   AccountLiveStateResponse,
   ChartAggregation,
+  ChannelMonitorConfig,
+  ChannelMonitorBillingRatesResponse,
+  ChannelMonitorListResponse,
   CreateAccountResponse,
   CreateAPIKeyResponse,
   CreateAPIKeyRequest,
@@ -130,6 +133,7 @@ import type {
   CodexUserAgentCatalog,
   CodexUserAgentPreview,
   UpdateAccountSchedulerRequest,
+  UpdateChannelMonitorConfigRequest,
   UpdateAPIKeyRequest,
   UpdatePromptFilterNewAPIBindingRequest,
   UpdateOAuthAccountRequest,
@@ -497,6 +501,7 @@ export type UsageLogQueryParams = {
   accountId?: string
   fast?: string
   ultra?: string
+  upstreamModelMismatch?: string
   stream?: string
   compact?: string
   hasCompactionHistory?: string
@@ -521,6 +526,7 @@ export function buildUsageLogSearchParams(params: UsageLogQueryParams) {
   if (params.accountId) search.set('account_id', params.accountId)
   if (params.fast) search.set('fast', params.fast)
   if (params.ultra) search.set('ultra', params.ultra)
+  if (params.upstreamModelMismatch) search.set('upstream_model_mismatch', params.upstreamModelMismatch)
   if (params.stream) search.set('stream', params.stream)
   if (params.compact) search.set('compact', params.compact)
   if (params.hasCompactionHistory) search.set('has_compaction_history', params.hasCompactionHistory)
@@ -562,13 +568,14 @@ export const api = {
   createPortalImageEditJob: (apiKey: string, data: CreateImageJobPayload) =>
     requestImageStudioPortal<ImageJobResponse>('/edit-jobs', apiKey, { method: 'POST', body: JSON.stringify(data) }),
   getPortalImageJobs: (apiKey: string, params: { page?: number; pageSize?: number } = {}) => {
-    const sp = new URLSearchParams()
+    const sp = new URLSearchParams({ summary: '1' })
     if (params.page) sp.set('page', String(params.page))
     if (params.pageSize) sp.set('page_size', String(params.pageSize))
     return requestImageStudioPortal<ImageJobsResponse>(`/jobs?${sp.toString()}`, apiKey)
   },
-  getPortalImageJob: (apiKey: string, id: number, params: { includeCache?: boolean } = {}) => {
+  getPortalImageJob: (apiKey: string, id: number, params: { includeCache?: boolean; summary?: boolean } = {}) => {
     const sp = new URLSearchParams()
+    if (params.summary === true || (params.summary !== false && !params.includeCache)) sp.set('summary', '1')
     if (params.includeCache) sp.set('include_cache', '1')
     const query = sp.toString()
     return requestImageStudioPortal<ImageJobResponse>(`/jobs/${id}${query ? `?${query}` : ''}`, apiKey)
@@ -590,8 +597,6 @@ export const api = {
   },
   deletePortalImageAsset: (apiKey: string, id: number) =>
     requestImageStudioPortal<MessageResponse>(`/assets/${id}`, apiKey, { method: 'DELETE' }),
-  reacquireCodexTurnState: (accountID: number, model: string) =>
-    request<{ queued: number }>('/settings/codex-turn-state/probe', { method: 'POST', body: JSON.stringify({ account_id: accountID, model }) }),
   getStats: () => request<StatsResponse>('/stats'),
   // channel is a first-class upstream provider filter; omit for all accounts.
   // view: 'lite' — 只返回身份/绑定字段,跳过用量富化(代理绑定弹窗等场景)。
@@ -655,6 +660,22 @@ export const api = {
       `/accounts/${id}/openai-responses/balance${force ? '?refresh=1' : ''}`,
       { signal, timeoutMs: 25_000 },
     ),
+  getChannelMonitorConfig: (id: number, signal?: AbortSignal) =>
+    request<ChannelMonitorConfig>(`/accounts/${id}/channel-monitor`, { signal }),
+  updateChannelMonitorConfig: (id: number, data: UpdateChannelMonitorConfigRequest) =>
+    request<ChannelMonitorConfig>(`/accounts/${id}/channel-monitor`, {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  getChannelMonitors: (signal?: AbortSignal) =>
+    request<ChannelMonitorListResponse>('/channel-monitors', { signal }),
+  getChannelMonitorBillingRates: (signal?: AbortSignal) =>
+    request<ChannelMonitorBillingRatesResponse>('/channel-monitors/billing-rates', { signal }),
+  probeChannelMonitor: (id: number) =>
+    request<MessageResponse>(`/channel-monitors/${id}/probe`, {
+      method: 'POST',
+      timeoutMs: 80_000,
+    }),
   addGrokAccount: (data: AddGrokAccountRequest) =>
     request<CreateAccountResponse>('/accounts/grok', { method: 'POST', body: JSON.stringify(data) }),
   fetchGrokModels: (data: AddGrokAccountRequest) =>
@@ -857,11 +878,6 @@ export const api = {
     }),
   refreshAccount: (id: number) =>
     request<MessageResponse>(`/accounts/${id}/refresh`, { method: 'POST' }),
-  refreshCodexTurnStateTickets: (id: number, model?: string) =>
-    request<{ queued: number }>('/settings/codex-turn-state/probe', {
-      method: 'POST',
-      body: JSON.stringify({ account_id: id, ...(model ? { model } : {}) }),
-    }),
   getAccount: (id: number, signal?: AbortSignal) =>
     request<AccountRow>(`/accounts/${id}`, { signal }),
   forceUsageProbe: () =>
@@ -1253,13 +1269,14 @@ export const api = {
   createImageEditJob: (data: CreateImageJobPayload) =>
     request<ImageJobResponse>('/images/edit-jobs', { method: 'POST', body: JSON.stringify(data) }),
   getImageJobs: (params: { page?: number; pageSize?: number } = {}) => {
-    const sp = new URLSearchParams()
+    const sp = new URLSearchParams({ summary: '1' })
     if (params.page) sp.set('page', String(params.page))
     if (params.pageSize) sp.set('page_size', String(params.pageSize))
     return request<ImageJobsResponse>(`/images/jobs?${sp.toString()}`)
   },
-  getImageJob: (id: number, params: { includeCache?: boolean } = {}) => {
+  getImageJob: (id: number, params: { includeCache?: boolean; summary?: boolean } = {}) => {
     const sp = new URLSearchParams()
+    if (params.summary === true || (params.summary !== false && !params.includeCache)) sp.set('summary', '1')
     if (params.includeCache) sp.set('include_cache', '1')
     const query = sp.toString()
     return request<ImageJobResponse>(`/images/jobs/${id}${query ? `?${query}` : ''}`)
@@ -1629,7 +1646,7 @@ export const api = {
     request<{ message: string; deleted: number }>('/proxies/batch-delete', { method: 'POST', body: JSON.stringify({ ids }) }),
   cleanErrorProxies: () =>
     request<{ message: string; cleaned: number; unbound: number }>('/proxies/clean-error', { method: 'POST' }),
-  autoBalanceProxies: (data: { channel?: 'codex' | 'grok' | 'claude'; mode?: 'unbound' | 'all'; max_per_proxy?: number; proxy_ids?: number[] }) =>
+  autoBalanceProxies: (data: { channel?: UpstreamChannel; mode?: 'unbound' | 'all'; max_per_proxy?: number; proxy_ids?: number[] }) =>
     request<AutoBalanceProxiesResult>('/proxies/auto-balance', { method: 'POST', body: JSON.stringify(data) }),
   listProxyRiskScoringProfiles: () =>
     request<{ profiles: ProxyRiskScoringProfile[] }>('/proxy-risk-scoring/profiles'),

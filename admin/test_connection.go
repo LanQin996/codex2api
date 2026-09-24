@@ -147,6 +147,12 @@ func (h *Handler) testConnection(c *gin.Context, quality *qualityTestRequest) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	prompt := c.Query("prompt")
+	hasPrompt := quality == nil && c.Request.URL.Query().Has("prompt")
+	if hasPrompt && (strings.TrimSpace(prompt) == "" || len([]rune(prompt)) > auth.MaxTestContentRunes) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("测试内容不能为空，且不能超过 %d 个字符", auth.MaxTestContentRunes)})
+		return
+	}
 	claudeSecurityCfg := h.store.ClaudeSecurityConfig()
 	payload := h.buildAccountConnectionTestPayload(c.Request.Context(), account, testModel, claudeSecurityCfg)
 	if quality != nil {
@@ -154,6 +160,12 @@ func (h *Handler) testConnection(c *gin.Context, quality *qualityTestRequest) {
 		if err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
+		}
+	} else if hasPrompt {
+		if isClaudeAccount {
+			payload = buildClaudeConnectionTestPayloadWithContent(testModel, prompt, claudeSecurityCfg)
+		} else {
+			payload = buildTestPayloadWithContent(testModel, prompt)
 		}
 	}
 

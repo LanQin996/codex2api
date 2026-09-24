@@ -2,7 +2,6 @@ package admin
 
 import (
 	"encoding/json"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -10,96 +9,7 @@ import (
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/codex2api/internal/openaiidentity"
-	"github.com/codex2api/proxy"
 )
-
-func codexTurnStateTicketStatuses(row *database.AccountRow, runtimeAccount *auth.Account) ([]codexTurnStateTicketStatus, int, int, bool) {
-	cfg := proxy.CurrentCodexTurnStateTicketConfig()
-	if cfg == nil || !cfg.Enabled || row == nil {
-		return nil, 0, 0, false
-	}
-	upstreamType := strings.TrimSpace(row.GetCredential("upstream_type"))
-	if strings.EqualFold(upstreamType, auth.UpstreamOpenAIResponses) || strings.EqualFold(upstreamType, auth.UpstreamGrok) || strings.EqualFold(upstreamType, auth.UpstreamClaude) || strings.EqualFold(upstreamType, auth.UpstreamAntigravity) {
-		return nil, 0, 0, false
-	}
-	tickets := auth.ParseCodexTurnStateTickets(row.Credentials[auth.CodexTurnStateTicketsCredentialKey])
-	if runtimeAccount != nil {
-		runtimeAccount.Mu().RLock()
-		tickets = make(map[string]auth.CodexTurnStateTicket, len(runtimeAccount.CodexTurnStateTickets))
-		for model, ticket := range runtimeAccount.CodexTurnStateTickets {
-			tickets[model] = ticket
-		}
-		runtimeAccount.Mu().RUnlock()
-	}
-	probeStatuses := proxy.CodexTurnStateProbeStatuses(row.ID)
-	now := time.Now()
-	ready := 0
-	models := make(map[string]struct{}, len(tickets)+len(cfg.ProbeModels)+len(probeStatuses))
-	for model := range tickets {
-		models[strings.ToLower(strings.TrimSpace(model))] = struct{}{}
-	}
-	for _, model := range cfg.ProbeModels {
-		if model = strings.ToLower(strings.TrimSpace(model)); model != "" && cfg.ModelManaged(model) {
-			models[model] = struct{}{}
-		}
-	}
-	for model := range probeStatuses {
-		models[strings.ToLower(strings.TrimSpace(model))] = struct{}{}
-	}
-	items := make([]codexTurnStateTicketStatus, 0, len(models))
-	for model := range models {
-		ticket, hasTicket := tickets[model]
-		state := "missing"
-		if hasTicket && ticket.Valid(now, cfg.TargetLength) {
-			state = "ready"
-			ready++
-		} else if hasTicket && ticket.NeedsVerification && ticket.StoredValid(now, cfg.TargetLength) {
-			state = "unverified"
-		} else if hasTicket {
-			state = "expired"
-		}
-		item := codexTurnStateTicketStatus{
-			Model: model, State: state, Length: ticket.Length, FernetBlocks: ticket.FernetBlocks,
-			ProxySID: ticket.ProxySID, ExitIP: ticket.ExitIP, VerifiedModel: ticket.VerifiedModel,
-			Source: ticket.Source, Bound: strings.TrimSpace(ticket.ProxyURL) != "",
-			CapturedAt: ticket.CapturedAt, ExpiresAt: ticket.ExpiresAt,
-		}
-		if state == "ready" {
-			item.RemainingSeconds = max(0, int64(time.Until(ticket.ExpiresAt).Seconds()))
-			item.NextAttempt = ticket.ExpiresAt.Add(-time.Duration(cfg.RefreshBeforeSeconds) * time.Second)
-		}
-		if probeState, ok := probeStatuses[model]; ok {
-			item.LastAttempt, item.LastSuccess = probeState.LastAttempt, probeState.LastSuccess
-			item.Attempts, item.Failures, item.LastDurationMs = probeState.Attempts, probeState.Failures, probeState.LastDurationMs
-			item.Queued, item.InFlight, item.LastError = probeState.Queued, probeState.InFlight, probeState.LastError
-			if !probeState.NextAttempt.IsZero() {
-				item.NextAttempt = probeState.NextAttempt
-			}
-			if probeState.InFlight {
-				item.State = "refreshing"
-			} else if probeState.Queued && item.State != "ready" {
-				item.State = "queued"
-			}
-		}
-
-		items = append(items, item)
-	}
-	sort.Slice(items, func(i, j int) bool { return items[i].Model < items[j].Model })
-	managed := 0
-	for _, model := range cfg.ProbeModels {
-		if cfg.ModelManaged(model) {
-			managed++
-		}
-	}
-	if managed == 0 {
-		for _, model := range cfg.Models {
-			if !strings.Contains(model, "*") {
-				managed++
-			}
-		}
-	}
-	return items, ready, max(managed, len(items)), true
-}
 
 func antigravityPersistedStatus(row *database.AccountRow) (string, string) {
 	if row == nil {
@@ -203,6 +113,9 @@ func (h *Handler) buildAccountResponse(
 			planType = runtimePlan
 		}
 	}
+	if isGrokAccount && row.GrokPlanDisplay != nil {
+		planType = row.GrokPlanDisplay.Plan
+	}
 	var grokPlan *auth.GrokPlan
 	if isGrokAccount {
 		if resolved, ok := auth.ResolveGrokPlan(planType); ok {
@@ -216,6 +129,10 @@ func (h *Handler) buildAccountResponse(
 	codexPassthroughMode := ""
 	if isOpenAIResponsesAccount && includeDetails {
 		codexPassthroughMode = auth.NormalizeCodexPassthroughMode(row.GetCredential("codex_passthrough_mode"))
+	}
+	responsesUpstreamTransport := ""
+	if isOpenAIResponsesAccount && includeDetails {
+		responsesUpstreamTransport = auth.NormalizeOpenAIResponsesUpstreamTransport(row.GetCredential(auth.OpenAIResponsesUpstreamTransportCredentialKey))
 	}
 	balanceQueryURL := ""
 	if isOpenAIResponsesAccount && includeDetails {
@@ -298,7 +215,6 @@ func (h *Handler) buildAccountResponse(
 		}
 		allowedAPIKeyIDs = row.GetCredentialInt64Slice("allowed_api_key_ids")
 	}
-	codexTurnStateTickets, codexTurnStateReadyCount, codexTurnStateManagedCount, codexTurnStateEnabled := codexTurnStateTicketStatuses(row, runtimeAccount)
 	resp := accountResponse{
 		DetailLoaded:                 includeDetails,
 		ID:                           row.ID,
@@ -332,6 +248,8 @@ func (h *Handler) buildAccountResponse(
 		AgentIdentity:                isAgentIdentityCredentialRow(row),
 		GrokAuthKind:                 grokAuthKind,
 		GrokPlan:                     grokPlan,
+		GrokPlanDisplay:              row.GrokPlanDisplay,
+		GrokModels:                   row.GrokModels,
 		GrokBilling:                  grokBilling,
 		AvatarURL:                    row.GetCredential("avatar_url"),
 		VerifiedEmail:                row.GetCredentialBool("verified_email"),
@@ -345,6 +263,7 @@ func (h *Handler) buildAccountResponse(
 		ModelMapping:                 modelMapping,
 		CodexClientMetadataMode:      codexClientMetadataMode,
 		CodexPassthroughMode:         codexPassthroughMode,
+		ResponsesUpstreamTransport:   responsesUpstreamTransport,
 		CodexFingerprintMode:         codexFingerprintMode,
 		ClaudeFingerprintMode:        claudeFingerprintMode,
 		ClaudeUserAgent:              claudeUserAgent,
@@ -355,13 +274,6 @@ func (h *Handler) buildAccountResponse(
 		ClaudeVersionPolicyOverride:  claudeVersionPolicyOverride,
 		ClaudeClientVersionOverride:  claudeClientVersionOverride,
 		Timezone:                     accountTimezone,
-		CodexTurnState:               strings.TrimSpace(row.GetCredential(auth.CodexTurnStateCredentialKey)),
-		CodexTurnStateModels:         auth.NormalizeCodexTurnStateModels(row.GetCredential(auth.CodexTurnStateModelsCredentialKey)),
-		CodexTurnStateSetAt:          strings.TrimSpace(row.GetCredential(auth.CodexTurnStateSetAtCredentialKey)),
-		CodexTurnStateAutoEnabled:    codexTurnStateEnabled,
-		CodexTurnStateReadyCount:     codexTurnStateReadyCount,
-		CodexTurnStateManagedCount:   codexTurnStateManagedCount,
-		CodexTurnStateTickets:        codexTurnStateTickets,
 		CustomHeaders:                customHeaders,
 		UpstreamRequestIDHeader:      row.GetCredential(auth.UpstreamRequestIDHeaderCredentialKey),
 		ProxyURL:                     row.ProxyURL,

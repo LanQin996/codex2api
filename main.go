@@ -361,22 +361,6 @@ func main() {
 	store.TriggerAutoCleanupAsync()
 	defer store.Stop()
 	backgroundCtx, cancelBackground := context.WithCancel(context.Background())
-	// Codex x-codex-turn-state 自动采集器：设置保存在数据库，启动时先加载一次，
-	// 后台循环会继续读取以支持多实例/管理端热更新。
-	if ticketSettings, ticketErr := db.GetCodexTurnStateSettings(backgroundCtx); ticketErr != nil {
-		log.Printf("加载 Codex Turn State 自动采集设置失败（保持关闭）: %v", ticketErr)
-	} else {
-		proxy.SetCodexTurnStateTicketConfig(&proxy.CodexTurnStateTicketConfig{
-			Enabled: ticketSettings.Enabled, HarvestProxyURL: ticketSettings.HarvestProxyURL,
-			Models: ticketSettings.Models, ProbeModels: ticketSettings.ProbeModels, TargetLength: ticketSettings.TargetLength,
-			TTLSeconds: ticketSettings.TTLSeconds, RefreshBeforeSeconds: ticketSettings.RefreshBeforeSeconds,
-			ProbeIntervalSeconds: ticketSettings.ProbeIntervalSeconds, AttemptTimeoutSeconds: ticketSettings.AttemptTimeoutSeconds,
-			Concurrency: ticketSettings.Concurrency, PreserveExisting: ticketSettings.PreserveExisting, FailClosed: ticketSettings.FailClosed,
-			TicketProxySticky: ticketSettings.TicketProxySticky,
-		})
-	}
-	ticketHarvester := proxy.NewCodexTurnStateHarvester(store, db)
-	ticketHarvester.Start(backgroundCtx)
 	adminHandler.StartQualityTests(backgroundCtx)
 	defer cancelBackground()
 	if !proxy.StartResponseCacheSettingsPoller(backgroundCtx, db) {
@@ -392,6 +376,8 @@ func main() {
 	adminHandler.StartOfficialPricingSync(backgroundCtx)
 	// Prompt 审核日志保留清理：默认保留 7 天，每小时分批清理过期行，CY 关联行不动。
 	adminHandler.StartPromptLogRetention(backgroundCtx)
+	// Responses API 渠道监控按账号启用，健康检查和倍率探测分别调度。
+	adminHandler.StartChannelMonitor(backgroundCtx)
 
 	// 后台定时同步 Codex CLI 模拟版本（启动即拉一次，之后按设置的间隔）；
 	// 出上游新版本门槛时无需发版即可跟进。开关/间隔在设置页可调，
@@ -464,6 +450,16 @@ func main() {
 
 	handler.RegisterRoutes(r)
 	adminHandler.RegisterExternalImageRoutes(r, handler)
+	imageWorkers, queueErr := admin.ImageJobWorkerCount()
+	if queueErr != nil {
+		log.Fatal(queueErr)
+	}
+	if err := adminHandler.StartImageJobQueue(backgroundCtx, imageWorkers); err != nil {
+		log.Fatalf("Initialize image queue: %v", err)
+	}
+	if err := adminHandler.StartImageMaintenance(backgroundCtx); err != nil {
+		log.Fatalf("Initialize image maintenance: %v", err)
+	}
 	adminHandler.StartPromptIntelligence(backgroundCtx)
 	adminHandler.RegisterRoutes(r)
 
@@ -631,7 +627,10 @@ func main() {
 	log.Printf("  API:    POST /v1/responses")
 	log.Printf("  API:    POST /v1/images/generations")
 	log.Printf("  API:    POST /v1/images/jobs")
+	log.Printf("  API:    POST /v1/images/jobs/results")
 	log.Printf("  API:    GET  /v1/images/jobs/:id")
+	log.Printf("  API:    GET  /v1/images/jobs/:id/output")
+	log.Printf("  API:    POST /v1/images/jobs/:id/ack")
 	log.Printf("  API:    POST /v1/messages")
 	log.Printf("  API:    GET  /v1/models")
 	log.Println("==========================================")
@@ -666,7 +665,6 @@ func main() {
 	adminHandler.WaitAutoResetCredits()
 	adminHandler.WaitAutoActivate5hWindow()
 	adminHandler.WaitQualityTests()
-	ticketHarvester.Stop()
 	wsKeepalive.Stop()
 	wsrelay.ShutdownExecutor()
 	if !proxy.DrainResponseCacheBackendWrites(2 * time.Second) {

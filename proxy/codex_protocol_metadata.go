@@ -110,7 +110,7 @@ func prepareCodexProtocolMetadata(body []byte, account *auth.Account, sessionID 
 	return body, forward
 }
 
-// ApplyCodexProtocolHeaders is shared by HTTP, WS and ticket acquisition.
+// ApplyCodexProtocolHeaders is shared by HTTP and WebSocket requests.
 // It intentionally does not change UA, originator, auth, or turn-state.
 func ApplyCodexProtocolHeaders(outbound, prepared http.Header) {
 	if !CodexMetadataImpersonationEnabled() || outbound == nil {
