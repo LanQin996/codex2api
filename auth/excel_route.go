@@ -36,7 +36,7 @@ func (s *Store) ApplyAccountExcelRouteMode(id int64, mode string) {
 
 func IsExcelModel(model string) bool {
 	switch strings.ToLower(strings.TrimSpace(model)) {
-	case "gpt-5.6-luna-excel", "gpt-5.6-terra-excel", "gpt-5.6-sol-excel":
+	case "gpt-6-astra-excel", "gpt-6-sol-excel", "gpt-5.6-luna-excel", "gpt-5.6-terra-excel", "gpt-5.6-sol-excel":
 		return true
 	}
 	return false

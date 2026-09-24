@@ -6,6 +6,24 @@ import (
 	"testing"
 )
 
+func TestExcelGPT6Aliases(t *testing.T) {
+	for _, model := range []string{"gpt-6-astra-excel", "gpt-6-sol-excel"} {
+		if !IsExcelModel(model) {
+			t.Fatalf("missing route: %s", model)
+		}
+		a := &Account{DBID: 42, excelRouteMode: "oauth"}
+		if !a.SupportsCodexModel(model) {
+			t.Fatalf("enabled account rejected %s", model)
+		}
+		if (&Account{DBID: 43, excelRouteMode: "off"}).SupportsCodexModel(model) {
+			t.Fatalf("disabled account accepted %s", model)
+		}
+	}
+	if IsExcelModel("gpt-6-sol") || IsExcelModel("gpt-6-astra-execl") {
+		t.Fatal("ordinary model or misspelling must not route to Excel")
+	}
+}
+
 func TestExcelRouteExplicitAccountBinding(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "routes.json")
 	t.Setenv("EXCEL_ROUTES_FILE", path)

@@ -210,6 +210,11 @@ def production_app():
     # Do not load the desktop application's startup/shutdown event handlers.
     import proxy
 
+    # Extend the pinned adapter's routing table without overriding other models.
+    proxy.excel_upstream.EXCEL_MODEL_UPSTREAMS["gpt-6-astra-excel"] = "gpt-6-astra"
+    proxy.excel_upstream.EXCEL_MODEL_UPSTREAMS["gpt-6-sol-excel"] = "gpt-6-sol"
+    proxy.excel_upstream.MODEL_IDS = tuple(proxy.excel_upstream.EXCEL_MODEL_UPSTREAMS)
+
     # This adapter always uses explicitly supplied session headers, on every OS.
     scoped = os.environ.get("EXCEL_ACCOUNT_ROUTES", "0") == "1"
     if scoped:

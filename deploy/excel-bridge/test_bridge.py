@@ -139,6 +139,7 @@ def test_scoped_native_cache_isolation():
 
 
 @pytest.mark.parametrize("scoped", [False, True])
+@pytest.mark.parametrize("model", ["gpt-5.6-sol", "gpt-6-astra", "gpt-6-sol"])
 @pytest.mark.parametrize("tool_fields", [
     {},
     {"tools": [{"type": "function", "name": "local_probe", "parameters": {"type": "object"}}]},
@@ -146,7 +147,7 @@ def test_scoped_native_cache_isolation():
     {"tools": [{"type": "function", "function": {"name": "local_probe", "parameters": {"type": "object"}}}]},
     {"tool_choice": "none"},
 ])
-def test_pinned_backend_roundtrip(tmp_path, monkeypatch, scoped, tool_fields):
+def test_pinned_backend_roundtrip(tmp_path, monkeypatch, scoped, tool_fields, model):
     """Optional integration test: real adapter code, mocked HTTP upstream."""
     source = os.environ.get("EXCEL_UPSTREAM_SOURCE")
     if not source:
@@ -182,7 +183,7 @@ def test_pinned_backend_roundtrip(tmp_path, monkeypatch, scoped, tool_fields):
             catalog = json.dumps(body["input"])
             assert "local_probe" in catalog
             assert "run_officejs" in catalog
-        assert body["model"] == "gpt-5.6-sol"
+        assert body["model"] == model
         assert request.headers["chatgpt-account-id"] == "test-account"
         assert KEY not in request.headers["authorization"]
         response = {"id": "resp_mock", "object": "response", "model": body["model"],
@@ -197,6 +198,7 @@ def test_pinned_backend_roundtrip(tmp_path, monkeypatch, scoped, tool_fields):
 
     backend._EXCEL_UPSTREAM_CLIENT = httpx.AsyncClient(transport=httpx.MockTransport(upstream))
     with TestClient(app) as client:
+        assert model + "-excel" in {item["id"] for item in client.get("/v1/models", headers=AUTH).json()["data"]}
         headers = dict(AUTH)
         if scoped:
             headers.update({
@@ -207,7 +209,7 @@ def test_pinned_backend_roundtrip(tmp_path, monkeypatch, scoped, tool_fields):
             })
         for streaming in (False, True):
             result = client.post("/v1/responses", headers=headers, json={
-                "model": "gpt-5.6-sol-excel", "input": "hi", "stream": streaming,
+                "model": model + "-excel", "input": "hi", "stream": streaming,
                 **tool_fields})
             assert result.status_code == 200, result.text
             assert "hello" in result.text

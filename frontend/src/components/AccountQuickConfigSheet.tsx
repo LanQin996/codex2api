@@ -306,7 +306,7 @@ export default function AccountQuickConfigSheet({
               <p className="text-xs text-muted-foreground">{excelMode === "oauth"
                 ? "无需另填 Token；上游是否接受该账号仍需实际调用验证。"
                 : `需预先在桥接凭证目录放置 ${account.id}.json，且登录账号必须一致。`}</p>
-              <p className="text-xs text-muted-foreground break-all">客户端模型：gpt-5.6-sol-excel / gpt-5.6-luna-excel / gpt-5.6-terra-excel</p>
+              <p className="text-xs text-muted-foreground break-all">客户端模型：gpt-6-astra-excel / gpt-6-sol-excel / gpt-5.6-sol-excel / gpt-5.6-luna-excel / gpt-5.6-terra-excel</p>
             </>}
           </div>
 
