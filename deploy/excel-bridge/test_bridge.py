@@ -368,6 +368,24 @@ def test_http_migration_and_followup(tmp_path, monkeypatch):
         assert client.post("/v1/responses", headers=headers, json=body).status_code == 409
 
 
+def test_history_owner_failure_reasons(tmp_path):
+    from bridge import NativeCallStore
+    cache = NativeCallStore(tmp_path / "diagnostic.db", ttl_seconds=60, clock=lambda: 100)
+    try:
+        assert cache.owner_failure_reason("session", ["missing"]) == "record_missing"
+        cache.remember(("21", "session", "generation"), {"call_id": "a"})
+        assert cache.owner_failure_reason("other", ["a"]) == "session_mismatch"
+        assert cache.owner_failure_reason("session", ["a"]) == "resolved"
+        cache.remember(("19", "session", "generation"), {"call_id": "b"})
+        assert cache.owner_failure_reason("session", ["a", "b"]) == "mixed_scopes"
+        cache.remember(("19", "session", "generation"), {"call_id": "a"})
+        assert cache.owner_failure_reason("session", ["a"]) == "ambiguous_scope"
+        cache.clock = lambda: 161
+        assert cache.owner_failure_reason("session", ["a"]) == "session_expired"
+    finally:
+        cache.close()
+
+
 def test_history_owner_requires_complete_single_scope(tmp_path):
     from bridge import NativeCallStore
     cache = NativeCallStore(tmp_path / "owner.sqlite3")

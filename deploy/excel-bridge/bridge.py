@@ -578,6 +578,33 @@ class NativeCallStore:
                 self.db.execute("UPDATE sessions SET touched=? WHERE scope=?", (now,key))
         return dict(rows)
 
+    def owner_failure_reason(self, session, call_ids):
+        """Bounded diagnostic labels only; never expose IDs or stored payloads."""
+        candidates = None
+        with self.lock:
+            for call_id in sorted(set(call_ids)):
+                rows = self.db.execute(
+                    "SELECT c.scope,s.touched FROM (SELECT scope,call_id FROM calls UNION "
+                    "SELECT scope,call_id FROM checkpoints) c JOIN sessions s USING(scope) "
+                    "WHERE c.call_id=?", (call_id,),
+                ).fetchall()
+                if not rows:
+                    return "record_missing"
+                matching = [(key, touched) for key, touched in rows
+                            if json.loads(key)[1] == session]
+                if not matching:
+                    return "session_mismatch"
+                scopes = {key for key, touched in matching
+                          if touched > self.clock() - self.ttl}
+                if not scopes:
+                    return "session_expired"
+                candidates = scopes if candidates is None else candidates & scopes
+                if not candidates:
+                    return "mixed_scopes"
+        if not candidates:
+            return "empty_history"
+        return "ambiguous_scope" if len(candidates) != 1 else "resolved"
+
     def owner(self, session, call_ids):
         """Find one exact persisted scope covering all calls, never cross sessions."""
         candidates = None
@@ -837,6 +864,11 @@ def create_app(backend, key, session_path, *, scoped=False):
             return error(503, "Persistent history lookup unavailable")
         owner = cache.owner(session, set(ids))
         if owner is None:
+            logger.warning(
+                "excel_history_owner_unavailable reason=%s call_count=%d session_hash=%s",
+                cache.owner_failure_reason(session, ids), len(set(ids)),
+                hashlib.sha256(session.encode()).hexdigest()[:12],
+            )
             return error(409, "Original Excel tool history is missing or ambiguous; start a new conversation")
         return {"account_id": owner}
 
