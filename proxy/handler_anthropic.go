@@ -275,7 +275,11 @@ func (h *Handler) hasNativeClaudeAccountMatching(c *gin.Context, model string, a
 	}
 	apiKeyID := requestAPIKeyID(c)
 	accountFilter := claudeChannelAccountFilter(model)
-	accountFilter = h.withModelCooldownFilter(model, accountFilter)
+	ctx := context.Background()
+	if c != nil && c.Request != nil {
+		ctx = c.Request.Context()
+	}
+	accountFilter = h.withModelCooldownFilter(ctx, model, accountFilter)
 	if c != nil && c.Request != nil {
 		// The full Messages filter is assembled immediately after this routing
 		// stub. Apply the request's session affinity here as well, so a native
@@ -525,7 +529,7 @@ func (h *Handler) Messages(c *gin.Context) {
 	// 翻译后的请求体本身就是 Responses 形态，中转账号直接以 HTTP 转发，
 	// 使仅接入中转的用户也能使用 Claude Code（issue #181）。
 	accountFilter := accountFilterForResponsesModel(effectiveModel, modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db)))
-	accountFilter = h.withModelCooldownFilter(effectiveModel, accountFilter)
+	accountFilter = h.withModelCooldownFilter(c.Request.Context(), effectiveModel, accountFilter)
 	accountFilter = h.applyUpstreamChannelFilter(c, effectiveModel, accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
 	// scope 并发位在选中账号后才能占，请求退出时统一释放（issue #439 v2）。
@@ -612,6 +616,14 @@ func (h *Handler) Messages(c *gin.Context) {
 				sendAnthropicError(c, http.StatusTooManyRequests, "rate_limit_error", msg)
 				return
 			}
+			if h.accountPoolConcurrencySaturated(apiKeyID, retryExclusions.ForSelection(), accountFilter, auth.DispatchPolicyStandard) {
+				setConcurrencySaturatedRetryAfter(c)
+				if isStream && writeCommittedAnthropicRetryError(c, "overloaded_error", concurrencySaturatedMessageEN) {
+					return
+				}
+				sendAnthropicError(c, http.StatusServiceUnavailable, "overloaded_error", concurrencySaturatedMessageEN)
+				return
+			}
 			if isStream && writeCommittedAnthropicRetryError(c, "overloaded_error", noAvailableAnthropicAccountMessage(effectiveModel)) {
 				return
 			}
@@ -638,6 +650,9 @@ func (h *Handler) Messages(c *gin.Context) {
 		isRelayAccount := account.IsRelayStyle()
 		attemptEffectiveModel := effectiveModel
 		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !isRelayAccount
+		if account.OpenAIResponsesUsesUpstreamWebsocket() && !rawResponsesBodyShouldForceHTTPForImageGeneration(rawBody) {
+			useWebsocket = true
+		}
 		upstreamEndpoint := "/v1/responses"
 		if account.IsClaudeOAuth() {
 			// Native Claude accounts do not use the relay/Codex endpoint even
@@ -792,6 +807,8 @@ func (h *Handler) Messages(c *gin.Context) {
 			}
 			// service_tier 记账按 payload 规则改写后的值归因（仅 Codex 路径套用规则）。
 			serviceTier = EffectiveRequestedServiceTier(codexBody, attemptEffectiveModel, downstreamHeaders, attemptIdentity)
+			upstreamCtx = WithCodexTurnStateAffinityKey(upstreamCtx, affinityKey)
+			guardCodexTurnStateEcho(affinityKey, account, downstreamHeaders)
 			resp, reqErr = executeHTTPWithContinuousRetryKeepalive(upstreamCtx, func() (*http.Response, error) {
 				return ExecuteRequest(upstreamCtx, account, codexBody, upstreamSessionID, proxyURL, apiKey, deviceCfg, downstreamHeaders, useWebsocket)
 			})
@@ -814,7 +831,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			if wsHTTPFallback.ForceHTTP() && !useWebsocket {
 				wsHTTPFallback.LogHTTPAttemptCompletion("/v1/messages", account.ID(), attempt+1, durationMs, 0, logStatusUpstreamStreamBreak)
 			}
-			if useWebsocket && kind == upstreamErrorKindMessageTooBig {
+			if useWebsocket && kind == upstreamErrorKindMessageTooBig && !account.OpenAIResponsesUsesUpstreamWebsocket() {
 				wsElapsed := time.Since(start)
 				wsHTTPFallback.Retain(account, proxyURL, wsElapsed, websocketMessageTooBigSource(reqErr.Error()))
 				log.Printf("上游 WebSocket 1009，保留账号租约并降级 HTTP (fallback_id=%s, source=%s, attempt=%d, account=%d, endpoint=/v1/messages, ws_elapsed_ms=%d): %v", wsHTTPFallback.ID(), wsHTTPFallback.Source(), attempt+1, account.ID(), wsElapsed.Milliseconds(), reqErr)
@@ -1503,7 +1520,7 @@ func (h *Handler) Messages(c *gin.Context) {
 			wsHTTPFallback.LogHTTPAttemptCompletion("/v1/messages", account.ID(), attempt+1, totalDuration, firstTokenMs, outcome.logStatusCode)
 		}
 		downstreamWrote := streamAttempt.downstreamWrote(wroteAnyBody)
-		if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, useWebsocket, downstreamWrote, c.Request.Context().Err(), writeErr) {
+		if shouldFallbackWebsocketMessageTooBigToHTTP(outcome, useWebsocket, downstreamWrote, c.Request.Context().Err(), writeErr) && !account.OpenAIResponsesUsesUpstreamWebsocket() {
 			_ = streamAttempt.Close()
 			wsElapsed := time.Since(start)
 			resp.Body.Close()

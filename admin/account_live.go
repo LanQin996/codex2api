@@ -12,8 +12,7 @@ type accountLiveItem struct {
 }
 
 // GetAccountLiveState returns request-local runtime counters for the visible
-// account page. It intentionally reads only in-memory atomics, so frequent UI
-// polling does not touch the database or rebuild the paged account snapshot.
+// account page. Scheduler counters use in-memory atomics.
 func (h *Handler) GetAccountLiveState(c *gin.Context) {
 	ids, err := parseAccountListIDs(c.Query("ids"))
 	if err != nil {

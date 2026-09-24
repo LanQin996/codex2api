@@ -5,7 +5,12 @@ import type { AccountLiveStateResponse } from '../types'
 // Merge a live poll response into an account list. Rows whose live concurrency
 // counters did not change keep their object identity, and a no-op poll returns the
 // original array, so the 1s polling cadence cannot defeat row-level memoization.
-export function mergeAccountLiveState<T extends { id: number; active_requests?: number; occupied_requests?: number; session_slot_buffer_enabled?: boolean }>(
+export function mergeAccountLiveState<T extends {
+  id: number
+  active_requests?: number
+  occupied_requests?: number
+  session_slot_buffer_enabled?: boolean
+}>(
   current: T[],
   response: AccountLiveStateResponse,
 ): T[] {

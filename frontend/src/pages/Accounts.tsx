@@ -61,6 +61,7 @@ import type {
   AddOpenAIResponsesAccountRequest,
   CodexClientMetadataMode,
   CodexPassthroughMode,
+  ResponsesUpstreamTransport,
   CodexFingerprintMode,
   UpdateOpenAIResponsesAccountRequest,
   APIKeyRow,
@@ -113,10 +114,6 @@ import {
   applyOptionalWorkspaceRouteHeader,
   applyWorkspaceRouteHeader,
 } from "../lib/workspaceRoute";
-import {
-  computeCodexTurnStateTtl,
-  formatCodexTurnStateCountdown,
-} from "../lib/codexTurnState";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -684,6 +681,7 @@ function codexFingerprintModeOptions(
     { value: "off", label: t("accounts.codexFingerprintModeOff") },
     { value: "device", label: t("accounts.codexFingerprintModeDevice") },
     { value: "session", label: t("accounts.codexFingerprintModeSession") },
+    { value: "single_machine_multi_window", label: t("accounts.codexFingerprintModeSessionIdentity") },
     { value: "full", label: t("accounts.codexFingerprintModeFull") },
   ];
 }
@@ -695,6 +693,8 @@ function codexFingerprintModeDetail(
   switch (mode) {
     case "device":
       return t("accounts.codexFingerprintModeDeviceDetail");
+    case "single_machine_multi_window":
+      return t("accounts.codexFingerprintModeSessionIdentityDetail");
     case "session":
       return t("accounts.codexFingerprintModeSessionDetail");
     case "full":
@@ -1907,11 +1907,6 @@ export default function Accounts() {
     useState<CodexFingerprintMode>("off");
   const [editTimezone, setEditTimezone] = useState("");
   const [editTimezoneCustom, setEditTimezoneCustom] = useState(false);
-  // Turn State 强制注入:注入值 + 限定模型(逗号分隔)。仅 Codex 官方账号下发。
-  const [editCodexTurnState, setEditCodexTurnState] = useState("");
-  const [editCodexTurnStateModels, setEditCodexTurnStateModels] = useState("");
-  // 时效倒计时的时钟源:编辑弹窗打开期间每秒推进一次,关闭即停。
-  const [turnStateNow, setTurnStateNow] = useState(() => Date.now());
   // 代理池条目：账号表单里"从代理池选择"下拉的数据源。加载失败静默留空
   // （选择器为空时自动隐藏，不影响手动填代理）。
   const [proxyPool, setProxyPool] = useState<ProxyRow[]>([]);
@@ -1939,6 +1934,7 @@ export default function Accounts() {
       models: [],
       codex_client_metadata_mode: "auto",
       codex_passthrough_mode: "off",
+      responses_upstream_transport: "http",
       proxy_url: "",
     });
   const [openAIModelDraft, setOpenAIModelDraft] = useState("");
@@ -2038,6 +2034,7 @@ export default function Accounts() {
       models: [],
       codex_client_metadata_mode: "auto",
       codex_passthrough_mode: "off",
+      responses_upstream_transport: "http",
       proxy_url: "",
     });
   const [openAIModelMappingText, setOpenAIModelMappingText] = useState("");
@@ -2268,87 +2265,6 @@ export default function Accounts() {
       </p>
     </div>
   );
-
-  // Turn State 时效:只在编辑弹窗打开且该账号已保存注入值时每秒重算;弹窗关闭清掉 interval。
-  const [reacquiringTurnState, setReacquiringTurnState] = useState<string | null>(null);
-  const reacquireTurnState = async (accountID: number, model: string) => {
-    const key = accountID + ':' + model;
-    setReacquiringTurnState(key);
-    try {
-      await api.reacquireCodexTurnState(accountID, model);
-      showToast(t('accounts.turnStateReacquireQueued'));
-      await reload();
-    } catch (error) {
-      showToast(error instanceof Error ? error.message : String(error));
-    } finally {
-      setReacquiringTurnState(null);
-    }
-  };
-  const savedCodexTurnState = editingAccount?.codex_turn_state ?? "";
-  const turnStateTtlVisible =
-    editingAccount !== null &&
-    isCodexOfficialAccount(editingAccount) &&
-    savedCodexTurnState !== "" &&
-    editCodexTurnState === savedCodexTurnState;
-  useEffect(() => {
-    if (!turnStateTtlVisible) return;
-    setTurnStateNow(Date.now());
-    const timer = window.setInterval(() => setTurnStateNow(Date.now()), 1000);
-    return () => window.clearInterval(timer);
-  }, [turnStateTtlVisible]);
-
-  const renderCodexTurnStateTtl = () => {
-    if (!turnStateTtlVisible) return null;
-    const ttl = computeCodexTurnStateTtl(
-      editingAccount?.codex_turn_state_set_at,
-      turnStateNow,
-    );
-    if (ttl.kind === "unknown") {
-      return (
-        <p className="mt-1.5 text-xs text-muted-foreground">
-          {t("accounts.codexTurnStateTtlUnknown")}
-        </p>
-      );
-    }
-    if (ttl.kind === "expired") {
-      return (
-        <div className="mt-1.5 space-y-0.5">
-          <p className="flex items-center gap-1.5 text-xs font-medium text-red-600 dark:text-red-400">
-            <Timer className="size-3.5" />
-            {t("accounts.codexTurnStateTtlExpired")}
-          </p>
-          <p className="text-xs text-muted-foreground">
-            {t("accounts.codexTurnStateTtlExpiredHint")}
-          </p>
-        </div>
-      );
-    }
-    const barColor = ttl.warning ? "bg-amber-500" : "bg-emerald-500";
-    const textColor = ttl.warning
-      ? "text-amber-600 dark:text-amber-400"
-      : "text-emerald-600 dark:text-emerald-400";
-    return (
-      <div className="mt-1.5 space-y-1">
-        <p
-          className={cn(
-            "flex items-center gap-1.5 text-xs font-medium tabular-nums",
-            textColor,
-          )}
-        >
-          <Timer className="size-3.5" />
-          {t("accounts.codexTurnStateTtlRemaining", {
-            time: formatCodexTurnStateCountdown(ttl.remainingMs),
-          })}
-        </p>
-        <div className="h-1 w-full overflow-hidden rounded-full bg-muted">
-          <div
-            className={cn("h-full rounded-full transition-[width]", barColor)}
-            style={{ width: `${Math.round(ttl.ratio * 100)}%` }}
-          />
-        </div>
-      </div>
-    );
-  };
 
   const renderWorkspaceRouteInput = ({
     value = workspaceRouteID,
@@ -3733,6 +3649,7 @@ export default function Accounts() {
         models: [],
         codex_client_metadata_mode: "auto",
         codex_passthrough_mode: "off",
+        responses_upstream_transport: "http",
         proxy_url: "",
       });
       setOpenAIModelDraft("");
@@ -5663,8 +5580,6 @@ export default function Accounts() {
     setEditTimezoneCustom(
       Boolean(account.timezone && !findClaudeTimezoneOption(account.timezone)),
     );
-    setEditCodexTurnState(account.codex_turn_state ?? "");
-    setEditCodexTurnStateModels(account.codex_turn_state_models ?? "");
     setEditTags(account.tags ?? []);
     setEditGroupIds(account.group_ids ?? []);
     setEditOpenAIForm({
@@ -5677,6 +5592,8 @@ export default function Accounts() {
         account.codex_client_metadata_mode ?? "auto",
       codex_passthrough_mode:
         account.codex_passthrough_mode ?? "off",
+      responses_upstream_transport:
+        account.responses_upstream_transport ?? "http",
       proxy_url: account.proxy_url ?? "",
     });
     setEditOpenAIModelDraft("");
@@ -5724,8 +5641,6 @@ export default function Accounts() {
     setEditCodexFingerprintMode("off");
     setEditTimezone("");
     setEditTimezoneCustom(false);
-    setEditCodexTurnState("");
-    setEditCodexTurnStateModels("");
     setEditTags([]);
     setEditGroupIds([]);
     setEditOpenAIForm({
@@ -5736,6 +5651,7 @@ export default function Accounts() {
       models: [],
       codex_client_metadata_mode: "auto",
       codex_passthrough_mode: "off",
+      responses_upstream_transport: "http",
       proxy_url: "",
     });
     setEditOpenAIModelDraft("");
@@ -5887,8 +5803,6 @@ export default function Accounts() {
           ? {
               codex_fingerprint_mode: editCodexFingerprintMode,
               timezone: editTimezone.trim(),
-              codex_turn_state: editCodexTurnState.trim(),
-              codex_turn_state_models: editCodexTurnStateModels.trim(),
             }
           : {}),
       };
@@ -8195,6 +8109,34 @@ export default function Accounts() {
                   </p>
                 </div>
                 <div>
+                  <label className="block mb-2 text-sm font-semibold text-muted-foreground">
+                    {t("accounts.responsesUpstreamTransport")}
+                  </label>
+                  <Select
+                    value={openAIForm.responses_upstream_transport ?? "http"}
+                    onValueChange={(value) =>
+                      setOpenAIForm((form) => ({
+                        ...form,
+                        responses_upstream_transport:
+                          value as ResponsesUpstreamTransport,
+                      }))
+                    }
+                    options={[
+                      {
+                        value: "http",
+                        label: t("accounts.responsesUpstreamHTTP"),
+                      },
+                      {
+                        value: "websocket",
+                        label: t("accounts.responsesUpstreamWebsocket"),
+                      },
+                    ]}
+                  />
+                  <p className="mt-1.5 text-xs text-muted-foreground">
+                    {t("accounts.responsesUpstreamTransportHint")}
+                  </p>
+                </div>
+                <div>
                   <div className="mb-2 flex items-center justify-between gap-2">
                     <label className="text-sm font-semibold text-muted-foreground">
                       {t("accounts.openaiModels")} *
@@ -9358,6 +9300,34 @@ export default function Accounts() {
                         {t("accounts.codexPassthroughHint")}
                       </p>
                     </div>
+                    <div>
+                      <label className="block mb-2 text-xs font-semibold text-muted-foreground">
+                        {t("accounts.responsesUpstreamTransport")}
+                      </label>
+                      <Select
+                        value={editOpenAIForm.responses_upstream_transport ?? "http"}
+                        onValueChange={(value) =>
+                          setEditOpenAIForm((form) => ({
+                            ...form,
+                            responses_upstream_transport:
+                              value as ResponsesUpstreamTransport,
+                          }))
+                        }
+                        options={[
+                          {
+                            value: "http",
+                            label: t("accounts.responsesUpstreamHTTP"),
+                          },
+                          {
+                            value: "websocket",
+                            label: t("accounts.responsesUpstreamWebsocket"),
+                          },
+                        ]}
+                      />
+                      <p className="mt-1.5 text-xs text-muted-foreground">
+                        {t("accounts.responsesUpstreamTransportHint")}
+                      </p>
+                    </div>
 
                     <div className="rounded-xl border border-border/70 bg-card p-4.5 shadow-2xs space-y-4">
                       <div>
@@ -9965,87 +9935,6 @@ export default function Accounts() {
                               onChange: setEditTimezone,
                               onCustomChange: setEditTimezoneCustom,
                             })}
-                          </div>
-                        ) : null}
-
-                        {/* Turn State 强制注入 */}
-                        {isCodexOfficialAccount(editingAccount) ? (
-                          <div className="rounded-xl border border-border/70 bg-card p-4.5 shadow-2xs hover:border-border/90 transition-colors md:col-span-2">
-                            <div className="flex items-center gap-2 font-semibold text-foreground text-sm">
-                              <Hourglass className="size-4 text-amber-500" />
-                              <span>{t("accounts.codexTurnStateTitle")}</span>
-                            </div>
-                            <div className="mt-2 space-y-2 text-xs">
-                              <CodexTurnStateTicketBadge account={editingAccount} />
-                              {(editingAccount.codex_turn_state_tickets ?? []).map(ticket => (
-                                <div key={ticket.model} className="rounded border p-2 break-words">
-                                  <Button type="button" variant="outline" size="sm" className="float-right ml-2" disabled={reacquiringTurnState !== null || ticket.state === 'refreshing'} onClick={() => void reacquireTurnState(editingAccount.id, ticket.model)}>
-                                    {t('accounts.turnStateReacquire')}
-                                  </Button>
-                                  <strong>{ticket.model}</strong>: {t("accounts.turnStatePhase." + ticket.state, { defaultValue: ticket.state })} {ticket.length ? `(${ticket.length} ${t("accounts.turnStateLength")}${ticket.fernet_blocks ? ` / ${ticket.fernet_blocks} blocks` : ""})` : ""}
-                                  {ticket.proxy_sid && <p>sid: <span className="font-mono">{ticket.proxy_sid}</span></p>}
-                                  {ticket.exit_ip && <p>exit: <span className="font-mono">{ticket.exit_ip}</span></p>}
-                                  {ticket.bound !== undefined && <p>bound: <span className="font-mono">{ticket.bound ? "已绑定出口" : "无绑定出口"}</span></p>}
-                                  {ticket.verified_model && <p>verified model: <span className="font-mono">{ticket.verified_model}</span></p>}
-                                  {ticket.source && <p>source: <span className="font-mono">{ticket.source}</span></p>}
-                                  {ticket.last_error && <p className="text-red-600">{ticket.last_error}</p>}
-                                  {ticket.last_attempt && !ticket.last_attempt.startsWith("0001") && <p>{t("accounts.turnStateLastAttempt")}: {new Date(ticket.last_attempt).toLocaleString()}</p>}
-                                  {ticket.next_attempt && !ticket.next_attempt.startsWith("0001") && <p>{t("accounts.turnStateNextAttempt")}: {new Date(ticket.next_attempt).toLocaleString()}</p>}
-                                </div>
-                              ))}
-                            </div>
-                            <p className="mt-1 text-xs text-muted-foreground leading-relaxed">
-                              {t("accounts.codexTurnStateHint")}
-                            </p>
-                            <div className="mt-3">
-                              <div className="flex items-center justify-between mb-2">
-                                <label className="block text-sm font-semibold text-muted-foreground">
-                                  {t("accounts.codexTurnStateValueLabel")}
-                                </label>
-                                <Button
-                                  type="button"
-                                  variant="outline"
-                                  size="sm"
-                                  disabled={!editCodexTurnState}
-                                  onClick={() => setEditCodexTurnState("")}
-                                >
-                                  {t("accounts.codexTurnStateClear")}
-                                </Button>
-                              </div>
-                              <textarea
-                                className="w-full min-h-[80px] p-3 border border-input rounded-xl bg-background text-sm resize-y font-mono focus:outline-none focus:ring-2 focus:ring-ring"
-                                placeholder={t(
-                                  "accounts.codexTurnStateValuePlaceholder",
-                                )}
-                                value={editCodexTurnState}
-                                onChange={(
-                                  event: ChangeEvent<HTMLTextAreaElement>,
-                                ) => setEditCodexTurnState(event.target.value)}
-                                rows={3}
-                                spellCheck={false}
-                              />
-                              {renderCodexTurnStateTtl()}
-                            </div>
-                            <div className="mt-3">
-                              <label className="block text-sm font-semibold text-muted-foreground mb-2">
-                                {t("accounts.codexTurnStateModelsLabel")}
-                              </label>
-                              <Input
-                                value={editCodexTurnStateModels}
-                                placeholder={t(
-                                  "accounts.codexTurnStateModelsPlaceholder",
-                                )}
-                                onChange={(
-                                  event: ChangeEvent<HTMLInputElement>,
-                                ) =>
-                                  setEditCodexTurnStateModels(event.target.value)
-                                }
-                                spellCheck={false}
-                              />
-                              <p className="mt-1.5 text-xs text-muted-foreground">
-                                {t("accounts.codexTurnStateModelsHint")}
-                              </p>
-                            </div>
                           </div>
                         ) : null}
 
@@ -13088,6 +12977,7 @@ function formatPlanLabel(planType?: string): string {
   const lower = raw.toLowerCase();
   if (lower === "prolite" || lower === "pro_lite" || lower === "pro-lite")
     return "ProLite";
+  if (lower === "self_serve_business_prolite") return "team5x";
   return raw;
 }
 
@@ -13130,7 +13020,11 @@ function PlanBadge({
 
   const normalized = normalizePlanType(planType);
   const key =
-    normalized === "pro" && label === "ProLite" ? "prolite" : normalized;
+    normalized === "pro" && label === "ProLite"
+      ? "prolite"
+      : label === "team5x"
+        ? "team"
+        : normalized;
   const cls =
     style[key] ||
     "bg-slate-100 text-slate-600 ring-slate-400/20 dark:bg-slate-500/15 dark:text-slate-300 dark:ring-slate-400/20";

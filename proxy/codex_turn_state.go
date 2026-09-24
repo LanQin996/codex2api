@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"net/http"
 	"strings"
 	"sync"
@@ -39,7 +40,7 @@ var (
 // 并记录铸造账号与该次尝试的绑定出口。上游没有该头时主动清除 writer 上可能残留的
 // 上一 failover attempt 的值——否则换号重试后旧账号的 blob 会粘到新账号的响应上,正是本
 // 文件要防止的跨账号矛盾。(流式响应一旦提交,对 writer 头的改动是无害空操作。)
-func relayCodexTurnStateResponseHeader(c *gin.Context, affinityKey string, account *auth.Account, headers http.Header, proxyURL string) {
+func relayCodexTurnStateResponseHeader(c *gin.Context, affinityKey string, account *auth.Account, model string, headers http.Header) {
 	if c == nil {
 		return
 	}
@@ -61,7 +62,7 @@ func relayCodexTurnStateResponseHeader(c *gin.Context, affinityKey string, accou
 // a later failover may use another account. If a heartbeat already committed
 // the response, no documented Responses event is equivalent to this header, so
 // the token is intentionally omitted instead of leaking stale account state.
-func (h *Handler) commitResponsesStreamAttempt(c *gin.Context, attempt *continuousRetryStreamAttempt, affinityKey string, account *auth.Account, headers http.Header, boundProxy string) error {
+func (h *Handler) commitResponsesStreamAttempt(c *gin.Context, attempt *continuousRetryStreamAttempt, affinityKey string, account *auth.Account, model string, headers http.Header) error {
 	if attempt == nil {
 		return h.commitStreamAttempt(c, attempt)
 	}
@@ -116,39 +117,49 @@ func guardCodexTurnStateEcho(affinityKey string, account *auth.Account, headers 
 	}
 }
 
-// codexTurnStateOriginForAffinity 读取该下游会话的溯源记录,过期记录当场删除。
-func codexTurnStateOriginForAffinity(affinityKey string) (codexTurnStateOrigin, bool) {
-	affinityKey = strings.TrimSpace(affinityKey)
-	if affinityKey == "" {
-		return codexTurnStateOrigin{}, false
+type codexTurnStateAffinityContextKey struct{}
+
+// WithCodexTurnStateAffinityKey attaches the session affinity key used by
+// turn-state echo guarding so WebSocket executors can read it from ctx.
+func WithCodexTurnStateAffinityKey(ctx context.Context, affinityKey string) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	raw, ok := codexTurnStateOrigins.Load(affinityKey)
-	if !ok {
-		return codexTurnStateOrigin{}, false
-	}
-	origin, ok := raw.(codexTurnStateOrigin)
-	if !ok {
-		codexTurnStateOrigins.Delete(affinityKey)
-		return codexTurnStateOrigin{}, false
-	}
-	if !origin.expiresAt.IsZero() && time.Now().After(origin.expiresAt) {
-		codexTurnStateOrigins.Delete(affinityKey)
-		return codexTurnStateOrigin{}, false
-	}
-	return origin, true
+	return context.WithValue(ctx, codexTurnStateAffinityContextKey{}, strings.TrimSpace(affinityKey))
 }
 
-// codexTurnStateProxyForAffinity 返回该下游会话最近一次下发的 blob 所用的绑定出口,
-// 空串表示无溯源记录或上次下发没有绑定出口。注入侧据此把回带值发回同一条出口。
-func codexTurnStateProxyForAffinity(affinityKey string) string {
-	origin, ok := codexTurnStateOriginForAffinity(affinityKey)
-	if !ok {
+// CodexTurnStateAffinityKeyFromContext returns the affinity key set by
+// WithCodexTurnStateAffinityKey, or "" when absent.
+func CodexTurnStateAffinityKeyFromContext(ctx context.Context) string {
+	if ctx == nil {
 		return ""
 	}
-	return strings.TrimSpace(origin.proxyURL)
+	v, _ := ctx.Value(codexTurnStateAffinityContextKey{}).(string)
+	return v
 }
 
-func noteCodexTurnStateProvenance(affinityKey string, account *auth.Account, proxyURL string) {
+// GuardCodexTurnStateEcho strips client-echoed turn-state known to have been
+// minted by a different account for this session. Safe no-op when affinityKey
+// is empty or provenance is missing.
+func GuardCodexTurnStateEcho(affinityKey string, account *auth.Account, headers http.Header) {
+	guardCodexTurnStateEcho(affinityKey, account, headers)
+}
+
+// NoteCodexTurnStateProvenance records which account minted turn-state for
+// affinityKey. Exported so WS-path tests can seed provenance.
+func NoteCodexTurnStateProvenance(affinityKey string, account *auth.Account) {
+	noteCodexTurnStateProvenance(affinityKey, account)
+}
+
+// ClearCodexTurnStateProvenance removes a provenance entry (tests / cleanup).
+func ClearCodexTurnStateProvenance(affinityKey string) {
+	if strings.TrimSpace(affinityKey) == "" {
+		return
+	}
+	codexTurnStateOrigins.Delete(affinityKey)
+}
+
+func noteCodexTurnStateProvenance(affinityKey string, account *auth.Account) {
 	if strings.TrimSpace(affinityKey) == "" || account == nil || account.ID() <= 0 {
 		return
 	}

@@ -189,19 +189,8 @@
 .quality-test-preset-dialog .quality-test-fields textarea { min-height: 180px; }
 @media (prefers-reduced-motion: reduce) { .quality-test-progress span { animation: none; width: 100%; } }
 
-/* Latest-account gallery and persistent batch controls. */
-.quality-test-gallery-toolbar{display:flex;align-items:center;justify-content:space-between;gap:16px;margin:16px 0}.quality-test-gallery-toolbar p{color:var(--color-muted-foreground);font-size:13px}
-.quality-test-gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,300px),1fr));gap:18px;padding:16px 0}
-.quality-test-result-card{min-width:0;border:1px solid var(--color-border);border-radius:16px;padding:16px;background:var(--color-card,var(--color-background));display:flex;flex-direction:column;gap:12px}
-.quality-test-result-card header{display:flex;flex-direction:column;gap:4px}.quality-test-result-card header strong{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.quality-test-result-card header span,.quality-test-result-card time{font-size:12px;color:var(--color-muted-foreground)}
-.quality-test-card-config{display:flex;flex-wrap:wrap;gap:6px;font-size:12px;min-height:40px;align-content:flex-start;overflow-wrap:anywhere}.quality-test-card-config span{padding:3px 7px;border-radius:6px;background:var(--color-muted)}
-.quality-test-card-preview{height:260px;overflow:hidden;border-radius:12px;background:var(--color-muted);display:flex;align-items:center;justify-content:center;color:var(--color-muted-foreground);font-size:13px}.quality-test-card-preview iframe{width:100%;height:100%;border:0;background:white}
-.quality-test-card-status{display:flex;align-items:center;justify-content:space-between;font-size:12px}.quality-test-result-card footer{display:flex;flex-wrap:wrap;gap:6px;margin-top:auto}.quality-test-card-error{font-size:12px;color:var(--color-destructive);overflow-wrap:anywhere;max-height:100px;overflow:auto}
-.quality-test-status.queued{color:var(--color-muted-foreground)}
-.quality-test-batch-progress{display:flex;flex-wrap:wrap;align-items:center;gap:12px;padding:14px;border:1px solid var(--color-border);border-radius:12px;margin-bottom:16px;font-size:12px}.quality-test-batch-progress>div{display:flex;flex-wrap:wrap;gap:12px}.quality-test-batch-progress details{width:100%;max-height:160px;overflow:auto}
-.quality-test-batch-panel[data-slot="sheet-content"] { width: min(560px, calc(100vw - 2rem)); max-width: calc(100vw - 2rem); }
-.quality-test-batch-panel .quality-test-batch-fields { min-width: 0; margin-top: 0; }
-.quality-test-batch-panel [data-slot="sheet-body"] { overscroll-behavior: contain; }
-.quality-test-batch-panel .quality-test-batch-selection { flex-wrap: wrap; }
-.quality-test-batch-fields{display:flex;flex-direction:column;gap:14px;margin-top:20px}.quality-test-batch-fields>label{display:flex;flex-direction:column;gap:8px;font-size:13px}.quality-test-batch-fields textarea{border:1px solid var(--color-border);border-radius:8px;padding:10px;background:var(--color-background);resize:vertical}.quality-test-batch-selection{display:flex;align-items:center;gap:8px;font-size:12px}.quality-test-batch-accounts{max-height:280px;overflow:auto;border:1px solid var(--color-border);border-radius:8px}.quality-test-batch-accounts label{display:flex;align-items:center;gap:12px;padding:10px;border-bottom:1px solid var(--color-border);cursor:pointer}.quality-test-batch-accounts label span{min-width:0;overflow-wrap:anywhere}.quality-test-batch-accounts small{display:block;color:var(--color-muted-foreground)}.quality-test-batch-summary{padding:12px;background:var(--color-muted);border-radius:8px;font-size:13px;overflow-wrap:anywhere}
-@media(min-width:1600px){.quality-test-gallery{grid-template-columns:repeat(4,minmax(0,1fr))}}@media(max-width:640px){.quality-test-gallery-toolbar{align-items:flex-start}.quality-test-gallery-toolbar p{max-width:60%}.quality-test-gallery{grid-template-columns:1fr}}
+.turn-state-history tbody tr { cursor: default; }
+.turn-state-history-proxy, .turn-state-history-expiry { display: flex; flex-direction: column; gap: 5px; }
+.turn-state-history-proxy code { font-size: 11px; }
+.turn-state-history-proxy small { color: var(--color-muted-foreground); font-size: 10px; }
+.turn-state-history-reason { white-space: normal; min-width: 160px; max-width: 260px; line-height: 1.6; }
