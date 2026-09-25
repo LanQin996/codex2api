@@ -8,11 +8,56 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/tidwall/gjson"
 )
+
+func TestExcelStreamingTimeoutAndCancellation(t *testing.T) {
+	if excelRequestClient(true).Timeout != 0 || excelRequestClient(false).Timeout != 300*time.Second {
+		t.Fatal("incorrect streaming or non-streaming timeout")
+	}
+	if excelRequestClient(true).Transport.(*http.Transport).ResponseHeaderTimeout != 300*time.Second {
+		t.Fatal("missing header timeout")
+	}
+	original := excelBridgeClient
+	short := *original
+	short.Timeout = 20 * time.Millisecond
+	excelBridgeClient = &short
+	defer func() { excelBridgeClient = original }()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		select {
+		case <-time.After(80 * time.Millisecond):
+			w.Write([]byte("alive"))
+			w.(http.Flusher).Flush()
+		case <-r.Context().Done():
+			return
+		}
+		<-r.Context().Done()
+	}))
+	defer server.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
+	resp, err := excelRequestClient(true).Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	buf := make([]byte, 5)
+	if _, err := io.ReadFull(resp.Body, buf); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if _, err := io.ReadAll(resp.Body); err == nil {
+		t.Fatal("caller cancellation ignored")
+	}
+}
 
 func TestExcelContinuationPinnedAcrossOverflow(t *testing.T) {
 	for _, kind := range []string{"function_call", "custom_tool_call", "function_call_output", "custom_tool_call_output"} {

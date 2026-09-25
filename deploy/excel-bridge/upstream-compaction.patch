@@ -1,5 +1,5 @@
 diff --git a/excel_upstream.py b/excel_upstream.py
-index 26c24e6..34ddeca 100644
+index 26c24e6..d45bb62 100644
 --- a/excel_upstream.py
 +++ b/excel_upstream.py
 @@ -763,7 +763,7 @@ def _client_tool_protocol_instructions(source: dict) -> str:
@@ -11,20 +11,30 @@ index 26c24e6..34ddeca 100644
          "For a custom tool, code instead contains "
          '{"name":"TOOL_NAME","input":"RAW_INPUT"}. '
          "Do not put JavaScript, OfficeJS, a second run_officejs envelope, or a "
-@@ -786,6 +786,20 @@ def _client_tool_protocol_instructions(source: dict) -> str:
+@@ -786,6 +786,30 @@ def _client_tool_protocol_instructions(source: dict) -> str:
      )
  
  
++def _client_tool_named(source: dict, name: str, kind: str) -> str | None:
++    allowed = client_tool_types(source)
++    for key, leaf, _namespace, tool_type, _tool in _iter_client_tools(source.get("tools")):
++        if leaf == name and tool_type == kind and key in allowed:
++            return key
++    return None
++
++
 +def _client_tool_transport_example(source: dict) -> str:
 +    allowed = client_tool_types(source)
-+    if allowed.get("exec") == "custom":
-+        return json.dumps({"name": "exec", "input":
++    exec_name = _client_tool_named(source, "exec", "custom")
++    if exec_name:
++        return json.dumps({"name": exec_name, "input":
 +            "text(ALL_TOOLS.filter(t => /exec_command|shell_command|apply_patch/.test(t.name)));"},
 +            separators=(",", ":"))
 +    for name in ("exec_command", "shell_command"):
-+        if name in allowed:
++        actual_name = _client_tool_named(source, name, "function")
++        if actual_name:
 +            field = "cmd" if name == "exec_command" else "command"
-+            return json.dumps({"name": name, "arguments": {field: "pwd"}},
++            return json.dumps({"name": actual_name, "arguments": {field: "pwd"}},
 +                              separators=(",", ":"))
 +    return "Use an exact tool name and schema from the current catalog."
 +
@@ -32,7 +42,7 @@ index 26c24e6..34ddeca 100644
  def _client_tool_protocol_reminder(source: dict) -> str:
      """Compact protocol cue that stays inside the cached prompt prefix.
  
-@@ -810,11 +824,22 @@ def _client_tool_protocol_reminder(source: dict) -> str:
+@@ -810,11 +834,22 @@ def _client_tool_protocol_reminder(source: dict) -> str:
          "below. Never set the inner name to run_officejs or functions.run_officejs, "
          "and never nest another transport envelope. The code field is not JavaScript; serialize "
          "the inner JSON and escape backslashes and quotes in shell commands. Example inner code: "
@@ -42,7 +52,7 @@ index 26c24e6..34ddeca 100644
          + ", ".join(sorted(allowed_tools))
          + ". Other native tools are unavailable."
      )
-+    if allowed_tools.get("exec") == "custom":
++    if _client_tool_named(source, "exec", "custom"):
 +        reminder += (
 +            " The custom exec tool is a live orchestration tool, not historical data. "
 +            "Its tools object exposes nested shell and filesystem tools; discover them "
@@ -56,7 +66,7 @@ index 26c24e6..34ddeca 100644
      if "shell_command" in allowed_tools:
          reminder += " For repository inspection transport shell_command."
      elif "exec_command" in allowed_tools:
-@@ -1436,6 +1461,15 @@ def translate_input_items(
+@@ -1436,6 +1471,15 @@ def translate_input_items(
                  result.append(item)
              continue
          if item_type in {"function_call_output", "custom_tool_call_output"}:
@@ -72,3 +82,29 @@ index 26c24e6..34ddeca 100644
              result.append(_normalized_tool_output(item, call_origins))
              continue
          if item_type == "reasoning":
+@@ -1583,7 +1627,7 @@ def prepare_responses_body(
+     if CATALOG_AT_PROMPT_END:
+         input_items = _append_before_terminal_compaction_trigger(
+             prologue + input_items,
+-            [catalog],
++            [catalog, _message_item("developer", _client_tool_protocol_reminder(source))],
+         )
+     else:
+         prologue.append(catalog)
+@@ -1594,6 +1638,16 @@ def prepare_responses_body(
+             # turn and force the upstream cache to stop at that earlier byte.
+             prologue.append(_message_item("developer", reminder))
+         input_items = prologue + input_items
++    # Opaque compaction can retain stale capability conclusions. Place the
++    # current protocol after that state, once at the compaction boundary,
++    # rather than appending a cache-breaking reminder on every tool turn.
++    if not CATALOG_AT_PROMPT_END:
++        compact_positions = [i for i, item in enumerate(input_items)
++                             if isinstance(item, dict) and item.get("type") == "compaction"]
++        reminder = _client_tool_protocol_reminder(source)
++        if compact_positions and reminder:
++            input_items.insert(compact_positions[-1] + 1,
++                               _message_item("developer", reminder))
+     output["input"] = input_items
+ 
+     cache_key = _cache_key(source)

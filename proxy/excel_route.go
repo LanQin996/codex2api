@@ -24,7 +24,18 @@ import (
 var excelBridgeClient = &http.Client{
 	Timeout:       300 * time.Second,
 	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
-	Transport:     &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 32},
+	Transport:     &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 32, ResponseHeaderTimeout: 300 * time.Second},
+}
+
+func excelRequestClient(stream bool) *http.Client {
+	if !stream {
+		return excelBridgeClient
+	}
+	// Total client timeouts include body reads and truncate healthy long SSE.
+	// Retain response-header timeout and caller cancellation for streams.
+	client := *excelBridgeClient
+	client.Timeout = 0
+	return &client
 }
 
 type excelMigrationContextKey struct{}
@@ -210,5 +221,5 @@ func executeExcelRequest(ctx context.Context, account *auth.Account, body []byte
 	}
 	// Do not use traced upstream transport: this internal hop contains a token
 	// in a private header. Account admission/release remains in the handler.
-	return excelBridgeClient.Do(req)
+	return excelRequestClient(gjson.GetBytes(body, "stream").Bool()).Do(req)
 }

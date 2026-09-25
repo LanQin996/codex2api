@@ -28,6 +28,42 @@ def test_exec_only_catalog_uses_callable_discovery_example():
     assert module._client_tool_transport_example(body) in module._client_tool_protocol_instructions(body)
 
 
+@pytest.mark.parametrize("catalog_at_end", [False, True])
+def test_compaction_refreshes_live_tool_protocol(monkeypatch, catalog_at_end):
+    source = os.environ.get("EXCEL_UPSTREAM_SOURCE")
+    if not source:
+        pytest.skip("Set EXCEL_UPSTREAM_SOURCE")
+    sys.path.insert(0, source)
+    module = importlib.import_module("excel_upstream")
+    monkeypatch.setattr(module, "CATALOG_AT_PROMPT_END", catalog_at_end)
+    compact = {"type": "compaction", "encrypted_content": "opaque"}
+    body = {"model": "gpt-5.6-sol-excel", "tools": [{"type": "custom", "name": "exec"}],
+            "input": [compact, {"role": "user", "content": "continue"}]}
+    wire = module.prepare_responses_body(body)["input"]
+    after = wire[wire.index(compact) + 1:]
+    assert any(x.get("role") == "developer" and
+               "nested shell and filesystem tools" in json.dumps(x) for x in after)
+    if not catalog_at_end:
+        body["input"].append({"role": "assistant", "content": "working"})
+        assert module.prepare_responses_body(body)["input"][:len(wire)] == wire
+
+
+def test_new_session_namespaced_exec_discovery():
+    source = os.environ.get("EXCEL_UPSTREAM_SOURCE")
+    if not source:
+        pytest.skip("Set EXCEL_UPSTREAM_SOURCE")
+    sys.path.insert(0, source)
+    module = importlib.import_module("excel_upstream")
+    body = {"tools": [{"type": "namespace", "name": "functions",
+                       "tools": [{"type": "custom", "name": "exec"}]}],
+            "input": [{"role": "user", "content": "inspect the repository"}]}
+    example = json.loads(module._client_tool_transport_example(body))
+    assert example["name"] == "functions.exec"
+    assert "ALL_TOOLS" in example["input"]
+    assert "nested shell and filesystem tools" in json.dumps(module.prepare_responses_body(body))
+    assert module._client_tool_protocol_reminder({**body, "tool_choice": "none"}) == ""
+
+
 def test_reset_turn_state_preserves_unrelated_metadata():
     from bridge import reset_client_turn_state
     body = {"metadata": {"task_id": "stale", "turn_id": "changing",
@@ -292,6 +328,34 @@ def test_compacted_result_recovers_only_from_exact_checkpoint(tmp_path):
         for bad in [[{**result, "output": "changed"}], [result, result], [call]]:
             with pytest.raises(ValueError):
                 replay_checkpoint({"input": bad}, cache, scope)
+    finally:
+        cache.close()
+
+
+def test_migration_replays_compacted_checkpoint_before_new_pairs(tmp_path):
+    from bridge import NativeCallStore, migrate_completed_history
+    scope = ("21", "session", "generation")
+    call = {"type": "function_call", "call_id": "old", "name": "read", "arguments": "{}"}
+    result = {"type": "function_call_output", "call_id": "old", "output": "done"}
+    cache = NativeCallStore(tmp_path / "mixed.db")
+    try:
+        first = migrate_completed_history({"input": [call, result]}, cache, scope)
+        compact = {"type": "compaction", "encrypted_content": "opaque"}
+        new_call = {**call, "call_id": "new"}
+        new_result = {**result, "call_id": "new"}
+        body = {"input": [compact, result, new_call, new_result]}
+        rebuilt = migrate_completed_history(body, cache, scope)
+        assert rebuilt["_excel_checkpoint"] == first["_excel_checkpoint"]
+        assert rebuilt["input"][0] == compact
+        assert len(rebuilt["input"]) == 3
+        assert body["input"] == [compact, result, new_call, new_result]
+        assert migrate_completed_history(body, cache, scope) == rebuilt
+        for bad in [[compact, {**result, "output": "changed"}, new_call, new_result],
+                    [compact, result, {**new_call, "call_id": "pending"}]]:
+            with pytest.raises(ValueError):
+                migrate_completed_history({"input": bad}, cache, scope)
+        with pytest.raises(ValueError):
+            migrate_completed_history(body, cache, ("other", "session", "generation"))
     finally:
         cache.close()
 

@@ -248,6 +248,17 @@ def install_wire_diagnostics(backend):
 
     def prepare(*args, **kwargs):
         body = original(*args, **kwargs)
+        source = args[0] if args else kwargs.get("source", {})
+        source = source if isinstance(source, dict) else {}
+        parser = getattr(backend.excel_upstream, "client_tool_types", None)
+        if parser is not None:
+            tools = source.get("tools")
+            parsed = parser(source)
+            logger.info(
+                "excel_tool_catalog present=%s raw_count=%d callable_count=%d disabled=%s",
+                "tools" in source, len(tools) if isinstance(tools, list) else 0,
+                len(parsed), source.get("tool_choice") == "none",
+            )
         request_wire_shape.set(wire_shape(body))
         request_cache_diagnostic.set(cache_diagnostic_snapshot(body))
         return body
@@ -291,7 +302,7 @@ TOOL_CALL_TYPES = {"function_call", "custom_tool_call"}
 TOOL_RESULT_TYPES = {"function_call_output", "custom_tool_call_output"}
 
 
-def completed_tool_pairs(items):
+def completed_tool_pairs(items, *, allow_empty=False):
     """Require ordered, unique calls and results; never guess pending outcomes."""
     if not isinstance(items, list):
         raise ValueError("Full tool history is required")
@@ -325,7 +336,7 @@ def completed_tool_pairs(items):
             if kind != expected or not isinstance(item["output"], (str, list)):
                 raise ValueError("Invalid tool result")
             results[call_id] = item
-    if not calls or calls.keys() != results.keys():
+    if (not calls and not allow_empty) or calls.keys() != results.keys():
         raise ValueError("Outstanding tool executions prevent migration")
     return calls, results
 
@@ -336,7 +347,13 @@ def migrate_completed_history(body, cache, scope):
     No client tool is executed by this operation. Client-supplied results retain
     user-level trust and must not be promoted to developer/system instructions.
     """
-    calls, results = completed_tool_pairs(body.get("input"))
+    # Verify retained checkpoint results before validating newly visible pairs.
+    body = replay_checkpoint(body, cache, scope)
+    history = body.get("input")
+    calls, results = completed_tool_pairs(
+        history, allow_empty=bool(cache.checkpoint_items(scope)))
+    if not calls:
+        return body
     checkpoint = {
         call_id: json.dumps({"call": call, "result": results[call_id]},
                             ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -829,7 +846,16 @@ def create_app(backend, key, session_path, *, scoped=False):
                         logger.info("excel_history_migrated account=%s", account)
                     else:
                         body = replay_checkpoint(body, cache, request_scope.get())
-                except ValueError:
+                except ValueError as exc:
+                    reasons = {
+                        "Checkpoint history changed": "history_changed",
+                        "Orphan, duplicate or incomplete tool result": "orphan_or_duplicate_result",
+                        "Outstanding tool executions prevent migration": "outstanding_calls",
+                        "Opaque history cannot migrate": "opaque_reference",
+                        "Invalid compaction state": "invalid_compaction",
+                    }
+                    logger.warning("excel_checkpoint_conflict account=%s reason=%s",
+                                   account, reasons.get(str(exc), "invalid_history"))
                     return error(409, "Excel checkpoint conflicts with supplied history")
             # Never fabricate native identities. Durable records survive restarts,
             # while credential, account and session isolation remain intact.
