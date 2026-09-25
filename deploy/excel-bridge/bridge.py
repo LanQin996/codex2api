@@ -354,6 +354,7 @@ async def observe_tool_stream(stream, trace, stage):
         logger.warning("excel_tool_stream %s", json.dumps({
             "trace": trace, "stage": stage, "completed_call_events": counts,
             "terminal": terminal, "oversized_lines": oversized,
+            "observation_complete": oversized == 0 and not pending and not dropping,
         }, sort_keys=True))
 
 
@@ -1064,6 +1065,10 @@ def create_app(backend, key, session_path, *, scoped=False):
         response = await backend._handle_excel_responses(request, body)
         log_upstream_failure(response, body, account if scoped else "session_file")
         return response
+
+    @app.post("/v1/responses/compact")
+    async def unsupported_compact(request: Request):
+        return error(400, "Excel does not support /responses/compact; use inline compaction on /responses")
 
     @app.post("/internal/history-owner")
     async def history_owner(request: Request):

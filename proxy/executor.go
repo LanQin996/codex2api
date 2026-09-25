@@ -1089,6 +1089,9 @@ func ExecuteOpenAIResponsesCompactRequest(ctx context.Context, account *auth.Acc
 
 // ExecuteCompactRequest 向 Codex 上游发送 /responses/compact 请求（非流式压缩接口）
 func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBody []byte, sessionID string, proxyOverride string, apiKey string, deviceCfg *DeviceProfileConfig, headers http.Header) (upstreamResponse *http.Response, upstreamErr error) {
+	if auth.IsExcelModel(gjson.GetBytes(requestBody, "model").String()) {
+		return nil, ErrBadRequest("Excel does not support /responses/compact; use inline compaction on /responses")
+	}
 	if account == nil || account.IsRelayStyle() {
 		return nil, ErrNoAvailableAccount()
 	}

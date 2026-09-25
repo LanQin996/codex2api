@@ -702,6 +702,31 @@ def test_missing_key_rejected():
     with pytest.raises(RuntimeError):
         create_app(None, "", "unused")
 
+def test_dedicated_compact_rejected_without_upstream(setup):
+    client, _, _, calls = setup
+    path = "/v1/responses/compact"
+    assert client.post(path).status_code == 401
+    result = client.post(path, headers=AUTH, json={"model": "test-excel"})
+    assert result.status_code == 400
+    assert "does not support /responses/compact" in result.text
+    assert not calls
+
+def test_oversized_terminal_observation_is_incomplete(caplog):
+    import asyncio
+    from bridge import observe_tool_stream
+    raw = b"data: " + json.dumps({"type": "response.completed", "secret": "x" * 70000}).encode() + bytes([10, 10])
+    async def source():
+        for i in range(0, len(raw), 137):
+            yield raw[i:i+137]
+    async def collect():
+        return b"".join([c async for c in observe_tool_stream(source(), "test", "client")])
+    assert asyncio.run(collect()) == raw
+    record = json.loads(caplog.records[-1].getMessage().split("excel_tool_stream ", 1)[1])
+    assert record["terminal"] is None
+    assert record["observation_complete"] is False
+    assert record["oversized_lines"] == 1
+    assert "secret" not in caplog.text
+
 
 @pytest.mark.parametrize("body", [[], None, {"model": "copilot"}, {"model": "test-excel", "stream": "false"},
                                         {"model": "test-excel", "previous_response_id": "resp_old"}])

@@ -1,8 +1,160 @@
 diff --git a/excel_upstream.py b/excel_upstream.py
-index 26c24e6..b705035 100644
+index 26c24e6..0e8d770 100644
 --- a/excel_upstream.py
 +++ b/excel_upstream.py
-@@ -763,7 +763,7 @@ def _client_tool_protocol_instructions(source: dict) -> str:
+@@ -249,9 +249,12 @@ def _iter_client_tools(tools: object, namespace: str | None = None):
+             yield from _iter_client_tools(tool.get("tools"), name.strip())
+ 
+ 
+-def client_tool_types(source: dict) -> dict[str, str]:
+-    if str(source.get("tool_choice") or "").strip().lower() == "none":
+-        return {}
++class ClientToolChoiceError(ValueError):
++    pass
++
++
++def all_client_tool_types(source: dict) -> dict[str, str]:
++    # History identity does not depend on this turn's execution permissions.
+     result: dict[str, str] = {}
+     for key, _name, _namespace, tool_type, _tool in _iter_client_tools(
+         source.get("tools")
+@@ -260,6 +263,50 @@ def client_tool_types(source: dict) -> dict[str, str]:
+     return result
+ 
+ 
++def _client_tool_selection(source: dict) -> tuple[dict[str, str], bool]:
++    catalog = all_client_tool_types(source)
++    choice = source.get("tool_choice")
++    if choice is None or choice == "auto":
++        return catalog, False
++    if choice == "none":
++        return {}, False
++    if choice == "required":
++        if not catalog:
++            raise ClientToolChoiceError("required tool_choice has no available client tools")
++        return catalog, True
++    if not isinstance(choice, dict):
++        raise ClientToolChoiceError("unsupported tool_choice")
++    if choice.get("type") == "allowed_tools":
++        mode, choices = choice.get("mode"), choice.get("tools")
++        if mode not in ("auto", "required") or not isinstance(choices, list) or not choices:
++            raise ClientToolChoiceError("allowed_tools requires a mode and non-empty tool list")
++        required = mode == "required"
++    else:
++        choices, required = [choice], True
++    selected = {}
++    for item in choices:
++        if not isinstance(item, dict):
++            raise ClientToolChoiceError("invalid tool_choice selector")
++        kind, name, namespace = item.get("type"), item.get("name"), item.get("namespace")
++        if kind not in ("function", "custom") or not isinstance(name, str) or not name:
++            raise ClientToolChoiceError("tool_choice must identify a function or custom tool")
++        if namespace is not None and (not isinstance(namespace, str) or not namespace):
++            raise ClientToolChoiceError("invalid tool_choice namespace")
++        key = _client_tool_key(name, namespace)
++        if catalog.get(key) != kind:
++            raise ClientToolChoiceError("tool_choice selects an unavailable client tool")
++        selected[key] = kind
++    return selected, required
++
++
++def client_tool_types(source: dict) -> dict[str, str]:
++    return _client_tool_selection(source)[0]
++
++
++def client_tool_call_required(source: dict) -> bool:
++    return _client_tool_selection(source)[1]
++
++
+ def relay_tool_name(name: str) -> str:
+     """Return the legacy non-colliding marker name used before run_officejs."""
+     return CLIENT_TOOL_RELAY_PREFIX + name
+@@ -587,6 +634,8 @@ def _restore_native_function_arguments(name: str, arguments: object) -> object:
+ def extract_native_client_tool_call(
+     response: dict | None,
+     source: dict,
++    *,
++    remember: bool = True,
+ ) -> dict[str, str] | None:
+     if not isinstance(response, dict):
+         return None
+@@ -607,11 +656,14 @@ def extract_native_client_tool_call(
+     envelope = _transport_envelope(native)
+     if _is_transport_name(native.get("name")) and envelope is None:
+         return None
+-    name = (
+-        _original_client_tool_name(envelope.get("name"), allowed_tools)
+-        if envelope is not None
+-        else _original_client_tool_name(native.get("name"), allowed_tools)
+-    )
++    native_name = native.get("name")
++    namespace = native.get("namespace")
++    if namespace is not None and not isinstance(namespace, str):
++        return None
++    if isinstance(native_name, str):
++        native_name = _client_tool_key(native_name, namespace)
++    name = _original_client_tool_name(
++        envelope.get("name") if envelope is not None else native_name, allowed_tools)
+     if name is None or name not in specs:
+         return None
+     tool_info = specs[name]
+@@ -653,7 +705,8 @@ def extract_native_client_tool_call(
+             else f"{NATIVE_FALLBACK_CALL_ID_PREFIX}{uuid4().hex}"
+         )
+         native_item_id = native.get("id")
+-        _remember_native_call(native)
++        if remember:
++            _remember_native_call(native)
+         result = {
+             "type": "function_call",
+             "id": (
+@@ -689,8 +742,9 @@ def extract_native_client_tool_call(
+             else f"{NATIVE_FALLBACK_CALL_ID_PREFIX}{uuid4().hex}"
+         )
+         native_item_id = native.get("id")
+-        _remember_native_call(native)
+-        return {
++        if remember:
++            _remember_native_call(native)
++        result = {
+             "type": "custom_tool_call",
+             "id": (
+                 native_item_id
+@@ -702,9 +756,12 @@ def extract_native_client_tool_call(
+                 else f"ctc_{call_id}"
+             ),
+             "call_id": call_id,
+-            "name": name,
++            "name": tool_info["name"],
+             "input": custom_input,
+         }
++        if tool_info["namespace"]:
++            result["namespace"] = tool_info["namespace"]
++        return result
+     return None
+ 
+ 
+@@ -717,6 +774,8 @@ def _client_tool_protocol_instructions(source: dict) -> str:
+     for key, name, namespace, tool_type, tool in _iter_client_tools(
+         source.get("tools")
+     ):
++        if key not in allowed_tools:
++            continue
+         entry: dict[str, object] = {
+             "type": tool_type,
+             "name": key,
+@@ -745,6 +804,10 @@ def _client_tool_protocol_instructions(source: dict) -> str:
+         separators=(",", ":"),
+         ensure_ascii=False,
+     )
++    if client_tool_call_required(source):
++        catalog_json += " At least one permitted client tool must be called in this response."
++    if source.get("parallel_tool_calls") is False:
++        catalog_json += " Call at most one client tool in this response."
+     return (
+         "This request is relayed by an external Codex Responses API client, not "
+         "by the live Excel workbook. This proxy instruction supersedes any earlier "
+@@ -763,7 +826,7 @@ def _client_tool_protocol_instructions(source: dict) -> str:
          "client tool. The inner name is never run_officejs or functions.run_officejs. "
          "For a function tool, use this shape: outer arguments include summary, "
          "extended_summary, destructive=false, references=[], and code equal to "
@@ -11,7 +163,7 @@ index 26c24e6..b705035 100644
          "For a custom tool, code instead contains "
          '{"name":"TOOL_NAME","input":"RAW_INPUT"}. '
          "Do not put JavaScript, OfficeJS, a second run_officejs envelope, or a "
-@@ -786,6 +786,30 @@ def _client_tool_protocol_instructions(source: dict) -> str:
+@@ -786,6 +849,30 @@ def _client_tool_protocol_instructions(source: dict) -> str:
      )
  
  
@@ -42,7 +194,7 @@ index 26c24e6..b705035 100644
  def _client_tool_protocol_reminder(source: dict) -> str:
      """Compact protocol cue that stays inside the cached prompt prefix.
  
-@@ -810,11 +834,22 @@ def _client_tool_protocol_reminder(source: dict) -> str:
+@@ -810,11 +897,22 @@ def _client_tool_protocol_reminder(source: dict) -> str:
          "below. Never set the inner name to run_officejs or functions.run_officejs, "
          "and never nest another transport envelope. The code field is not JavaScript; serialize "
          "the inner JSON and escape backslashes and quotes in shell commands. Example inner code: "
@@ -66,7 +218,7 @@ index 26c24e6..b705035 100644
      if "shell_command" in allowed_tools:
          reminder += " For repository inspection transport shell_command."
      elif "exec_command" in allowed_tools:
-@@ -1262,6 +1297,10 @@ def _normalized_tool_output(
+@@ -1262,6 +1360,10 @@ def _normalized_tool_output(
      item: dict,
      call_origins: dict[str, str],
  ) -> dict:
@@ -77,7 +229,7 @@ index 26c24e6..b705035 100644
      call_id = item.get("call_id")
      origin = call_origins.get(call_id) if isinstance(call_id, str) else None
      normalized = item
-@@ -1436,6 +1475,15 @@ def translate_input_items(
+@@ -1436,6 +1538,15 @@ def translate_input_items(
                  result.append(item)
              continue
          if item_type in {"function_call_output", "custom_tool_call_output"}:
@@ -93,7 +245,17 @@ index 26c24e6..b705035 100644
              result.append(_normalized_tool_output(item, call_origins))
              continue
          if item_type == "reasoning":
-@@ -1583,7 +1631,7 @@ def prepare_responses_body(
+@@ -1561,7 +1672,8 @@ def prepare_responses_body(
+     }
+ 
+     raw_input = source.get("input")
+-    input_items = translate_input_items(raw_input, client_tool_types(source))
++    client_tool_types(source)
++    input_items = translate_input_items(raw_input, all_client_tool_types(source))
+     # Captured before the prologue is prepended: the injected instructions and
+     # catalog are identical across conversations, so only the caller's own
+     # first history item identifies this conversation. Use translated items:
+@@ -1583,7 +1695,7 @@ def prepare_responses_body(
      if CATALOG_AT_PROMPT_END:
          input_items = _append_before_terminal_compaction_trigger(
              prologue + input_items,
@@ -102,7 +264,7 @@ index 26c24e6..b705035 100644
          )
      else:
          prologue.append(catalog)
-@@ -1594,6 +1642,18 @@ def prepare_responses_body(
+@@ -1594,6 +1706,18 @@ def prepare_responses_body(
              # turn and force the upstream cache to stop at that earlier byte.
              prologue.append(_message_item("developer", reminder))
          input_items = prologue + input_items
@@ -121,3 +283,378 @@ index 26c24e6..b705035 100644
      output["input"] = input_items
  
      cache_key = _cache_key(source)
+@@ -1611,11 +1735,8 @@ def prepare_responses_body(
+     output["reasoning_effort"] = _normalize_reasoning_effort(requested_effort) or "medium"
+ 
+     context_management = source.get("context_management")
+-    output["context_management"] = (
+-        context_management
+-        if isinstance(context_management, list)
+-        else [{"type": "compaction", "compact_threshold": 200_000}]
+-    )
++    if context_management is not None and context_management != []:
++        output["context_management"] = context_management
+ 
+     metadata: dict[str, str] = {}
+     raw_metadata = source.get("metadata")
+diff --git a/proxy.py b/proxy.py
+index 6ea1bad..2931072 100644
+--- a/proxy.py
++++ b/proxy.py
+@@ -67,6 +67,7 @@ import hashlib
+ import messages_preprocess
+ import migrate_runtime_paths
+ import json
++import logging
+ import sqlite3
+ import tempfile
+ import time
+@@ -5905,10 +5906,108 @@ def _excel_tool_call_event_bytes(
+     ]
+ 
+ 
++def _excel_has_native_calls(response):
++    output = response.get("output") if isinstance(response, dict) else None
++    return isinstance(output, list) and any(
++        isinstance(item, dict) and item.get("type") in {"function_call", "custom_tool_call"}
++        for item in output)
++
++
++def _excel_convert_native_batch(response, source):
++    if response.get("status") != "completed":
++        raise ValueError("response_not_completed")
++    output = response.get("output", [])
++    if not isinstance(output, list):
++        raise ValueError("invalid_response_output")
++    natives = [(i, x) for i, x in enumerate(output) if isinstance(x, dict) and
++               x.get("type") in {"function_call", "custom_tool_call"}]
++    ids = [x.get("call_id") for _, x in natives]
++    if any(not isinstance(x, str) or not x for x in ids) or len(set(ids)) != len(ids):
++        raise ValueError("invalid_or_duplicate_call_id")
++    if len(natives) > 1 and source.get("parallel_tool_calls") is False:
++        raise ValueError("parallel_calls_disabled")
++    converted = []
++    for index, native in natives:
++        if native.get("status") not in (None, "completed"):
++            raise ValueError("tool_not_completed")
++        call = excel_upstream.extract_native_client_tool_call(
++            {"output": [native]}, source, remember=False)
++        if call is None:
++            raise ValueError("catalog_or_schema_mismatch")
++        converted.append((index, call))
++    translated = dict(response)
++    translated["output"] = list(output)
++    for index, call in converted:
++        translated["output"][index] = {**call, "status": "completed"}
++    # Commit only after the entire batch satisfies the client contract.
++    for _, native in natives:
++        excel_upstream._remember_native_call(native)
++    return translated, converted
++
++
++def _excel_without_tool_calls(response):
++    safe = dict(response)
++    output = safe.get("output")
++    if isinstance(output, list):
++        safe["output"] = [x for x in output if not isinstance(x, dict) or
++                          x.get("type") not in {"function_call", "custom_tool_call"}]
++    return safe
++
++
++def _excel_convert_client_response(response, source, text=None):
++    if not isinstance(response, dict):
++        raise ValueError("invalid_response_payload")
++    status = response.get("status")
++    if status in ("failed", "incomplete", "cancelled", "in_progress", "queued"):
++        return _excel_without_tool_calls(response), []
++    if status != "completed":
++        raise ValueError("missing_or_invalid_response_status")
++    if _excel_has_native_calls(response):
++        return _excel_convert_native_batch(response, source)
++    if text is None:
++        text = format_translation.extract_response_output_text(response)
++    call = excel_upstream.extract_client_tool_call(
++        text or "", excel_upstream.client_tool_types(source))
++    if call is not None:
++        # Legacy text relays obey the same argument schema as native relays.
++        checked = excel_upstream.extract_native_client_tool_call(
++            {"output": [call]}, source, remember=False)
++        if checked is None:
++            raise ValueError("catalog_or_schema_mismatch")
++        translated = excel_upstream.response_payload_with_tool_call(
++            response, checked, model_id=excel_upstream.excel_model_id(source.get("model"))
++            or excel_upstream.MODEL_ID)
++        return translated, [(0, checked)]
++    if excel_upstream.TOOL_CALL_MARKER_OPEN in (text or ""):
++        raise ValueError("invalid_tool_marker")
++    if excel_upstream.client_tool_call_required(source):
++        raise ValueError("required_tool_call_missing")
++    return dict(response), []
++
++
++def _excel_tool_rejection_message(reason, mode):
++    allowed = {"catalog_or_schema_mismatch", "invalid_or_duplicate_call_id",
++               "parallel_calls_disabled", "tool_not_completed", "response_not_completed",
++               "invalid_response_output", "invalid_response_payload",
++               "missing_or_invalid_response_status", "invalid_tool_marker",
++               "required_tool_call_missing", "terminal_tool_calls_missing",
++               "invalid_terminal_status", "incomplete_tool_stream"}
++    reason = reason if reason in allowed else "invalid_tool_call"
++    logging.getLogger(__name__).warning("excel_tool_rejected mode=%s reason=%s", mode, reason)
++    return "Tool relay rejected: " + reason + "; no tool dispatched."
++
++
++def _excel_invalid_tool_stream(code="invalid_tool_call", reason="catalog_or_schema_mismatch"):
++    message = _excel_tool_rejection_message(
++        code if code == "incomplete_tool_stream" else reason, "stream")
++    return format_translation.sse_encode("response.failed", {
++        "type": "response.failed", "response": {"object": "response", "status": "failed",
++        "output": [], "error": {"type": "server_error", "code": code,
++        "message": message}}})
++
++
+ def _excel_tool_stream_transform(source_body: dict):
+-    allowed_tools = excel_upstream.client_tool_types(source_body)
+-    if not allowed_tools:
+-        return None
++    excel_upstream.client_tool_types(source_body)
+     marker_open = excel_upstream.TOOL_CALL_MARKER_OPEN
+ 
+     def _marker_hold_length(text: str) -> int:
+@@ -5926,7 +6025,7 @@ def _excel_tool_stream_transform(source_body: dict):
+         held_events: list[bytes] = []
+         delta_template: dict = {}
+         done_seen = False
+-        native_tool_output_index: int | None = None
++        native_seen = False
+ 
+         def flush_text() -> list[bytes]:
+             nonlocal emitted_upto
+@@ -5952,8 +6051,11 @@ def _excel_tool_stream_transform(source_body: dict):
+             if not isinstance(payload, dict):
+                 continue
+             event_type = str(event_name or payload.get("type") or "").strip().lower()
+-            event_output_index = payload.get("output_index")
+             encoded = format_translation.sse_encode(event_type or "message", payload)
++            if event_type == "error":
++                yield encoded
++                yield b"data: [DONE]" + bytes([10, 10])
++                return
+ 
+             if event_type == "response.output_text.delta":
+                 delta = payload.get("delta")
+@@ -6015,6 +6117,7 @@ def _excel_tool_stream_transform(source_body: dict):
+                 "response.custom_tool_call_input.delta",
+                 "response.custom_tool_call_input.done",
+             }:
++                native_seen = True
+                 held_events.append(encoded)
+                 continue
+ 
+@@ -6024,8 +6127,7 @@ def _excel_tool_stream_transform(source_body: dict):
+                     item.get("type") if isinstance(item, dict) else None
+                 )
+                 if item_type in {"function_call", "custom_tool_call"}:
+-                    if isinstance(event_output_index, int) and event_output_index >= 0:
+-                        native_tool_output_index = event_output_index
++                    native_seen = True
+                     held_events.append(encoded)
+                     continue
+                 if (
+@@ -6044,59 +6146,44 @@ def _excel_tool_stream_transform(source_body: dict):
+ 
+             if event_type in {"response.completed", "response.failed", "response.incomplete"}:
+                 response = payload.get("response")
+-                response = response if isinstance(response, dict) else None
+-                if response:
+-                    format_translation.normalize_response_reasoning_for_client(response)
+-                tool_call = None
+-                if event_type == "response.completed":
+-                    completed_text = full_text or (
+-                        format_translation.extract_response_output_text(response)
+-                        if response
+-                        else ""
+-                    )
+-                    tool_call = excel_upstream.extract_client_tool_call(
+-                        completed_text or "",
+-                        allowed_tools,
+-                    )
+-                    if tool_call is None:
+-                        tool_call = excel_upstream.extract_native_client_tool_call(
+-                            response,
+-                            source_body,
+-                        )
+-                if tool_call is not None:
+-                    held_events.clear()
+-                    emitted_upto = len(full_text)
+-                    response_payload = excel_upstream.response_payload_with_tool_call(
+-                        response,
+-                        tool_call,
+-                        model_id=excel_upstream.excel_model_id(source_body.get("model"))
+-                        or excel_upstream.MODEL_ID,
+-                    )
+-                    tool_output_index = (
+-                        native_tool_output_index
+-                        if native_tool_output_index is not None
+-                        else 0
+-                    )
+-                    for chunk in _excel_tool_call_event_bytes(
+-                        tool_call,
+-                        response_payload,
+-                        output_index=tool_output_index,
+-                    ):
+-                        yield chunk
+-                    continue
+-                # Not a tool call after all: release everything that was held
+-                # back so the client still receives the full assistant text.
+-                for chunk in flush_text():
+-                    yield chunk
+-                for held in held_events:
+-                    yield held
+-                held_events.clear()
+-                marker_mode = False
+-                yield encoded
+-                continue
++                response = dict(response) if isinstance(response, dict) else None
++                try:
++                    if response is not None:
++                        response.setdefault("status", event_type.removeprefix("response."))
++                        format_translation.normalize_response_reasoning_for_client(response)
++                    if event_type != "response.completed":
++                        safe = dict(payload)
++                        if response is not None:
++                            response["status"] = event_type.removeprefix("response.")
++                            safe["response"] = _excel_without_tool_calls(response)
++                        yield format_translation.sse_encode(event_type, safe)
++                    else:
++                        if native_seen and not _excel_has_native_calls(response):
++                            raise ValueError("terminal_tool_calls_missing")
++                        translated, calls = _excel_convert_client_response(
++                            response, source_body, full_text or None)
++                        for index, call in calls:
++                            for chunk in _excel_tool_call_event_bytes(call, translated, output_index=index)[:-1]:
++                                yield chunk
++                        status = translated.get("status")
++                        if status not in ("completed", "failed", "incomplete"):
++                            raise ValueError("invalid_terminal_status")
++                        if not calls and not marker_mode:
++                            for chunk in flush_text():
++                                yield chunk
++                        terminal = "response." + status
++                        yield format_translation.sse_encode(terminal, {"type": terminal, "response": translated})
++                except ValueError as exc:
++                    yield _excel_invalid_tool_stream(reason=str(exc))
++                yield b"data: [DONE]" + bytes([10, 10])
++                return
+ 
+             yield encoded
+ 
++        if native_seen:
++            yield _excel_invalid_tool_stream("incomplete_tool_stream")
++            yield b"data: [DONE]" + bytes([10, 10])
++            return
+         for chunk in flush_text():
+             yield chunk
+         for held in held_events:
+@@ -6104,7 +6191,19 @@ def _excel_tool_stream_transform(source_body: dict):
+         if done_seen:
+             yield b"data: [DONE]\n\n"
+ 
+-    return transform
++    async def sequenced(byte_iter):
++        # Held/replaced events change stream length; never reuse upstream numbers.
++        sequence = 0
++        async for event_name, data in format_translation.iter_sse_messages(transform(byte_iter)):
++            if data == "[DONE]":
++                yield b"data: [DONE]" + bytes([10, 10])
++                return
++            payload = json.loads(data)
++            payload["sequence_number"] = sequence
++            sequence += 1
++            yield format_translation.sse_encode(event_name or payload.get("type") or "message", payload)
++
++    return sequenced
+ 
+ 
+ async def _read_excel_non_streaming_response_payload(
+@@ -6115,15 +6214,28 @@ async def _read_excel_non_streaming_response_payload(
+         async for event_name, data in format_translation.iter_sse_messages(
+             upstream.aiter_bytes()
+         ):
+-            if not _is_response_completed_event(event_name, data):
+-                continue
+             try:
+                 parsed = json.loads(data or "")
+             except json.JSONDecodeError:
+                 continue
++            if not isinstance(parsed, dict):
++                continue
++            event_type = event_name or parsed.get("type")
++            if event_type == "error":
++                failure = parsed.get("error")
++                if not isinstance(failure, dict):
++                    failure = {k: parsed[k] for k in ("type", "code", "message", "param") if k in parsed}
++                return {"object": "response", "status": "failed", "output": [], "error": failure}
++            if event_type not in ("response.completed", "response.failed", "response.incomplete"):
++                continue
+             response_payload = parsed.get("response") if isinstance(parsed, dict) else None
+             if isinstance(response_payload, dict):
+-                completed_payload = response_payload
++                completed_payload = dict(response_payload)
++                if event_type != "response.completed":
++                    completed_payload["status"] = event_type.removeprefix("response.")
++                else:
++                    completed_payload.setdefault("status", "completed")
++                break
+     except httpx.RemoteProtocolError:
+         # Basispoints sometimes emits a malformed final chunk after the
+         # complete response event. The completed Responses payload is still
+@@ -6193,26 +6305,15 @@ async def _post_excel_non_streaming_request(
+         _finish_usage_and_trace(plan, 502, response_text=message)
+         return format_translation.openai_error_response(502, message)
+ 
+-    translated_payload = dict(response_payload)
+-    translated_payload["model"] = excel_model_id
+-    response_text = format_translation.extract_response_output_text(response_payload)
+-    tool_call = excel_upstream.extract_client_tool_call(
+-        response_text,
+-        excel_upstream.client_tool_types(client_body),
+-    )
+-    if tool_call is None:
+-        tool_call = excel_upstream.extract_native_client_tool_call(
+-            response_payload,
+-            client_body,
+-        )
+-    if tool_call is not None:
+-        translated_payload = excel_upstream.response_payload_with_tool_call(
+-            response_payload,
+-            tool_call,
+-            model_id=excel_model_id,
+-        )
+-        if isinstance(translated_payload, dict):
+-            format_translation.normalize_response_reasoning_for_client(translated_payload)
++    try:
++        translated_payload, _ = _excel_convert_client_response(response_payload, client_body)
++        translated_payload["model"] = excel_model_id
++        format_translation.normalize_response_reasoning_for_client(translated_payload)
++    except ValueError as exc:
++        message = _excel_tool_rejection_message(str(exc), "nonstream")
++        _finish_usage_and_trace(plan, 502, response_text=message)
++        return JSONResponse(status_code=502, content={"error": {
++            "type": "server_error", "code": "invalid_tool_call", "message": message}})
+ 
+     _finish_usage_and_trace(
+         plan,
+@@ -6241,6 +6342,12 @@ async def _handle_excel_responses(
+     *,
+     source_body: dict | None = None,
+ ) -> Response:
++    try:
++        excel_upstream.client_tool_types(body)
++    except excel_upstream.ClientToolChoiceError as exc:
++        return JSONResponse(status_code=400, content={"error": {
++            "type": "invalid_request_error", "code": "invalid_tool_choice",
++            "message": str(exc)}})
+     excel_model_id = (
+         excel_upstream.excel_model_id(body.get("model")) or excel_upstream.MODEL_ID
+     )

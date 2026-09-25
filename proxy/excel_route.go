@@ -107,6 +107,18 @@ func isExcelModelAccessChanged(status int, body []byte) bool {
 		gjson.GetBytes(body, "error.code").String() == "basispoints_model_access_changed"
 }
 
+// Only bridge-authored deterministic rejection, not arbitrary tool errors or
+// interrupted streams. Rotating credentials cannot repair this response.
+func isExcelToolContractError(body []byte) bool {
+	for _, prefix := range []string{"error", "response.error"} {
+		if gjson.GetBytes(body, prefix+".code").String() == "invalid_tool_call" &&
+			strings.HasPrefix(gjson.GetBytes(body, prefix+".message").String(), "Tool relay rejected: ") {
+			return true
+		}
+	}
+	return false
+}
+
 func excelSessionScope(body []byte, sessionID, clientKey string) string {
 	seed := gjson.GetBytes(body, "prompt_cache_key").String()
 	if seed == "" {

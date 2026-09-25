@@ -53,6 +53,9 @@ func continuousRetryPreflightPassthrough(settings RuntimeSettings) bool {
 }
 
 func continuousRetryHTTPSelected(policy database.ContinuousRetryPolicy, status int, body []byte) bool {
+	if isExcelToolContractError(body) {
+		return false
+	}
 	if !policy.Enabled {
 		return false
 	}
@@ -170,6 +173,9 @@ func continuousRetryRequestErrorSelected(policy database.ContinuousRetryPolicy, 
 }
 
 func continuousRetryStreamSelected(outcome streamOutcome, payload []byte, eventType string, policies ...database.ContinuousRetryPolicy) bool {
+	if isExcelToolContractError(payload) || isExcelToolContractError(outcome.failurePayload) {
+		return false
+	}
 	policy := continuousRetryPolicyForCall(policies)
 	if !policy.Enabled || outcome.terminalLocal {
 		return false
@@ -274,6 +280,9 @@ func terminalUpstreamErrorPayload(payload []byte) []byte {
 // into account-scoped 4xx/context/error-frame failures whose legacy outcome is
 // not penalized.
 func continuousRetryStreamFailureSelected(outcome streamOutcome, payload []byte, eventType string, policies ...database.ContinuousRetryPolicy) bool {
+	if isExcelToolContractError(payload) || isExcelToolContractError(outcome.failurePayload) {
+		return false
+	}
 	if outcome.terminalLocal || strings.EqualFold(strings.TrimSpace(outcome.failureKind), "continuous_retry_timeout") {
 		return false
 	}

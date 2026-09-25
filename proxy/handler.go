@@ -487,6 +487,13 @@ func accountFilterForResponsesModelWithOriginal(originalModel string, effectiveM
 func accountFilterForCompactResponsesModelWithOriginal(originalModel string, effectiveModel string, allowCodexAccounts bool) auth.AccountFilter {
 	inner := accountFilterForInlineCompactionModelWithOriginal(originalModel, effectiveModel, allowCodexAccounts)
 	return func(account *auth.Account) bool {
+		model := effectiveModel
+		if mapped, ok := resolveAccountCompactModelMappingForCandidates(account, compactMappingCandidates(originalModel, effectiveModel)); ok {
+			model = mapped
+		}
+		if auth.IsExcelModel(model) {
+			return false
+		}
 		// The dedicated compact executor has no Grok adapter. Inline compaction
 		// on ordinary Responses has a separate provider capability boundary.
 		return account != nil && !account.IsGrokAPI() && inner(account)
@@ -2301,6 +2308,11 @@ func classifyStreamOutcome(ctxErr, readErr, writeErr error, gotTerminal bool) st
 
 func classifyResponseFailedOutcome(payload []byte) streamOutcome {
 	statusCode := responseFailedStatusCode(payload)
+	if isExcelToolContractError(payload) {
+		return streamOutcome{logStatusCode: statusCode, failureKind: "client",
+			failureMessage: usageLogErrorMessage(statusCode, payload),
+			failurePayload: append([]byte(nil), payload...), requestScoped: true}
+	}
 	errorBody := responseFailedErrorBody(payload)
 	permanentQuota := isPermanentQuotaFailure(errorBody)
 	safetyPolicy := isExplicitUpstreamSafetyPolicy(payload)
@@ -3424,6 +3436,9 @@ func isRetryableStatus(code int) bool {
 }
 
 func shouldRetryHTTPStatus(statusCode int, body []byte, generalRetries *int, rateLimitRetries *int, maxGeneralRetries, maxRateLimitRetries int, policies ...database.ContinuousRetryPolicy) bool {
+	if isExcelToolContractError(body) {
+		return false
+	}
 	policy := continuousRetryPolicyForCall(policies)
 	if isExplicitUpstreamCyberPolicy(body) {
 		return false
@@ -5939,6 +5954,10 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	// 先让全局/渠道映射看到客户端原始模型（包括 -openai-compact 别名）；
 	// 没有命中映射时，再按兼容规则剥离后缀。
 	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredCompactModelMappingToBody(rawBody, supportedModels)
+	if auth.IsExcelModel(gjson.GetBytes(rawBody, "model").String()) {
+		ErrorToGinResponse(c, ErrBadRequest("Excel does not support /responses/compact; use inline compaction on /responses"))
+		return
+	}
 	rawBody, _ = normalizePortableResponsesCompactionHistory(rawBody)
 	setRawRequestBody(c, rawBody)
 
@@ -8455,6 +8474,9 @@ func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []by
 }
 
 func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, body []byte, resp *http.Response, model string) codex429Decision {
+	if isExcelToolContractError(body) {
+		return codex429Decision{}
+	}
 	// An Excel model entitlement error must not put the whole OAuth account
 	// into payment_required: other Excel/Codex models may still be usable.
 	if isExcelModelAccessChanged(statusCode, body) {
