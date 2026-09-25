@@ -7,6 +7,7 @@ services:
     build:
       context: ./deploy/excel-bridge
     environment:
+      EXCEL_MAX_REQUEST_BODY_SIZE_MB: ${EXCEL_MAX_REQUEST_BODY_SIZE_MB:-${CODEX_MAX_REQUEST_BODY_SIZE_MB:-48}}
       EXCEL_BRIDGE_API_KEY: ${EXCEL_BRIDGE_API_KEY:?Set a random bridge key of at least 32 characters}
     volumes:
       - type: bind

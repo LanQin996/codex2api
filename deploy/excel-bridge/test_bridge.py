@@ -12,6 +12,19 @@ from starlette.testclient import TestClient
 from bridge import create_app
 
 
+def test_opaque_state_diagnostic_redacted_and_bounded():
+    from bridge import opaque_state_shape
+    item = {"type": "reasoning", "encrypted_content": "private-cipher", "id": "private-id"}
+    body = {"input": [item] * 20 + [{"type": "compaction", "encrypted_content": "opaque"}]}
+    before = json.dumps(body)
+    result = opaque_state_shape(body)
+    assert result["encrypted_types"] == {"reasoning": 20, "compaction": 1}
+    assert len(result["samples"]) == 16 and result["truncated"]
+    assert "private" not in json.dumps(result)
+    assert json.dumps(body) == before
+    assert opaque_state_shape({"input": "text"})["samples"] == []
+
+
 def test_encrypted_result_diagnostic_contains_no_payload():
     from bridge import encrypted_result_shape
     result = encrypted_result_shape({"input": [{"type": "function_call_output",
@@ -662,10 +675,41 @@ def test_invalid_request(setup, body):
 
 
 def test_bad_json_and_size_limit(setup):
+    from bridge import request_body_limit
     client, _, _, calls = setup
     assert client.post("/v1/responses", content="{", headers=AUTH).status_code == 400
-    assert client.post("/v1/responses", content=b"x" * (16 * 1024 * 1024 + 1), headers=AUTH).status_code == 413
+    result = client.post("/v1/responses", content=b"x" * (request_body_limit() + 1), headers=AUTH)
+    assert result.status_code == 413
+    assert f"{request_body_limit() // (1024 * 1024)} MiB" in result.text
     assert not calls
+
+
+@pytest.mark.parametrize("size", [16 * 1024 * 1024 + 1, 48 * 1024 * 1024])
+def test_large_request_reaches_backend(setup, size):
+    client, _, _, calls = setup
+    body = b'{"model":"test-excel","input":"hello"}'
+    response = client.post("/v1/responses", content=body + b" " * (size - len(body)), headers=AUTH)
+    assert response.status_code == 200
+    assert calls[-1][0]["input"] == "hello"
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "abc", "1.5", ""])
+def test_invalid_request_body_limit(monkeypatch, value):
+    monkeypatch.setenv("EXCEL_MAX_REQUEST_BODY_SIZE_MB", value)
+    with pytest.raises(RuntimeError, match="positive integer"):
+        create_app(None, KEY, "unused")
+
+
+def test_configured_request_body_limit(monkeypatch):
+    from bridge import request_body_limit
+    monkeypatch.setenv("EXCEL_MAX_REQUEST_BODY_SIZE_MB", " 64 ")
+    assert request_body_limit() == 64 * 1024 * 1024
+    monkeypatch.setenv("EXCEL_MAX_REQUEST_BODY_SIZE_MB", "1")
+    backend = SimpleNamespace(excel_upstream=SimpleNamespace())
+    with TestClient(create_app(backend, KEY, "unused")) as client:
+        result = client.post("/v1/responses", content=b"x" * (1024 * 1024 + 1), headers=AUTH)
+        assert result.status_code == 413
+        assert "1 MiB" in result.text
 
 
 def test_rotation_and_fail_closed(setup):
@@ -970,3 +1014,39 @@ def test_native_officejs_identity_restored_for_tool_output(kind, durable, tmp_pa
     assert results[0]["output"] == "local execution result"
     if durable:
         module._excel_native_cache.close()
+
+import importlib
+import os
+import sys
+import pytest
+
+def test_migration_keeps_original_turn(tmp_path):
+    sys.path.insert(0, os.environ['EXCEL_UPSTREAM_SOURCE'])
+    u = importlib.import_module('excel_upstream')
+    import bridge
+    cache = bridge.NativeCallStore(tmp_path / 'turn.db')
+    history = [{'role': 'user', 'content': 'work'}]
+    states = []
+    try:
+        for n in range(2):
+            history += [{'type': 'function_call', 'call_id': str(n), 'name': 'probe', 'arguments': '{}'},
+                        {'type': 'function_call_output', 'call_id': str(n), 'output': 'done'}]
+            state = u._agent_turn_state(history)
+            body = bridge.migrate_completed_history({'input': list(history), 'prompt_cache_key': 'stable'}, cache, ('21','session','generation'))
+            bridge.reset_client_turn_state(body)
+            bridge.restore_logical_turn_state(body, state)
+            states.append(u.prepare_responses_body(body)['metadata'])
+        assert states[0]['turn_id'] == states[1]['turn_id']
+        assert [s['agent_iteration'] for s in states] == ['2', '3']
+        assert u.prepare_responses_body(body)['metadata'] == states[-1]
+        history.append({'role': 'user', 'content': 'next'})
+        body = {'input': history, 'prompt_cache_key': 'stable', 'metadata': {'turn_id': 'forged', 'customer': 'keep'}}
+        bridge.reset_client_turn_state(body)
+        bridge.restore_logical_turn_state(body, u._agent_turn_state(history))
+        new = u.prepare_responses_body(bridge.replay_checkpoint(body, cache, ('21','session','generation')))['metadata']
+        assert new['turn_id'] != states[-1]['turn_id'] and new['turn_id'] != 'forged'
+        assert new['task_id'] == states[-1]['task_id']
+        assert new['agent_iteration'] == '1' and new['customer'] == 'keep'
+    finally:
+        cache.close()
+

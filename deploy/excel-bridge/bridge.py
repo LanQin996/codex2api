@@ -30,6 +30,16 @@ from fastapi.responses import JSONResponse
 
 MAX_BODY = 16 * 1024 * 1024
 MAX_SESSION = 128 * 1024
+
+
+def request_body_limit():
+    # Match the gateway default; attachment and internal limits stay separate.
+    value = os.environ.get("EXCEL_MAX_REQUEST_BODY_SIZE_MB", "48").strip()
+    if not value.isascii() or not value.isdecimal() or int(value) <= 0:
+        raise RuntimeError("EXCEL_MAX_REQUEST_BODY_SIZE_MB must be a positive integer")
+    return int(value) * 1024 * 1024
+
+
 request_store = ContextVar("excel_store")
 request_scope = ContextVar("excel_scope")
 logger = logging.getLogger("excel_bridge")
@@ -252,6 +262,28 @@ def encrypted_result_shape(body):
             "missing_output": sum("output" not in x for x in results)}
 
 
+def opaque_state_shape(body):
+    items = body.get("input") if isinstance(body, dict) else None
+    counts, encrypted, samples = {}, {}, []
+    allowed = {"reasoning", "compaction", "function_call_output", "custom_tool_call_output"}
+    total = 0
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("type")
+        kind = kind if isinstance(kind, str) and kind in allowed else "other"
+        counts[kind] = counts.get(kind, 0) + 1
+        value = item.get("encrypted_content")
+        if isinstance(value, str) and value:
+            total += 1
+            encrypted[kind] = encrypted.get(kind, 0) + 1
+            if len(samples) < 16:
+                samples.append({"type": kind, "bytes": len(value.encode()),
+                                "digest": hashlib.sha256(value.encode()).hexdigest()[:24]})
+    return {"types": counts, "encrypted_types": encrypted,
+            "samples": samples, "truncated": total > len(samples)}
+
+
 def install_wire_diagnostics(backend):
     original = backend.excel_upstream.prepare_responses_body
     if getattr(original, "_excel_diagnostic", False):
@@ -273,6 +305,10 @@ def install_wire_diagnostics(backend):
         request_wire_shape.set(wire_shape(body))
         request_cache_diagnostic.set(cache_diagnostic_snapshot(body))
         snapshot = request_cache_diagnostic.get() or {}
+        logger.warning("excel_opaque_state %s", json.dumps({
+            "trace": snapshot.get("trace"), "account": snapshot.get("account"),
+            "scope_hash": snapshot.get("scope_hash"),
+            "source": opaque_state_shape(source), "wire": opaque_state_shape(body)}, sort_keys=True))
         logger.warning("excel_result_shape trace=%s source=%s wire=%s",
                        snapshot.get("trace", ""), encrypted_result_shape(source),
                        encrypted_result_shape(body))
@@ -289,6 +325,7 @@ def install_wire_diagnostics(backend):
         async def transform(byte_iter):
             async def observed():
                 pending = b""
+                encrypted_error_logged = False
                 async for chunk in byte_iter:
                     pending += chunk
                     while bytes([10]) in pending:
@@ -299,7 +336,8 @@ def install_wire_diagnostics(backend):
                                 if isinstance(event, dict) and event.get("type") in {"error", "response.failed"}:
                                     response = event.get("response")
                                     failure = event.get("error") or (response.get("error") if isinstance(response, dict) else None)
-                                    if isinstance(failure, dict) and failure.get("code") == "invalid_encrypted_content":
+                                    if isinstance(failure, dict) and failure.get("code") == "invalid_encrypted_content" and not encrypted_error_logged:
+                                        encrypted_error_logged = True
                                         logger.warning("excel_encrypted_result_rejected trace=%s",
                                                        (snapshot or {}).get("trace", ""))
                                 if isinstance(event, dict) and event.get("type") in {
@@ -460,6 +498,25 @@ def replay_checkpoint(body, cache, scope):
     # A distinct deterministic upstream task/cache identity for the new checkpoint.
     rebuilt["_excel_checkpoint"] = checkpoint_id
     return rebuilt
+
+
+def restore_logical_turn_state(body, state):
+    # Capture from original client history, before checkpoint quotations and
+    # image messages introduce synthetic user messages. Never trust supplied
+    # task/turn metadata. Match the pinned adapter's deterministic derivation.
+    if state is None:
+        return
+    conversation = body.get('prompt_cache_key')
+    if not isinstance(conversation, str) or not conversation.strip():
+        return
+    conversation = conversation.strip()
+    fingerprint, iteration = state
+    metadata = body.get('metadata')
+    metadata = dict(metadata) if isinstance(metadata, dict) else {}
+    metadata['task_id'] = str(uuid.uuid5(uuid.NAMESPACE_URL, f'ghcp-proxy/gpt-excel/{conversation}'))
+    metadata['turn_id'] = str(uuid.uuid5(uuid.NAMESPACE_URL, f'ghcp-proxy/gpt-excel/{conversation}/turn/{fingerprint}'))
+    metadata['agent_iteration'] = iteration
+    body['metadata'] = metadata
 
 
 def reset_client_turn_state(body):
@@ -773,6 +830,7 @@ def load_session(path, backend):
 def create_app(backend, key, session_path, *, scoped=False):
     if not key or len(key) < 32:
         raise RuntimeError("EXCEL_BRIDGE_API_KEY must contain at least 32 characters")
+    max_request_body = request_body_limit()
 
     @asynccontextmanager
     async def lifespan(app):
@@ -807,9 +865,9 @@ def create_app(backend, key, session_path, *, scoped=False):
     async def responses(request: Request):
         raw = bytearray()
         async for chunk in request.stream():
+            if len(raw) + len(chunk) > max_request_body:
+                return error(413, f"Request body exceeds {max_request_body // (1024 * 1024)} MiB")
             raw.extend(chunk)
-            if len(raw) > MAX_BODY:
-                return error(413, "Request body exceeds 16 MiB")
         try:
             body = json.loads(raw)
         except (ValueError, UnicodeError):
@@ -822,6 +880,8 @@ def create_app(backend, key, session_path, *, scoped=False):
             return error(400, "stream must be a boolean")
         if body.get("previous_response_id"):
             return error(400, "Excel requires full input history, not previous_response_id")
+        derive_turn = getattr(backend.excel_upstream, '_agent_turn_state', None)
+        logical_turn = derive_turn(body.get('input')) if callable(derive_turn) else None
         if scoped:
             account = request.headers.get("x-excel-account", "")
             scope = request.headers.get("x-excel-session", "")
@@ -914,6 +974,7 @@ def create_app(backend, key, session_path, *, scoped=False):
         # The upstream handler obtains a snapshot of session headers before
         # its first await. One worker preserves its native tool-call cache.
         request_wire_shape.set(None)
+        restore_logical_turn_state(body, logical_turn)
         response = await backend._handle_excel_responses(request, body)
         log_upstream_failure(response, body, account if scoped else "session_file")
         return response
