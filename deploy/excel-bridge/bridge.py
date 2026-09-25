@@ -284,6 +284,79 @@ def opaque_state_shape(body):
             "samples": samples, "truncated": total > len(samples)}
 
 
+def nested_encryption_shape(body):
+    # Fixed labels only; do not parse quoted text or record values.
+    counts, stack, visited = {}, [body], 0
+    while stack and visited < 50000:
+        node = stack.pop()
+        visited += 1
+        if isinstance(node, dict):
+            for key in ("encrypted_content", "encrypted_output", "encrypted_text"):
+                if key in node:
+                    counts[key] = counts.get(key, 0) + 1
+            kind = node.get("type")
+            if isinstance(kind, str) and kind in {
+                "encrypted_content", "encrypted_output", "encrypted_text",
+                "input_file", "item_reference", "compaction", "compaction_trigger",
+            }:
+                key = "type:" + kind
+                counts[key] = counts.get(key, 0) + 1
+            children = node.values()
+        elif isinstance(node, list):
+            children = node
+        else:
+            continue
+        for child in children:
+            if isinstance(child, (dict, list)):
+                if len(stack) + visited >= 50000:
+                    return {"counts": counts, "truncated": True}
+                stack.append(child)
+    return {"counts": counts, "truncated": bool(stack)}
+
+
+async def observe_tool_stream(stream, trace, stage):
+    # Bounded line observer. Forward original chunks, never arguments or text.
+    pending = bytearray()
+    dropping = False
+    counts = {"function_call": 0, "custom_tool_call": 0}
+    terminal = None
+    oversized = 0
+    try:
+        async for chunk in stream:
+            parts = chunk.split(bytes([10]))
+            for index, part in enumerate(parts):
+                if not dropping:
+                    if len(pending) + len(part) > 65536:
+                        pending.clear()
+                        dropping = True
+                        oversized += 1
+                    else:
+                        pending.extend(part)
+                if index < len(parts) - 1:
+                    if not dropping and pending.startswith(b"data:"):
+                        try:
+                            event = json.loads(pending[5:].strip())
+                            if isinstance(event, dict):
+                                typ = event.get("type")
+                                if typ == "response.output_item.done":
+                                    item = event.get("item")
+                                    kind = item.get("type") if isinstance(item, dict) else None
+                                    if isinstance(kind, str) and kind in counts:
+                                        counts[kind] += 1
+                                if typ in ("response.completed", "response.failed", "response.incomplete"):
+                                    terminal = typ
+                        except (ValueError, UnicodeError):
+                            pass
+                    pending.clear()
+                    dropping = False
+            yield chunk
+    finally:
+        logger.warning("excel_tool_stream %s", json.dumps({
+            "trace": trace, "stage": stage, "completed_call_events": counts,
+            "terminal": terminal, "oversized_lines": oversized,
+        }, sort_keys=True))
+
+
 def install_wire_diagnostics(backend):
     original = backend.excel_upstream.prepare_responses_body
     if getattr(original, "_excel_diagnostic", False):
@@ -297,14 +370,17 @@ def install_wire_diagnostics(backend):
         if parser is not None:
             tools = source.get("tools")
             parsed = parser(source)
-            logger.info(
-                "excel_tool_catalog present=%s raw_count=%d callable_count=%d disabled=%s",
-                "tools" in source, len(tools) if isinstance(tools, list) else 0,
-                len(parsed), source.get("tool_choice") == "none",
-            )
         request_wire_shape.set(wire_shape(body))
         request_cache_diagnostic.set(cache_diagnostic_snapshot(body))
         snapshot = request_cache_diagnostic.get() or {}
+        logger.warning("excel_tool_catalog %s", json.dumps({
+            "trace": snapshot.get("trace"), "scope_hash": snapshot.get("scope_hash"),
+            "present": "tools" in source,
+            "raw_count": len(source["tools"]) if isinstance(source.get("tools"), list) else 0,
+            "callable_count": len(parsed) if parser is not None else None,
+            "disabled": source.get("tool_choice") == "none",
+            "result_shape": encrypted_result_shape(source),
+        }, sort_keys=True))
         logger.warning("excel_opaque_state %s", json.dumps({
             "trace": snapshot.get("trace"), "account": snapshot.get("account"),
             "scope_hash": snapshot.get("scope_hash"),
@@ -321,6 +397,8 @@ def install_wire_diagnostics(backend):
     def make_transform(source_body):
         downstream = original_transform(source_body)
         snapshot = request_cache_diagnostic.get()
+        shape = request_wire_shape.get()
+        nested = nested_encryption_shape(source_body)
 
         async def transform(byte_iter):
             async def observed():
@@ -340,6 +418,12 @@ def install_wire_diagnostics(backend):
                                         encrypted_error_logged = True
                                         logger.warning("excel_encrypted_result_rejected trace=%s",
                                                        (snapshot or {}).get("trace", ""))
+                                        logger.warning("excel_encrypted_failure_shape %s", json.dumps({
+                                            "trace": (snapshot or {}).get("trace"),
+                                            "wire": shape, "source_nested": nested,
+                                            "function_output_decode_error": failure.get("message") ==
+                                                "Encrypted function output content could not be decrypted or decoded.",
+                                        }, sort_keys=True))
                                 if isinstance(event, dict) and event.get("type") in {
                                     "response.completed", "response.incomplete", "response.failed"
                                 }:
@@ -349,8 +433,10 @@ def install_wire_diagnostics(backend):
                     if len(pending) > MAX_BODY:
                         pending = b""
                     yield chunk
-            stream = observed()
-            async for chunk in downstream(stream) if downstream else stream:
+            trace = (snapshot or {}).get("trace")
+            stream = observe_tool_stream(observed(), trace, "upstream")
+            translated = downstream(stream) if downstream else stream
+            async for chunk in observe_tool_stream(translated, trace, "client"):
                 yield chunk
         return transform
 

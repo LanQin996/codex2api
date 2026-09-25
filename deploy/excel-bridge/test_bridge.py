@@ -25,6 +25,20 @@ def test_opaque_state_diagnostic_redacted_and_bounded():
     assert opaque_state_shape({"input": "text"})["samples"] == []
 
 
+def test_nested_encryption_shape_is_bounded_and_redacted():
+    from bridge import nested_encryption_shape
+    body = {"input": [{"content": [{"type": "encrypted_text",
+            "encrypted_content": "secret-cipher"}, {"type": "input_text",
+            "text": '{"encrypted_output":"quoted-not-wire"}'}]}]}
+    before = json.dumps(body)
+    result = nested_encryption_shape(body)
+    assert result == {"counts": {"encrypted_content": 1, "type:encrypted_text": 1},
+                      "truncated": False}
+    assert "secret" not in json.dumps(result)
+    assert json.dumps(body) == before
+    assert nested_encryption_shape([{}] * 50001)["truncated"]
+
+
 def test_encrypted_result_diagnostic_contains_no_payload():
     from bridge import encrypted_result_shape
     result = encrypted_result_shape({"input": [{"type": "function_call_output",
@@ -190,6 +204,29 @@ def test_cache_diagnostics_prefix_and_redaction(caplog):
         assert "private-" not in caplog.text
     finally:
         bridge.request_scope.reset(token)
+
+
+def test_tool_observer_preserves_fragmented_stream(caplog):
+    import asyncio
+    from bridge import observe_tool_stream
+    events = [
+        {"type": "response.output_item.done", "item": {"type": "function_call",
+         "arguments": "secret-arguments"}},
+        {"type": "response.completed"},
+    ]
+    raw = b"data: " + b"x" * 65537 + bytes([10])
+    raw += b"".join(b"data: " + json.dumps(e).encode() + bytes([13, 10, 13, 10]) for e in events)
+    chunks = [raw[i:i+137] for i in range(0, len(raw), 137)]
+    async def source():
+        for chunk in chunks:
+            yield chunk
+    async def collect():
+        return [chunk async for chunk in observe_tool_stream(source(), "test", "client")]
+    assert asyncio.run(collect()) == chunks
+    assert '"function_call": 1' in caplog.text
+    assert '"oversized_lines": 1' in caplog.text
+    assert '"terminal": "response.completed"' in caplog.text
+    assert "secret-arguments" not in caplog.text
 
 
 def test_cache_diagnostics_stream_preserves_chunks(caplog):
