@@ -241,6 +241,17 @@ def wire_shape(body):
     }
 
 
+def encrypted_result_shape(body):
+    items = body.get("input", []) if isinstance(body, dict) else []
+    if not isinstance(items, list):
+        items = []
+    results = [x for x in items if isinstance(x, dict) and
+               x.get("type") in {"function_call_output", "custom_tool_call_output"}]
+    return {"results": len(results),
+            "encrypted_results": sum(bool(x.get("encrypted_content")) for x in results),
+            "missing_output": sum("output" not in x for x in results)}
+
+
 def install_wire_diagnostics(backend):
     original = backend.excel_upstream.prepare_responses_body
     if getattr(original, "_excel_diagnostic", False):
@@ -261,6 +272,10 @@ def install_wire_diagnostics(backend):
             )
         request_wire_shape.set(wire_shape(body))
         request_cache_diagnostic.set(cache_diagnostic_snapshot(body))
+        snapshot = request_cache_diagnostic.get() or {}
+        logger.warning("excel_result_shape trace=%s source=%s wire=%s",
+                       snapshot.get("trace", ""), encrypted_result_shape(source),
+                       encrypted_result_shape(body))
         return body
 
     prepare._excel_diagnostic = True
@@ -281,6 +296,12 @@ def install_wire_diagnostics(backend):
                         if line.startswith(b"data:"):
                             try:
                                 event = json.loads(line[5:].strip())
+                                if isinstance(event, dict) and event.get("type") in {"error", "response.failed"}:
+                                    response = event.get("response")
+                                    failure = event.get("error") or (response.get("error") if isinstance(response, dict) else None)
+                                    if isinstance(failure, dict) and failure.get("code") == "invalid_encrypted_content":
+                                        logger.warning("excel_encrypted_result_rejected trace=%s",
+                                                       (snapshot or {}).get("trace", ""))
                                 if isinstance(event, dict) and event.get("type") in {
                                     "response.completed", "response.incomplete", "response.failed"
                                 }:

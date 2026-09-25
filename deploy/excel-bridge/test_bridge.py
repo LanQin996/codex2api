@@ -12,6 +12,28 @@ from starlette.testclient import TestClient
 from bridge import create_app
 
 
+def test_encrypted_result_diagnostic_contains_no_payload():
+    from bridge import encrypted_result_shape
+    result = encrypted_result_shape({"input": [{"type": "function_call_output",
+        "encrypted_content": "secret-ciphertext", "call_id": "private-call"}]})
+    assert result == {"results": 1, "encrypted_results": 1, "missing_output": 1}
+    assert encrypted_result_shape({"input": "text"})["results"] == 0
+
+
+@pytest.mark.parametrize("origin", ["run_officejs", "update_plan"])
+def test_native_encrypted_tool_result_is_not_rewritten(origin):
+    source = os.environ.get("EXCEL_UPSTREAM_SOURCE")
+    if not source:
+        pytest.skip("Set EXCEL_UPSTREAM_SOURCE")
+    sys.path.insert(0, source)
+    module = importlib.import_module("excel_upstream")
+    item = {"type": "function_call_output", "id": "native-output-id",
+            "call_id": "call-encrypted", "encrypted_content": "opaque-test-state"}
+    before = json.loads(json.dumps(item))
+    assert module._normalized_tool_output(item, {item["call_id"]: origin}) == before
+    assert item == before
+
+
 def test_exec_only_catalog_uses_callable_discovery_example():
     source = os.environ.get("EXCEL_UPSTREAM_SOURCE")
     if not source:
@@ -46,6 +68,27 @@ def test_compaction_refreshes_live_tool_protocol(monkeypatch, catalog_at_end):
     if not catalog_at_end:
         body["input"].append({"role": "assistant", "content": "working"})
         assert module.prepare_responses_body(body)["input"][:len(wire)] == wire
+
+
+@pytest.mark.parametrize("compacted", [False, True])
+def test_live_protocol_follows_history_environment(monkeypatch, compacted):
+    source = os.environ.get("EXCEL_UPSTREAM_SOURCE")
+    if not source:
+        pytest.skip("Set EXCEL_UPSTREAM_SOURCE")
+    sys.path.insert(0, source)
+    module = importlib.import_module("excel_upstream")
+    monkeypatch.setattr(module, "CATALOG_AT_PROMPT_END", False)
+    history = ([{"type": "compaction", "encrypted_content": "opaque"}] if compacted else [])
+    history += [{"role": "developer", "content": "Legacy environment: only Excel tools."},
+                {"role": "user", "content": "inspect repository"}]
+    body = {"tools": [{"type": "custom", "name": "exec"}], "input": history}
+    wire = module.prepare_responses_body(body)["input"]
+    legacy = next(i for i,x in enumerate(wire) if "Legacy environment" in json.dumps(x))
+    assert any(x.get("role") == "developer" and "ALL_TOOLS" in json.dumps(x) for x in wire[legacy+1:])
+    history.append({"role": "assistant", "content": "working"})
+    assert module.prepare_responses_body(body)["input"][:len(wire)] == wire
+    disabled = module.prepare_responses_body({**body, "tool_choice": "none"})["input"]
+    assert not any("ALL_TOOLS" in json.dumps(x) for x in disabled)
 
 
 def test_new_session_namespaced_exec_discovery():

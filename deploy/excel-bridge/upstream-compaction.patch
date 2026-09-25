@@ -1,5 +1,5 @@
 diff --git a/excel_upstream.py b/excel_upstream.py
-index 26c24e6..d45bb62 100644
+index 26c24e6..b705035 100644
 --- a/excel_upstream.py
 +++ b/excel_upstream.py
 @@ -763,7 +763,7 @@ def _client_tool_protocol_instructions(source: dict) -> str:
@@ -66,7 +66,18 @@ index 26c24e6..d45bb62 100644
      if "shell_command" in allowed_tools:
          reminder += " For repository inspection transport shell_command."
      elif "exec_command" in allowed_tools:
-@@ -1436,6 +1471,15 @@ def translate_input_items(
+@@ -1262,6 +1297,10 @@ def _normalized_tool_output(
+     item: dict,
+     call_origins: dict[str, str],
+ ) -> dict:
++    # Opaque native results are not empty plaintext results. Preserve their
++    # identity and payload; never invent successful output or canonicalize IDs.
++    if item.get("type") == "function_call_output" and item.get("encrypted_content"):
++        return dict(item)
+     call_id = item.get("call_id")
+     origin = call_origins.get(call_id) if isinstance(call_id, str) else None
+     normalized = item
+@@ -1436,6 +1475,15 @@ def translate_input_items(
                  result.append(item)
              continue
          if item_type in {"function_call_output", "custom_tool_call_output"}:
@@ -82,7 +93,7 @@ index 26c24e6..d45bb62 100644
              result.append(_normalized_tool_output(item, call_origins))
              continue
          if item_type == "reasoning":
-@@ -1583,7 +1627,7 @@ def prepare_responses_body(
+@@ -1583,7 +1631,7 @@ def prepare_responses_body(
      if CATALOG_AT_PROMPT_END:
          input_items = _append_before_terminal_compaction_trigger(
              prologue + input_items,
@@ -91,7 +102,7 @@ index 26c24e6..d45bb62 100644
          )
      else:
          prologue.append(catalog)
-@@ -1594,6 +1638,16 @@ def prepare_responses_body(
+@@ -1594,6 +1642,18 @@ def prepare_responses_body(
              # turn and force the upstream cache to stop at that earlier byte.
              prologue.append(_message_item("developer", reminder))
          input_items = prologue + input_items
@@ -100,7 +111,9 @@ index 26c24e6..d45bb62 100644
 +    # rather than appending a cache-breaking reminder on every tool turn.
 +    if not CATALOG_AT_PROMPT_END:
 +        compact_positions = [i for i, item in enumerate(input_items)
-+                             if isinstance(item, dict) and item.get("type") == "compaction"]
++                             if isinstance(item, dict) and
++                             (item.get("type") == "compaction" or
++                              (i >= len(prologue) and item.get("role") in {"developer", "system"}))]
 +        reminder = _client_tool_protocol_reminder(source)
 +        if compact_positions and reminder:
 +            input_items.insert(compact_positions[-1] + 1,
