@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -886,13 +887,12 @@ func ensureGeminiFinishReason(body []byte) []byte {
 }
 
 type antigravityNativeGeminiSSEBody struct {
-	source          io.ReadCloser
-	reader          *bufio.Reader
-	queue           bytes.Buffer
-	reverseNameMap  map[string]string
-	terminal        bool
-	sawResponse     bool
-	sawFinishReason bool
+	source         io.ReadCloser
+	reader         *bufio.Reader
+	queue          bytes.Buffer
+	reverseNameMap map[string]string
+	terminalErr    error
+	sawTerminal    bool
 }
 
 func newAntigravityNativeGeminiSSEResponseBody(r io.ReadCloser, reverseNameMap map[string]string) io.ReadCloser {
@@ -915,63 +915,118 @@ func (b *antigravityNativeGeminiSSEBody) enqueue(chunk []byte) {
 	b.queue.WriteString("\n\n")
 }
 
-func (b *antigravityNativeGeminiSSEBody) observe(chunk []byte) {
-	var payload map[string]any
-	if json.Unmarshal(chunk, &payload) != nil {
-		return
+func (b *antigravityNativeGeminiSSEBody) observe(payload map[string]any) {
+	switch strings.ToUpper(geminiFinishReason(payload)) {
+	case "", "NONE", "FINISH_REASON_UNSPECIFIED":
+	default:
+		b.sawTerminal = true
 	}
-	if lenGeminiCandidates(payload) > 0 {
-		b.sawResponse = true
-	}
-	if finishReason := geminiFinishReason(payload); finishReason != "" {
-		b.sawFinishReason = true
+	if feedback, ok := payload["promptFeedback"].(map[string]any); ok {
+		reason, _ := feedback["blockReason"].(string)
+		switch strings.ToUpper(strings.TrimSpace(reason)) {
+		case "", "NONE", "BLOCK_REASON_UNSPECIFIED":
+		default:
+			b.sawTerminal = true
+		}
 	}
 }
 
-func (b *antigravityNativeGeminiSSEBody) syntheticTerminalChunk() []byte {
-	payload := map[string]any{
-		"candidates": []any{
-			map[string]any{
-				"content": map[string]any{
-					"role":  "model",
-					"parts": []any{map[string]any{"text": ""}},
-				},
-				"finishReason": "STOP",
-			},
-		},
+func (b *antigravityNativeGeminiSSEBody) endError(err error) error {
+	if err != nil && !errors.Is(err, io.EOF) {
+		return err
 	}
-	out, _ := json.Marshal(payload)
-	return out
+	if b.sawTerminal {
+		return io.EOF
+	}
+	return fmt.Errorf("antigravity Gemini stream ended before a terminal response: %w", io.ErrUnexpectedEOF)
+}
+
+// Keep an error that accompanies the final event: the event is drained before
+// Read returns that error, including when the stream has no trailing blank line.
+func (b *antigravityNativeGeminiSSEBody) readEvent() ([]byte, error) {
+	var data []byte
+	for {
+		line, err := b.reader.ReadBytes('\n')
+		if len(line) > 0 {
+			line = bytes.TrimRight(line, "\r\n")
+			if bytes.HasPrefix(line, []byte("data:")) {
+				part := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+				if len(data) > 0 {
+					data = append(data, '\n')
+				}
+				data = append(data, part...)
+			}
+			if len(line) == 0 && len(data) > 0 {
+				return data, err
+			}
+		}
+		if err != nil {
+			return data, err
+		}
+	}
+}
+
+func antigravityNativeGeminiStreamPayload(data []byte) (map[string]any, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil, fmt.Errorf("decode antigravity Gemini stream event: %w", err)
+	}
+	if payload == nil {
+		return nil, fmt.Errorf("antigravity Gemini stream event must be a JSON object")
+	}
+	for {
+		if upstreamError, ok := payload["error"]; ok {
+			message := "antigravity Gemini upstream returned an error"
+			if detail, ok := upstreamError.(map[string]any); ok {
+				if text, ok := detail["message"].(string); ok && strings.TrimSpace(text) != "" {
+					message += ": " + text
+				}
+			}
+			return nil, errors.New(message)
+		}
+		response, ok := payload["response"].(map[string]any)
+		if !ok {
+			return payload, nil
+		}
+		payload = response
+	}
 }
 
 func (b *antigravityNativeGeminiSSEBody) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	for b.queue.Len() == 0 {
-		if b.terminal {
-			return 0, io.EOF
+		if b.terminalErr != nil {
+			return 0, b.terminalErr
 		}
-		data, err := readSSEDataLine(b.reader)
-		if err != nil {
-			if b.sawResponse && !b.sawFinishReason {
-				b.enqueue(b.syntheticTerminalChunk())
-			}
-			b.terminal = true
-			continue
-		}
+		data, readErr := b.readEvent()
 		trimmed := bytes.TrimSpace(data)
 		if len(trimmed) == 0 {
+			if readErr != nil {
+				b.terminalErr = b.endError(readErr)
+			}
 			continue
 		}
 		if bytes.Equal(trimmed, []byte("[DONE]")) {
-			if b.sawResponse && !b.sawFinishReason {
-				b.enqueue(b.syntheticTerminalChunk())
+			b.terminalErr = b.endError(readErr)
+			continue
+		}
+		payload, err := antigravityNativeGeminiStreamPayload(trimmed)
+		if err != nil {
+			b.terminalErr = err
+			if readErr != nil && !errors.Is(readErr, io.EOF) {
+				b.terminalErr = readErr
 			}
-			b.terminal = true
 			continue
 		}
 		chunk := unwrapAntigravityNativeGeminiChunk(trimmed)
 		chunk = antigravityRestoreNativeGeminiResponseNames(chunk, b.reverseNameMap)
-		b.observe(chunk)
+		b.observe(payload)
 		b.enqueue(chunk)
+		if readErr != nil {
+			b.terminalErr = b.endError(readErr)
+		}
 	}
 	return b.queue.Read(p)
 }

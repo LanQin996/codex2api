@@ -394,10 +394,8 @@ var codexAllowedForwardHeaders = []string{
 	"X-Client-Request-Id",
 	"X-Codex-Beta-Features",
 	codexResponsesLiteHeader,
-	// DeviceCheck 设备认证头（上游 openai/codex#20619）。仅在下游真实 Codex
-	// 客户端携带时原样透传——本代理无法（也不该）伪造：token 是 Apple 硬件
-	// 背书、服务端向 Apple 验证，假值必然验证失败、比"不携带"更暴露特征。
-	// 缺失是合法状态（纯 CLI / 非 macOS 客户端本就不发）。
+	// 下游真实客户端的证明优先透传。Windows Desktop 身份缺失时，会在出站头
+	// 装配结束后补官方客户端的 DeviceCheck 不可用状态；macOS 不模拟硬件证明。
 	"X-Oai-Attestation",
 }
 
@@ -570,6 +568,11 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		// 上游不接受的层级会原样发出并触发 400，这里补一次净化兜底。用量日志的
 		// requested tier 归因走 EffectiveRequestedServiceTier（净化前取值），不受影响。
 		requestBody = sanitizeServiceTierForUpstream(requestBody)
+	}
+	var daybreakErr error
+	requestBody, daybreakErr = guardDaybreakUpstream(ctx, account, requestBody)
+	if daybreakErr != nil {
+		return nil, daybreakErr
 	}
 	// 指纹收敛在 WS/HTTP 分叉前统一改写请求体，两条上游路径共享结果；请求头侧的
 	// 收敛（ApplyCodexFingerprintHeaders）从同一份「账号 + 下游头」推导，取值一致。
@@ -1387,6 +1390,7 @@ func applyCodexRequestHeaders(req *http.Request, account *auth.Account, accessTo
 	// 可整体退回旧的 Session_id 形态。
 	ApplyCodexSessionHeaders(req.Header, account, cacheKey, downstreamHeaders, false)
 	applyAccountCustomHeaders(req, account)
+	ApplyWindowsDesktopAttestation(req.Header, account)
 	RecordUpstreamUserAgent(req.Context(), req.Header.Get("User-Agent"))
 }
 

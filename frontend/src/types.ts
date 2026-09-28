@@ -488,6 +488,9 @@ export interface AccountRow {
   usage_percent_5h?: number | null
   usage_percent_spark?: number | null
   rate_limit_reset_credits?: number | null
+  daybreak_supported?: boolean
+  daybreak_models?: Record<string, string[]>
+  daybreak_checked_at?: number
   applicable_reset_credits?: number | null
   credits_valid?: boolean
   credits_balance?: string | null
@@ -2148,6 +2151,7 @@ export interface SystemSettings {
   auto_clean_full_usage: boolean
   auto_clean_error: boolean
   auto_clean_expired: boolean
+  auto_reset_credits_on_exhaustion_enabled: boolean
   auto_reset_credits_enabled: boolean
   auto_reset_credits_before_expiry_min: number
   auto_activate_5h_window_enabled: boolean
@@ -2285,6 +2289,9 @@ export interface SystemSettings {
   codex_cli_version_sync_enabled: boolean
   codex_cli_version_sync_interval_hours: number
   codex_synced_cli_version?: string
+  codex_synced_desktop_mac_build?: string
+  codex_synced_desktop_windows_build?: string
+  codex_synced_vscode_build?: string
   codex_effective_cli_version?: string
   codex_user_agent_config: string
   usage_log_mode: 'full' | 'errors' | 'off' | string
@@ -3548,6 +3555,7 @@ export interface UsageLog {
   model: string
   effective_model: string
   upstream_model?: string
+  daybreak_program?: string
   /** 上游响应自报的模型名（未自报/历史行为空）。 */
   upstream_response_model?: string
   /** 三态：undefined/null=上游未自报无法比对；true/false=自报与实发是否一致。 */
@@ -4012,6 +4020,7 @@ export interface PublicAPIKeyUsageLog {
   endpoint: string
   model: string
   effective_model: string
+  daybreak_program?: string
   status_code: number
   duration_ms: number
   first_token_ms: number

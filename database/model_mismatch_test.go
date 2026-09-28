@@ -90,3 +90,57 @@ func TestUsageLogsPersistUpstreamModel(t *testing.T) {
 		t.Fatalf("logs = %+v, want 1 条且 UpstreamModel=gpt-5.4-mini", logs)
 	}
 }
+
+func TestUsageLogsPersistDaybreakAndUpstreamModelTogether(t *testing.T) {
+	for _, mode := range []string{"sqlite_transaction", "postgres_values"} {
+		t.Run(mode, func(t *testing.T) {
+			db, err := New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
+			if err != nil {
+				t.Fatalf("New(sqlite): %v", err)
+			}
+			defer db.Close()
+			ctx := context.Background()
+			batch := []usageLogEntry{
+				{
+					StoreUsageLog: true, AccountID: 1, Endpoint: "/v1/responses", StatusCode: 200,
+					Model: "gpt-6-sol-daybreak-blue", EffectiveModel: "gpt-6-sol",
+					UpstreamModel: "gpt-6-sol-2026-09-01", DaybreakProgram: "daybreak_blue",
+				},
+				{
+					StoreUsageLog: true, AccountID: 2, Endpoint: "/v1/responses", StatusCode: 200,
+					Model: "gpt-6-astra-daybreak-red", EffectiveModel: "gpt-6-astra",
+					UpstreamModel: "gpt-6-astra-2026-09-01", DaybreakProgram: "daybreak_red",
+				},
+			}
+			if mode == "sqlite_transaction" {
+				err = db.insertSQLiteUsageLogBatch(ctx, batch)
+			} else {
+				// SQLite also accepts numbered placeholders, so exercise the
+				// PostgreSQL multi-row column/argument layout without a server.
+				err = db.batchInsertLogsChunk(ctx, db.conn, batch)
+			}
+			if err != nil {
+				t.Fatalf("insert batch: %v", err)
+			}
+			logs, err := db.ListRecentUsageLogs(ctx, 10)
+			if err != nil {
+				t.Fatalf("ListRecentUsageLogs: %v", err)
+			}
+			if len(logs) != len(batch) {
+				t.Fatalf("got %d logs, want %d", len(logs), len(batch))
+			}
+			want := make(map[string]usageLogEntry, len(batch))
+			for _, entry := range batch {
+				want[entry.Model] = entry
+			}
+			for _, log := range logs {
+				entry, ok := want[log.Model]
+				if !ok || log.UpstreamModel != entry.UpstreamModel || log.DaybreakProgram != entry.DaybreakProgram {
+					t.Fatalf("model %q: upstream=%q program=%q, want upstream=%q program=%q",
+						log.Model, log.UpstreamModel, log.DaybreakProgram, entry.UpstreamModel, entry.DaybreakProgram)
+				}
+				delete(want, log.Model)
+			}
+		})
+	}
+}

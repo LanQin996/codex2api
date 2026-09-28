@@ -484,6 +484,12 @@
     "proxyPoolLinkedHint": "已關聯代理池節點（按位址綁定）：在「代理」頁修改該節點位址會同步到所有綁定帳號，刪除則自動解除綁定。"
   },
   "settings": {
+    "clientVersionSyncSuccess": "用戶端版本已同步",
+    "clientVersionSyncPartial": "部分來源同步失敗，已保留原有版本",
+    "autoResetCreditsTitle": "主動重置次數自動消耗",
+    "autoResetCreditsDesc": "分別控制額度窗口用盡和重置券臨期時的自動消耗，兩項預設關閉，每輪每帳號最多消耗一次。",
+    "autoResetCreditsOnExhaustionEnabled": "窗口用盡後自動重置",
+    "autoResetCreditsOnExhaustionDesc": "每 5 分鐘檢查官方 Codex 帳號（含 Business Pro Lite）。上游確認任一共享額度窗口（如 5h、7d）達到 100%，且有可用重置次數時消耗一次，無需等待券臨期。預設關閉；開啟後立即檢查。",
     "codexOAuthKeepalive": "惰性模式下保持 Codex 授權",
     "codexOAuthKeepaliveDesc": "開啟後，惰性模式仍會為即將到期的 Codex Token 續期，包括額度冷卻中的帳號；不會解除冷卻或發送生成請求。預設關閉。",
     "codexTelemetry": "用戶端遙測（實驗性）",
