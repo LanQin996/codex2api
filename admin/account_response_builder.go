@@ -265,8 +265,6 @@ func (h *Handler) buildAccountResponse(
 		CodexPassthroughMode:         codexPassthroughMode,
 		ResponsesUpstreamTransport:   responsesUpstreamTransport,
 		CodexFingerprintMode:         codexFingerprintMode,
-		ExcelRouteMode:               h.excelRouteModeForRow(row),
-		ExcelBridgeConfigured:        excelBridgeConfigured(),
 		ClaudeFingerprintMode:        claudeFingerprintMode,
 		ClaudeUserAgent:              claudeUserAgent,
 		ClaudeClientPlatform:         string(claudeClientPolicy.Platform),

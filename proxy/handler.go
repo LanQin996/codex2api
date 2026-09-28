@@ -348,9 +348,6 @@ func isSparkPlanCandidate(planType string) bool {
 // 的 OpenAI Responses 中转账号。Grok、Antigravity、Claude 以及仍走 HTTP 的中转账号继续排除。
 func accountFilterForResponsesWebSocket(model string) auth.AccountFilter {
 	model = strings.TrimSpace(model)
-	if auth.IsExcelModel(model) {
-		return func(*auth.Account) bool { return false }
-	}
 	codex := accountFilterForModel(model)
 	return func(account *auth.Account) bool {
 		if account != nil && account.OpenAIResponsesUsesUpstreamWebsocket() {
@@ -487,13 +484,6 @@ func accountFilterForResponsesModelWithOriginal(originalModel string, effectiveM
 func accountFilterForCompactResponsesModelWithOriginal(originalModel string, effectiveModel string, allowCodexAccounts bool) auth.AccountFilter {
 	inner := accountFilterForInlineCompactionModelWithOriginal(originalModel, effectiveModel, allowCodexAccounts)
 	return func(account *auth.Account) bool {
-		model := effectiveModel
-		if mapped, ok := resolveAccountCompactModelMappingForCandidates(account, compactMappingCandidates(originalModel, effectiveModel)); ok {
-			model = mapped
-		}
-		if auth.IsExcelModel(model) {
-			return false
-		}
 		// The dedicated compact executor has no Grok adapter. Inline compaction
 		// on ordinary Responses has a separate provider capability boundary.
 		return account != nil && !account.IsGrokAPI() && inner(account)
@@ -657,9 +647,7 @@ func (h *Handler) modelValidator(supportedModels []string) api.ValidationRule {
 			return nil
 		}
 		model := value.String()
-		// Excel aliases are transport routes, not entries in the Codex upstream
-		// model catalog. Account eligibility is still enforced by the scheduler.
-		if validModels[model] || auth.IsExcelModel(model) || h.modelSupportedByAccountMapping(model) {
+		if validModels[model] || h.modelSupportedByAccountMapping(model) {
 			return nil
 		}
 		return &api.ValidationError{
@@ -2308,11 +2296,6 @@ func classifyStreamOutcome(ctxErr, readErr, writeErr error, gotTerminal bool) st
 
 func classifyResponseFailedOutcome(payload []byte) streamOutcome {
 	statusCode := responseFailedStatusCode(payload)
-	if isExcelToolContractError(payload) {
-		return streamOutcome{logStatusCode: statusCode, failureKind: "client",
-			failureMessage: usageLogErrorMessage(statusCode, payload),
-			failurePayload: append([]byte(nil), payload...), requestScoped: true}
-	}
 	errorBody := responseFailedErrorBody(payload)
 	permanentQuota := isPermanentQuotaFailure(errorBody)
 	safetyPolicy := isExplicitUpstreamSafetyPolicy(payload)
@@ -3436,9 +3419,6 @@ func isRetryableStatus(code int) bool {
 }
 
 func shouldRetryHTTPStatus(statusCode int, body []byte, generalRetries *int, rateLimitRetries *int, maxGeneralRetries, maxRateLimitRetries int, policies ...database.ContinuousRetryPolicy) bool {
-	if isExcelToolContractError(body) {
-		return false
-	}
 	policy := continuousRetryPolicyForCall(policies)
 	if isExplicitUpstreamCyberPolicy(body) {
 		return false
@@ -4019,7 +3999,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	if releaseAPIKeyConcurrency != nil {
 		defer releaseAPIKeyConcurrency()
 	}
-	allowCodexAccounts := auth.IsExcelModel(effectiveModel) || modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db))
+	allowCodexAccounts := modelIDInList(effectiveModel, SupportedModelIDs(c.Request.Context(), h.db))
 	var accountFilter auth.AccountFilter
 	if nativeRemoteCompactionV2 {
 		accountFilter = accountFilterForInlineCompactionModelWithOriginal(logModel, effectiveModel, allowCodexAccounts)
@@ -4034,34 +4014,6 @@ func (h *Handler) Responses(c *gin.Context) {
 	accountFilter = excludeClaudeAccountsFilter(accountFilter)
 	accountFilter = applyAffinityGroupRouting(c, sessionIdentity, accountFilter)
 	accountFilter = h.applyScopeBudgetFilter(c, accountFilter)
-	// Excel native tool IDs belong to the account that produced them. Never
-	// borrow a second Excel account on capacity overflow or retry.
-	if auth.IsExcelModel(effectiveModel) && hasExcelToolHistory(codexBody) {
-		sessionID := resolveUpstreamSessionID(apiKeyID, sessionIdentity.upstreamSeed, sessionIdentity.explicitUpstreamID, false)
-		clientKey := strings.TrimSpace(strings.TrimPrefix(c.GetHeader("Authorization"), "Bearer "))
-		owner, err := resolveExcelHistoryOwner(c.Request.Context(), codexBody, sessionID, clientKey)
-		canMigrate := os.Getenv("EXCEL_HISTORY_MIGRATION") == "1" && excelHistoryCanMigrate(codexBody)
-		if err != nil && !canMigrate {
-			log.Printf("Excel history owner lookup failed: %v", err)
-			c.JSON(http.StatusConflict, gin.H{"error": gin.H{
-				"type": "invalid_request_error", "code": "excel_history_unavailable",
-				"message": "Original Excel tool history cannot be resolved; retry later or start a new conversation if history was lost",
-			}})
-			return
-		}
-		if canMigrate {
-			c.Request = c.Request.WithContext(context.WithValue(c.Request.Context(), excelMigrationContextKey{}, owner))
-		} else {
-			previousFilter := accountFilter
-			accountFilter = func(a *auth.Account) bool {
-				return a.ID() == owner && (previousFilter == nil || previousFilter(a))
-			}
-		}
-		// Persisted native-call ownership supersedes stale in-memory affinity.
-		turnContinuationPinned = false
-	} else if boundID, bound := h.store.SessionAffinityAccountID(affinityKey); bound {
-		accountFilter = pinExcelContinuationFilter(effectiveModel, rawBody, boundID, accountFilter)
-	}
 	// resolveCompactionAffinity 只在已知来源相互冲突时报错；缓存故障按未知
 	// 来源处理，保持正常调度。
 	compactionAffinity, compactionAffinityErr := h.resolveCompactionAffinity(c.Request.Context(), rawBody)
@@ -4218,7 +4170,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		attemptLogEffectiveModel := logEffectiveModel
 		// relay/Grok 账号默认走 HTTP，这里排除全局强制 WS，避免日志把它们错标成 via_websocket。
 		// 打开了上游 WebSocket 的 OpenAI Responses 中转账号在体积判断之后单独改回 WS。
-		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !account.IsRelayStyle() && !auth.IsExcelModel(attemptEffectiveModel)
+		useWebsocket := h.shouldUseWebsocketForHTTP() && !wsHTTPFallback.ForceHTTP() && !account.IsRelayStyle()
 		// 生图请求强制走 HTTP：WebSocket 传输大体积图片数据会卡死（issue #220）；
 		// 自然语言生图意图也需保留 image_generation 工具（issue #288）。
 		if useWebsocket && rawResponsesBodyShouldForceHTTPForImageGeneration(rawBody) {
@@ -5954,10 +5906,6 @@ func (h *Handler) ResponsesCompact(c *gin.Context) {
 	// 先让全局/渠道映射看到客户端原始模型（包括 -openai-compact 别名）；
 	// 没有命中映射时，再按兼容规则剥离后缀。
 	rawBody, requestModel, mappedModel, mappingApplied := h.applyConfiguredCompactModelMappingToBody(rawBody, supportedModels)
-	if auth.IsExcelModel(gjson.GetBytes(rawBody, "model").String()) {
-		ErrorToGinResponse(c, ErrBadRequest("Excel does not support /responses/compact; use inline compaction on /responses"))
-		return
-	}
 	rawBody, _ = normalizePortableResponsesCompactionHistory(rawBody)
 	setRawRequestBody(c, rawBody)
 
@@ -8474,21 +8422,6 @@ func (h *Handler) applyCooldown(account *auth.Account, statusCode int, body []by
 }
 
 func (h *Handler) applyCooldownForModel(account *auth.Account, statusCode int, body []byte, resp *http.Response, model string) codex429Decision {
-	if isExcelToolContractError(body) {
-		return codex429Decision{}
-	}
-	// An Excel model entitlement error must not put the whole OAuth account
-	// into payment_required: other Excel/Codex models may still be usable.
-	if isExcelModelAccessChanged(statusCode, body) {
-		if h.store == nil || model == "" {
-			return codex429Decision{}
-		}
-		cooldown := h.store.MarkModelCooldown(account, model, 5*time.Minute, "excel_model_access_changed")
-		return codex429Decision{
-			Scope: rateLimitScopeModel, Reason: "excel_model_access_changed",
-			Model: model, ResetAt: cooldown.ResetAt, Cooldown: time.Until(cooldown.ResetAt),
-		}
-	}
 	// Grok 上游的错误语义与 Codex 不同（免费额度耗尽/超支限制/Retry-After），单独映射。
 	if account.IsGrokAPI() {
 		return h.applyGrokCooldownForModel(account, statusCode, body, resp, model)

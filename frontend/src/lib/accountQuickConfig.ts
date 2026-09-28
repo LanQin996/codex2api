@@ -15,8 +15,6 @@ export type QuickConfigSaveError =
 export type QuickConfigReadySaveError = Exclude<QuickConfigSaveError, "not_ready">;
 
 export interface QuickConfigAccountSource {
-  excel_route_mode?: "off" | "oauth" | "session_file";
-  excel_bridge_configured?: boolean;
   upstream_request_id_header?: string | null;
   id: number;
   detail_loaded?: boolean;
@@ -32,8 +30,6 @@ export interface QuickConfigAccountSource {
 }
 
 export interface QuickConfigFormState {
-  excelRouteMode: "off" | "oauth" | "session_file";
-  excelBridgeConfigured: boolean;
   upstreamRequestIdHeader: string;
   accountId: number;
   fingerprintMode: CodexFingerprintMode;
@@ -113,8 +109,6 @@ export function formStateFromAccount(
 ): QuickConfigFormState {
   return {
     accountId: account.id,
-    excelRouteMode: account.excel_route_mode ?? "off",
-    excelBridgeConfigured: account.excel_bridge_configured ?? false,
     upstreamRequestIdHeader: account.upstream_request_id_header ?? "",
     fingerprintMode: normalizeCodexFingerprintMode(account.codex_fingerprint_mode),
     scoreMode: account.score_bias_override != null ? "custom" : "default",
@@ -210,7 +204,6 @@ export function buildQuickConfigSavePayload(
       custom_headers: parsedHeaders.value,
       upstream_request_id_header: form.upstreamRequestIdHeader.trim(),
       codex_fingerprint_mode: form.fingerprintMode,
-      excel_route_mode: form.excelRouteMode,
       tags: form.tags,
       group_ids: form.groupIds,
     },

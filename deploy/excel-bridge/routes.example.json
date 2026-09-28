@@ -1,4 +1,0 @@
-{
-  "123": {"credential_mode": "oauth"},
-  "456": {"credential_mode": "session_file"}
-}
