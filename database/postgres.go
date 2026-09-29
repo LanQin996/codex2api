@@ -239,6 +239,8 @@ type DB struct {
 	scopeQuotaMu        sync.Mutex
 	scopeQuotaKeys      map[int64]struct{}
 	scopeQuotaExpiresAt time.Time
+	credentialOpsMu     sync.Mutex
+	credentialOpsReady  bool
 }
 
 const (

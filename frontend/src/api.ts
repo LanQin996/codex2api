@@ -1685,12 +1685,20 @@ export const api = {
   testProxy: (url: string, id?: number, lang?: string) =>
     request<ProxyTestResult>('/proxies/test', { method: 'POST', body: JSON.stringify({ url, id, lang }) }),
   // OAuth
+  credentialOperations: () => request<{ encryption_ready: boolean; worker_ready: boolean; items: CredentialOperation[] }>('/credential-operations'),
+  importCredentialOperations: (content: string, proxy_url: string, replace_existing = false) => request<{ items: CredentialOperation[] }>('/credential-operations/import', { method: 'POST', body: JSON.stringify({ content, proxy_url, replace_existing }) }),
+  controlCredentialOperation: (id: string, action: 'pause' | 'resume' | 'retry') => request<MessageResponse>(`/credential-operations/${encodeURIComponent(id)}/${action}`, { method: 'POST' }),
   generateOAuthURL: (data: { proxy_url?: string; redirect_uri?: string }) =>
     request<OAuthURLResponse>('/oauth/generate-auth-url', { method: 'POST', body: JSON.stringify(data) }),
   exchangeOAuthCode: (data: { session_id: string; code: string; state: string; name?: string; proxy_url?: string }) =>
     request<OAuthExchangeResponse>('/oauth/exchange-code', { method: 'POST', body: JSON.stringify(data) }),
   updateOAuthAccount: (id: number, data: UpdateOAuthAccountRequest) =>
     request<OAuthExchangeResponse>(`/accounts/${id}/oauth/exchange-code`, { method: 'POST', body: JSON.stringify(data) }),
+}
+
+export interface CredentialOperation {
+  id: string; email: string; account_id: number; state: string; enabled: boolean;
+  auto_relogin: boolean; failures: number; next_run: number; message: string; lease_until: number;
 }
 
 export interface ProxyRow {

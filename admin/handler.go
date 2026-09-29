@@ -45,6 +45,8 @@ import (
 
 // Handler 管理后台 API 处理器
 type Handler struct {
+	credentialOpsOnce  sync.Once
+	credentialOps      *credentialOperationsService
 	imageQueue         *imageJobQueue
 	qualityTestContext context.Context
 	qualityTestWG      sync.WaitGroup
@@ -1393,6 +1395,9 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.GET("/proxies/:id/risk-score/history", h.ListProxyRiskScoreHistory)
 
 	// OAuth 授权流程
+	api.GET("/credential-operations", h.ListCredentialOperations)
+	api.POST("/credential-operations/import", h.ImportCredentialOperations)
+	api.POST("/credential-operations/:operation_id/:action", h.ControlCredentialOperations)
 	api.POST("/oauth/generate-auth-url", h.GenerateOAuthURL)
 	api.POST("/oauth/exchange-code", h.ExchangeOAuthCode)
 	api.GET("/oauth/poll-callback", h.PollOAuthCallback)

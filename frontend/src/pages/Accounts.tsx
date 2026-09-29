@@ -236,6 +236,7 @@ import {
 import CodexInviteView from "../components/CodexInviteView";
 import InviteGuideModal from "../components/InviteGuideModal";
 import Sub2APIImportModal from "../components/Sub2APIImportModal";
+import TwoFAImport from "../components/TwoFAImport";
 import AccountQuotaDistributionChart from "../components/AccountQuotaDistributionChart";
 import AccountRateLimitRecoveryChart from "../components/AccountRateLimitRecoveryChart";
 import AccountGroupMultiSelect from "../components/AccountGroupMultiSelect";
@@ -2055,7 +2056,7 @@ export default function Accounts() {
     ids: [],
   });
   const [addMethod, setAddMethod] = useState<
-    "rt" | "st" | "at" | "session" | "openai" | "oauth" | "agentIdentity"
+    "rt" | "st" | "at" | "session" | "openai" | "oauth" | "agentIdentity" | "twofa"
   >("oauth");
   const [agentIdentityJson, setAgentIdentityJson] = useState("");
   const [agentIdentityProxyUrl, setAgentIdentityProxyUrl] = useState("");
@@ -7841,7 +7842,7 @@ export default function Accounts() {
                       ? t("accounts.adding")
                       : t("accounts.agentIdentityImportBtn")}
                   </Button>
-                ) : oauthStep === "generate" ? (
+                ) : addMethod === "twofa" ? null : oauthStep === "generate" ? (
                   <Button
                     onClick={() => void handleOAuthGenerate()}
                     disabled={oauthGenerating}
@@ -7865,6 +7866,7 @@ export default function Accounts() {
           >
             {/* Tab switcher */}
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-1 p-1 mb-5 rounded-xl bg-muted/50 border border-border">
+              <button onClick={() => setAddMethod("twofa")} className={`min-w-0 rounded-lg px-2 py-2 text-sm font-semibold ${addMethod === "twofa" ? "bg-background shadow-sm text-foreground" : "text-muted-foreground hover:text-foreground"}`}>2FA 登录导入</button>
               <button
                 onClick={() => {
                   setAddMethod("oauth");
@@ -7949,7 +7951,9 @@ export default function Accounts() {
               </button>
             </div>
 
-            {addMethod === "rt" ? (
+            {addMethod === "twofa" ? (
+              <TwoFAImport onUpdated={() => void reloadSilently()} />
+            ) : addMethod === "rt" ? (
               <div className="space-y-4">
                 <div>
                   <label className="block mb-2 text-sm font-semibold text-muted-foreground">
