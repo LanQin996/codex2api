@@ -437,6 +437,8 @@ export interface AccountRow {
   /** True once the OAuth usage probe has run for this row (even with no windows). */
   claude_usage_windows_probed?: boolean
   timezone?: string
+  /** 账号页跳转地址;空值回退打开 base_url(api-base)。 */
+  account_href?: string
   custom_headers?: Record<string, string> | null
   health_tier?: string
   scheduler_score?: number
@@ -1569,6 +1571,7 @@ export interface UpdateAccountSchedulerRequest {
   claude_version_policy?: 'passthrough' | 'fixed' | 'minimum' | null
   claude_client_version?: string | null
   timezone?: string | null
+  account_href?: string | null
 }
 
 export interface BatchUpdateAccountsRequest extends UpdateAccountSchedulerRequest {
@@ -3527,9 +3530,15 @@ export interface APIKeyAccountStatsResponse {
   membership_basis: 'current_and_deleted_last_membership'
 }
 
+export type UserBillingMode = 'token' | 'per_image' | 'per_video' | 'per_second'
+
 export interface UsageLog {
-  user_billing_mode?: '' | 'token' | 'per_image'
+  /** Generated video duration (seconds) on Grok video settlement rows. */
+  video_seconds?: number
+  user_billing_mode?: '' | UserBillingMode
+  /** Unit price for unit billing modes (per image / video / second). */
   image_unit_price?: number
+  /** Billed units: images, videos or seconds depending on user_billing_mode. */
   billed_image_count?: number
   request_id?: string
   upstream_request_id?: string
@@ -3669,8 +3678,10 @@ export interface ChartAggregation {
 }
 
 export interface ModelPricingOverride {
-  user_billing_mode?: 'token' | 'per_image'
+  user_billing_mode?: UserBillingMode
   image_unit_price?: number
+  /** Upstream cost per media unit (USD / image or USD / second) for Grok Imagine models. */
+  media_unit_cost?: number
   image_input?: number
   cached_image_input?: number
   source?: string
@@ -4013,10 +4024,13 @@ export interface PublicAPIKeyUsageBreakdown {
 }
 
 export interface PublicAPIKeyUsageLog {
-  user_billing_mode?: '' | 'token' | 'per_image'
+  user_billing_mode?: '' | UserBillingMode
+  /** Unit price for unit billing modes (per image / video / second). */
   image_unit_price?: number
+  /** Billed units: images, videos or seconds depending on user_billing_mode. */
   billed_image_count?: number
   id: number
+  channel?: UpstreamChannel | ''
   endpoint: string
   model: string
   effective_model: string
@@ -4048,11 +4062,23 @@ export interface PublicAPIKeyUsageLog {
   created_at: ISODateString
 }
 
+/** Request-log filters for the public key usage page; they only narrow recent_logs. */
+export interface PublicAPIKeyUsageLogFilter {
+  model?: string
+  endpoint?: string
+  status?: '' | 'success' | 'error' | '4xx' | '5xx' | '429'
+  stream?: '' | 'stream' | 'sync'
+  channel?: '' | UpstreamChannel
+}
+
 export interface PublicAPIKeyUsageReport {
   summary: PublicAPIKeyUsageSummary
   windows: PublicAPIKeyUsageWindows
   models: PublicAPIKeyUsageBreakdown[]
   endpoints: PublicAPIKeyUsageBreakdown[]
+  /** Requested models / inbound endpoints seen in the range (unaffected by log filters). */
+  log_models?: string[]
+  log_endpoints?: string[]
   recent_logs: PublicAPIKeyUsageLog[]
   recent_logs_total: number
   recent_logs_page: number
