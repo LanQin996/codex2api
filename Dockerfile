@@ -40,11 +40,31 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 # ============================================================
 # Stage 3: 最终运行镜像
 # ============================================================
-FROM alpine:3.19
+FROM node:20-bookworm-slim
 
-RUN apk --no-cache add ca-certificates tzdata
+ARG TOSUB2_REF=v1.7.1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates tzdata python3 python3-venv git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Keep the protocol dependency layer independent from the Go binary layer. In
+# BuildKit, npm and pip caches survive ordinary application-only rebuilds.
+RUN --mount=type=cache,target=/root/.npm \
+    git clone --depth 1 --branch "${TOSUB2_REF}" https://github.com/poxiao33/toSub2.git /opt/tosub2 \
+    && npm --prefix /opt/tosub2 ci --omit=dev --ignore-scripts --no-audit --no-fund \
+    && rm -rf /opt/tosub2/.git
+
+RUN python3 -m venv /opt/tosub2/.venv
+
+RUN --mount=type=cache,target=/root/.cache/pip \
+    /opt/tosub2/.venv/bin/pip install -r /opt/tosub2/requirements.txt
 
 COPY --from=go-builder /codex2api /usr/local/bin/codex2api
+
+ENV TOSUB2_ROOT=/opt/tosub2 \
+    TOSUB2_PYTHON=/opt/tosub2/.venv/bin/python \
+    CREDENTIAL_OPS_NODE=node
 
 EXPOSE 8080
 
