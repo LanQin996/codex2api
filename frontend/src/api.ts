@@ -1685,6 +1685,8 @@ export const api = {
   testProxy: (url: string, id?: number, lang?: string) =>
     request<ProxyTestResult>('/proxies/test', { method: 'POST', body: JSON.stringify({ url, id, lang }) }),
   // OAuth
+  getCredentialOperationsSettings: () => request<{ concurrency: number }>('/settings/credential-operations'),
+  updateCredentialOperationsSettings: (concurrency: number) => request<{ concurrency: number }>('/settings/credential-operations', { method: 'PUT', body: JSON.stringify({ concurrency }) }),
   credentialOperations: () => request<{ encryption_ready: boolean; worker_ready: boolean; items: CredentialOperation[] }>('/credential-operations'),
   importCredentialOperations: (content: string, proxy_url: string, replace_existing = false) => request<{ items: CredentialOperation[] }>('/credential-operations/import', { method: 'POST', body: JSON.stringify({ content, proxy_url, replace_existing }) }),
   controlCredentialOperation: (id: string, action: 'pause' | 'resume' | 'retry') => request<MessageResponse>(`/credential-operations/${encodeURIComponent(id)}/${action}`, { method: 'POST' }),

@@ -145,23 +145,16 @@ func (h *Handler) StartCredentialOperations(ctx context.Context) {
 			s.running.Store(true)
 			log.Print("[credential-ops] local 2FA worker started")
 			defer s.running.Store(false)
-			timer := time.NewTicker(5 * time.Second)
-			defer timer.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-timer.C:
-				}
+			credentialops.RunPool(ctx, 5*time.Second, func(ctx context.Context) (int, error) {
+				settings, err := h.db.GetCredentialOperationsSettings(ctx)
+				return settings.Concurrency, err
+			}, func(ctx context.Context) (func(context.Context), error) {
 				job, err := h.db.ClaimCredentialOperation(ctx, uuid.NewString())
-				if errors.Is(err, sql.ErrNoRows) {
-					continue
-				}
 				if err != nil {
-					continue
+					return nil, err
 				}
-				h.runCredentialOperation(ctx, s, job)
-			}
+				return func(ctx context.Context) { h.runCredentialOperation(ctx, s, job) }, nil
+			})
 		}()
 	})
 }
@@ -212,6 +205,10 @@ func (h *Handler) runCredentialOperation(ctx context.Context, s *credentialOpera
 			return
 		}
 		// The gateway helper's fixed prefix carries the actual upstream status.
+		if credentialops.IsAccountBlockedResponse(probeErr.Error()) {
+			_ = h.db.BlockCredentialOperation(ctx, job)
+			return
+		}
 		authFailure := strings.HasPrefix(probeErr.Error(), "codex models upstream status 401:") || strings.HasPrefix(probeErr.Error(), "codex models upstream status 403:")
 		job.NextRun = time.Now().Add(5 * time.Minute).Unix()
 		job.Message = "巡检临时异常，不触发重登"
@@ -246,6 +243,10 @@ func (h *Handler) runCredentialOperation(ctx context.Context, s *credentialOpera
 		var err error
 		credentials, err = s.login(ctx, login)
 		if err != nil {
+			if errors.Is(err, credentialops.ErrAccountBlocked) {
+				_ = h.db.BlockCredentialOperation(ctx, job)
+				return
+			}
 			fail("本地登录失败，请检查登录资料、代理及 Worker 配置后重试")
 			return
 		}

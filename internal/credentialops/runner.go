@@ -71,8 +71,13 @@ func (r Runner) Login(ctx context.Context, login Login) (map[string]any, error) 
 	}
 	cmd.Env = append(cmd.Env, "CHATGPT_LOGIN_PASSWORD="+login.Password, "CHATGPT_TOTP_SECRET="+login.TOTP)
 	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
+	var failureOutput blockedOutput
+	defer func() { clear(failureOutput.tail) }()
+	cmd.Stderr = &failureOutput
 	if err = cmd.Run(); err != nil {
+		if failureOutput.blocked {
+			return nil, ErrAccountBlocked
+		}
 		return nil, errors.New("local login failed; check worker configuration or login details")
 	}
 	file, err := os.Open(output)

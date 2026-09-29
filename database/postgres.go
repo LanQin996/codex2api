@@ -8120,6 +8120,9 @@ func (db *DB) BatchSetError(ctx context.Context, ids []int64, errorMsg string) e
 
 // SoftDeleteAccount 将账号标记为 deleted，保留数据用于审计和事件追溯。
 func (db *DB) SoftDeleteAccount(ctx context.Context, id int64) error {
+	if err := db.EnsureCredentialOperations(ctx); err != nil {
+		return err
+	}
 	return db.withSQLiteWriteLock(ctx, func() error {
 		tx, err := db.conn.BeginTx(ctx, nil)
 		if err != nil {
@@ -8127,6 +8130,10 @@ func (db *DB) SoftDeleteAccount(ctx context.Context, id int64) error {
 		}
 		defer tx.Rollback()
 
+		// Match completion lock order: operation first, then account.
+		if _, err := tx.ExecContext(ctx, `DELETE FROM credential_operations WHERE account_id=$1`, id); err != nil {
+			return err
+		}
 		query := `
 			UPDATE accounts
 			SET status = 'deleted',
@@ -8258,11 +8265,17 @@ func (db *DB) RestoreAccount(ctx context.Context, id int64) error {
 
 // PurgeAccount 从回收站彻底删除账号（物理删除，不可恢复）。
 func (db *DB) PurgeAccount(ctx context.Context, id int64) error {
+	if err := db.EnsureCredentialOperations(ctx); err != nil {
+		return err
+	}
 	tx, err := db.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `DELETE FROM credential_operations WHERE account_id=$1`, id); err != nil {
+		return err
+	}
 	// Grok observations intentionally do not rely on foreign-key cascades; keep
 	// purge behavior consistent across SQLite and PostgreSQL.
 	if err := db.deleteGrokAccountStateTx(ctx, tx, "= $1", id); err != nil {
@@ -8291,12 +8304,18 @@ func (db *DB) PurgeAccount(ctx context.Context, id int64) error {
 
 // PurgeDeletedAccounts 清空回收站，返回被彻底删除的账号数量。
 func (db *DB) PurgeDeletedAccounts(ctx context.Context) (int64, error) {
+	if err := db.EnsureCredentialOperations(ctx); err != nil {
+		return 0, err
+	}
 	tx, err := db.conn.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
 	deletedPredicate := `IN (SELECT id FROM accounts WHERE status = 'deleted' OR COALESCE(error_message, '') = 'deleted')`
+	if _, err := tx.ExecContext(ctx, `DELETE FROM credential_operations WHERE account_id `+deletedPredicate); err != nil {
+		return 0, err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM model_capability_snapshots WHERE account_id `+deletedPredicate); err != nil {
 		return 0, err
 	}
@@ -8325,6 +8344,9 @@ func (db *DB) PurgeDeletedAccounts(ctx context.Context) (int64, error) {
 
 // BatchSoftDeleteAccounts 批量软删除账号，分批执行避免 SQL 参数过多。
 func (db *DB) BatchSoftDeleteAccounts(ctx context.Context, ids []int64) error {
+	if err := db.EnsureCredentialOperations(ctx); err != nil {
+		return err
+	}
 	return db.withSQLiteWriteLock(ctx, func() error {
 		const batchSize = 500
 		for i := 0; i < len(ids); i += batchSize {
@@ -8352,8 +8374,20 @@ func (db *DB) BatchSoftDeleteAccounts(ctx context.Context, ids []int64) error {
 				WHERE status <> 'deleted' AND id IN (%s)`,
 				strings.Join(placeholders, ","),
 			)
-			if _, err := db.conn.ExecContext(ctx, query, args...); err != nil {
+			tx, err := db.conn.BeginTx(ctx, nil)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM credential_operations WHERE account_id IN (`+strings.Join(placeholders, ",")+`)`, args...); err != nil {
+				tx.Rollback()
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, query, args...); err != nil {
+				tx.Rollback()
 				return fmt.Errorf("batch %d-%d failed: %w", i, end, err)
+			}
+			if err := tx.Commit(); err != nil {
+				return err
 			}
 		}
 		return nil

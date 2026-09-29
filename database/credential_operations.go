@@ -44,6 +44,10 @@ func (db *DB) EnsureCredentialOperations(ctx context.Context) error {
  login_cipher TEXT NOT NULL, result_cipher TEXT NOT NULL DEFAULT '', snapshot TEXT NOT NULL DEFAULT '',
  lease TEXT NOT NULL DEFAULT '', lease_until BIGINT NOT NULL DEFAULT 0)`)
 	if err == nil {
+		_, err = db.conn.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS credential_operations_settings (
+ id INTEGER PRIMARY KEY CHECK (id=1), concurrency INTEGER NOT NULL CHECK (concurrency BETWEEN 1 AND 8))`)
+	}
+	if err == nil {
 		db.credentialOpsReady = true
 	}
 	return err
@@ -60,6 +64,9 @@ func scanCredentialOperation(s credentialOperationScanner) (*CredentialOperation
 }
 func (db *DB) ListCredentialOperations(ctx context.Context) ([]CredentialOperation, error) {
 	if err := db.EnsureCredentialOperations(ctx); err != nil {
+		return nil, err
+	}
+	if err := db.cleanupDeletedCredentialOperations(ctx); err != nil {
 		return nil, err
 	}
 	rows, err := db.conn.QueryContext(ctx, `SELECT `+credentialOperationColumns+` FROM credential_operations ORDER BY email LIMIT 1000`)
@@ -108,6 +115,9 @@ func (db *DB) ClaimCredentialOperation(ctx context.Context, owner string) (*Cred
 	if err := db.EnsureCredentialOperations(ctx); err != nil {
 		return nil, err
 	}
+	if err := db.cleanupDeletedCredentialOperations(ctx); err != nil {
+		return nil, err
+	}
 	now := time.Now().Unix()
 	// A single conditional UPDATE is safe across processes on both databases.
 	return scanCredentialOperation(db.conn.QueryRowContext(ctx, `UPDATE credential_operations SET lease=$1,lease_until=$2
@@ -139,7 +149,7 @@ func (db *DB) ControlCredentialOperation(ctx context.Context, id, action string)
 	case "resume":
 		q = `UPDATE credential_operations SET enabled=TRUE,next_run=0 WHERE id=$1`
 	case "retry":
-		q = `UPDATE credential_operations SET state=CASE WHEN result_cipher<>'' THEN 'enrollment_pending' WHEN account_id>0 THEN 'enrolled' ELSE 'queued' END,next_run=0,message='' WHERE id=$1 AND enabled=TRUE AND lease_until<=$2`
+		q = `UPDATE credential_operations SET state=CASE WHEN result_cipher<>'' THEN 'enrollment_pending' WHEN account_id>0 THEN 'enrolled' ELSE 'queued' END,auto_relogin=TRUE,next_run=0,message='' WHERE id=$1 AND enabled=TRUE AND lease_until<=$2`
 	default:
 		return errors.New("invalid operation action")
 	}

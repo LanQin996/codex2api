@@ -1396,6 +1396,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 
 	// OAuth 授权流程
 	api.GET("/credential-operations", h.ListCredentialOperations)
+	api.GET("/settings/credential-operations", h.GetCredentialOperationsSettings)
+	api.PUT("/settings/credential-operations", h.UpdateCredentialOperationsSettings)
 	api.POST("/credential-operations/import", h.ImportCredentialOperations)
 	api.POST("/credential-operations/:operation_id/:action", h.ControlCredentialOperations)
 	api.POST("/oauth/generate-auth-url", h.GenerateOAuthURL)

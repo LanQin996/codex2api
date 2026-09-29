@@ -4,6 +4,7 @@ import { useTranslation } from 'react-i18next'
 import { api, resetAdminAuthState, setAdminKey } from '../api'
 import { formatBeijingTime, getTimezone, setTimezone } from '../utils/time'
 import PageHeader from '../components/PageHeader'
+import CredentialOperationsSettings from '../components/CredentialOperationsSettings'
 import StateShell from '../components/StateShell'
 import { useDataLoader } from '../hooks/useDataLoader'
 import { useToast } from '../hooks/useToast'
@@ -3285,6 +3286,9 @@ export default function Settings() {
           {activeTab === 'codex' ? (
             <>
               <SettingsSection id="settings-codex-quota" title={t('settings.nav.codexQuota')} description={t('settings.nav.codexQuotaDesc')} icon={<Gauge className="size-4" />}>
+              <SettingsCard title="2FA 后台任务" icon={<Shield className="size-4" />}>
+                <CredentialOperationsSettings />
+              </SettingsCard>
               <div className={SETTINGS_CARD_GRID_2}>
                 <SettingsCard title={t('settings.probeScheduling')} icon={<RefreshCw className="size-4" />}>
                   <div className="space-y-4">

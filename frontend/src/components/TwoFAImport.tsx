@@ -7,6 +7,7 @@ const stateLabels: Record<string, string> = {
   enrollment_pending: "登录成功，等待完成登记",
   enrolled: "已导入并启用凭证运营",
   login_failed: "未完成，需要重试",
+  recovery_blocked: "账号封禁或停用，自动恢复已停止",
 };
 
 export default function TwoFAImport({ onUpdated }: { onUpdated: () => void }) {
@@ -81,6 +82,7 @@ export default function TwoFAImport({ onUpdated }: { onUpdated: () => void }) {
     }
   };
   const control = async (id: string, action: "pause" | "resume" | "retry") => {
+    if (action === "retry" && rows.some(row => row.id === id && row.state === "recovery_blocked") && !window.confirm("请先确认账号已解封或停用状态已解除。确定恢复该账号的自动巡检和重登吗？")) return;
     setBusy(true);
     setError("");
     try {
@@ -177,6 +179,7 @@ export default function TwoFAImport({ onUpdated }: { onUpdated: () => void }) {
                 {row.enabled ? "暂停" : "恢复"}
               </Button>
               {(row.state === "login_failed" ||
+                row.state === "recovery_blocked" ||
                 row.state === "enrollment_pending") && (
                 <Button
                   size="sm"
