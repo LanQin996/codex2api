@@ -1804,6 +1804,8 @@
     "rateLimitRecover": "清除冷却并重试",
     "rateLimitRecoverHint": "仅清除本地账号及模型冷却，不会解除上游限流或恢复额度。仍返回 429 时将再次冷却。确认重置？",
     "quickConfigLoadingDesc": "正在读取完整账号配置。加载完成前不能保存，以免用空值覆盖请求头等详情字段。",
+    "excelBPSEnabled": "启用 Excel Basispoints",
+    "excelBPSHint": "此账号的 Responses 请求优先使用 Excel Basispoints；不支持的请求按服务端规则回退。",
     "openaiModels": "模型列表",
     "openaiModelsAdd": "添加",
     "openaiModelsFetch": "请求 /v1/models",

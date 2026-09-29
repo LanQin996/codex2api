@@ -15,6 +15,14 @@ export type QuickConfigSaveError =
 export type QuickConfigReadySaveError = Exclude<QuickConfigSaveError, "not_ready">;
 
 export interface QuickConfigAccountSource {
+  openai_excel_bps?: boolean;
+  account_type?: string;
+  openai_responses_api?: boolean;
+  grok_api?: boolean;
+  antigravity_api?: boolean;
+  claude_api?: boolean;
+  agent_identity?: boolean;
+  at_only?: boolean;
   upstream_request_id_header?: string | null;
   id: number;
   detail_loaded?: boolean;
@@ -30,6 +38,8 @@ export interface QuickConfigAccountSource {
 }
 
 export interface QuickConfigFormState {
+  excelBPSEnabled: boolean;
+  excelBPSAvailable: boolean;
   upstreamRequestIdHeader: string;
   accountId: number;
   fingerprintMode: CodexFingerprintMode;
@@ -109,6 +119,11 @@ export function formStateFromAccount(
 ): QuickConfigFormState {
   return {
     accountId: account.id,
+    excelBPSEnabled: account.openai_excel_bps ?? false,
+    excelBPSAvailable: account.account_type === "oauth" &&
+      !account.openai_responses_api && !account.grok_api &&
+      !account.antigravity_api && !account.claude_api &&
+      !account.agent_identity && !account.at_only,
     upstreamRequestIdHeader: account.upstream_request_id_header ?? "",
     fingerprintMode: normalizeCodexFingerprintMode(account.codex_fingerprint_mode),
     scoreMode: account.score_bias_override != null ? "custom" : "default",
@@ -195,6 +210,7 @@ export function buildQuickConfigSavePayload(
   return {
     ok: true,
     payload: {
+      ...(form.excelBPSAvailable ? { openai_excel_bps: form.excelBPSEnabled } : {}),
       score_bias_override: form.scoreMode === "custom" ? parsedScoreBias : null,
       base_concurrency_override:
         form.concurrencyMode === "custom" ? parsedBaseConcurrency : null,

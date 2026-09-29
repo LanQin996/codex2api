@@ -20,6 +20,7 @@ const listRow = {
 
 const detailedRow = {
   id: 42,
+  account_type: "oauth",
   detail_loaded: true,
   codex_fingerprint_mode: "full",
   score_bias_override: null,
@@ -121,6 +122,33 @@ test("ready details round-trip custom headers and full fingerprint mode", () => 
   assert.equal(result.payload.scheduler_priority, 8);
   assert.equal(result.payload.skip_warm_tier, true);
   assert.equal(result.payload.proxy_url, "http://127.0.0.1:7890");
+  assert.equal(result.payload.openai_excel_bps, false);
+});
+
+test("Excel Basispoints setting loads and saves both enabled and disabled", () => {
+  const enabled = formStateFromAccount({ ...detailedRow, openai_excel_bps: true });
+  assert.equal(enabled.excelBPSEnabled, true);
+  const enabledResult = buildQuickConfigSavePayload(enabled, true);
+  assert.equal(enabledResult.ok, true);
+  if (enabledResult.ok) assert.equal(enabledResult.payload.openai_excel_bps, true);
+
+  const disabledResult = buildQuickConfigSavePayload({ ...enabled, excelBPSEnabled: false }, true);
+  assert.equal(disabledResult.ok, true);
+  if (disabledResult.ok) assert.equal(disabledResult.payload.openai_excel_bps, false);
+});
+
+test("other account types omit the Excel Basispoints setting", () => {
+  for (const account of [
+    { ...detailedRow, account_type: "api_key" },
+    { ...detailedRow, openai_responses_api: true },
+    { ...detailedRow, agent_identity: true },
+  ]) {
+    const form = formStateFromAccount(account);
+    assert.equal(form.excelBPSAvailable, false);
+    const result = buildQuickConfigSavePayload(form, true);
+    assert.equal(result.ok, true);
+    if (result.ok) assert.equal("openai_excel_bps" in result.payload, false);
+  }
 });
 
 test("clearing the headers field after details loaded sends null, not an omitted key", () => {

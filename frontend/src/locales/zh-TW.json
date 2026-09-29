@@ -354,6 +354,8 @@
     }
   },
   "accounts": {
+    "excelBPSEnabled": "啟用 Excel Basispoints",
+    "excelBPSHint": "此帳號的 Responses 請求優先使用 Excel Basispoints；不支援的請求依伺服器規則回退。",
     "usageQuotaEstimate": "預計滿額 ${{amount}}",
     "usageQuotaEstimateHint": "{{window}} 滿額預計 = 本週期帳號成本 ÷ 已用比例。僅依本閘道紀錄估算，非官方額度；低用量時誤差較大。",
     "refreshAllUsage": "一鍵重新整理用量",

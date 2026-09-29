@@ -1804,6 +1804,8 @@
     "rateLimitRecover": "Clear cooldown and retry",
     "rateLimitRecoverHint": "Only clears local account/model cooldowns. This does not remove upstream limits or restore quota. Another 429 will reapply cooldown. Continue?",
     "quickConfigLoadingDesc": "Loading the full account configuration. Save stays disabled until this finishes, so empty list defaults cannot wipe headers or other detail fields.",
+    "excelBPSEnabled": "Enable Excel Basispoints",
+    "excelBPSHint": "Prefer Excel Basispoints for this account's Responses requests; unsupported requests follow server fallback rules.",
     "openaiModels": "Models",
     "openaiModelsAdd": "Add",
     "openaiModelsFetch": "Fetch /v1/models",

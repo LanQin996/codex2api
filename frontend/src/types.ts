@@ -388,6 +388,7 @@ export interface AccountRow {
   access_token_type?: string
   account_type?: string
   openai_responses_api?: boolean
+  openai_excel_bps?: boolean
   grok_api?: boolean
   antigravity_api?: boolean
   claude_api?: boolean
@@ -1549,6 +1550,7 @@ export interface GrokBatchImportResponse {
 }
 
 export interface UpdateAccountSchedulerRequest {
+  openai_excel_bps?: boolean
   upstream_request_id_header?: string | null
   score_bias_override?: number | null
   base_concurrency_override?: number | null
