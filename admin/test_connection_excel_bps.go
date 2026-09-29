@@ -141,14 +141,7 @@ func (h *Handler) runExcelBPSInteractiveTest(
 	hasContent := false
 	gotTerminal := false
 	lastEvent := ""
-	emitContent := func(text string) {
-		if strings.TrimSpace(text) == "" {
-			return
-		}
-		hasContent = true
-		recorder.contentReceived()
-		sendTestEvent(c, testEvent{Type: "content", Text: text})
-	}
+	emitContent := excelBPSTestContentEmitter(c, recorder, &hasContent, quality)
 	readErr := proxy.ReadSSEStream(stream, func(data []byte) bool {
 		recorder.observe(data)
 		kind := gjson.GetBytes(data, "type").String()
@@ -222,5 +215,18 @@ func (h *Handler) runExcelBPSInteractiveTest(
 			lastEvent = "unknown"
 		}
 		sendTestEvent(c, testEvent{Type: "error", Error: "Basispoints response ended before completion"})
+	}
+}
+
+// Whitespace-only deltas can separate SVG coordinates, CSS tokens and JS words.
+// Quality tests must preserve them exactly, just like the native Responses path.
+func excelBPSTestContentEmitter(c *gin.Context, recorder *codexTestRecorder, hasContent *bool, preserveWhitespace bool) func(string) {
+	return func(text string) {
+		if text == "" || (!preserveWhitespace && strings.TrimSpace(text) == "") {
+			return
+		}
+		*hasContent = true
+		recorder.contentReceived()
+		sendTestEvent(c, testEvent{Type: "content", Text: text})
 	}
 }
