@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { extractQualityTestHTML, qualityTestPreviewDocument, isQualityTestActive, qualityTestPlanTone, clampQualityTestFrameHeight, QUALITY_TEST_SIZE_SCRIPT, qualityTestFilterQuery } from './qualityTest.ts'
+import { extractQualityTestHTML, qualityTestPreviewDocument, isQualityTestActive, qualityTestPlanTone, qualityTestStatusKey, clampQualityTestFrameHeight, QUALITY_TEST_SIZE_SCRIPT, qualityTestFilterQuery } from './qualityTest.ts'
 import { readClaudeTestEvents } from './claudeConnectionTest.ts'
 
 test('quality preview extracts documents and SVG without rendering explanatory prose', () => {
@@ -68,4 +68,12 @@ test('queued jobs remain cancellable and latest-account queries carry channel fi
   assert.equal(params.get('channel'), 'codex')
   assert.equal(params.get('page'), '2')
   assert.equal(params.get('page_size'), '20')
+})
+
+test('quality status key separates broken upstream streams from rejections', () => {
+  assert.equal(qualityTestStatusKey(null), 'idle')
+  assert.equal(qualityTestStatusKey({ status: 'error' }), 'error')
+  assert.equal(qualityTestStatusKey({ status: 'error', interrupted: true }), 'streamInterrupted')
+  assert.equal(qualityTestStatusKey({ status: 'completed', interrupted: true }), 'completed')
+  assert.equal(qualityTestStatusKey({ status: 'interrupted' }), 'interrupted')
 })

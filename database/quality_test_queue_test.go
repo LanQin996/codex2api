@@ -3,6 +3,7 @@ package database
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -45,7 +46,7 @@ func TestQualityTestPersistentQueueClaimsAndIdempotency(t *testing.T) {
 	defer db.Close()
 	// Waiting must not consume the execution timeout or reported duration.
 	old := time.Now().Add(-time.Hour)
-	if _, err = db.conn.ExecContext(ctx, "UPDATE quality_test_jobs SET created_at=$1", db.timeArg(old)); err != nil {
+	if _, err = db.conn.ExecContext(ctx, "UPDATE quality_test_jobs SET created_at=$1,deadline_at=$2", db.timeArg(old), db.timeArg(old.Add(QualityTestDefaultTimeout))); err != nil {
 		t.Fatal(err)
 	}
 	var mu sync.Mutex
@@ -71,7 +72,7 @@ func TestQualityTestPersistentQueueClaimsAndIdempotency(t *testing.T) {
 		t.Fatalf("claimed %d, want 3", len(claimed))
 	}
 	for _, job := range claimed {
-		if job.ID > batch.JobIDs[2] || job.StartedAt == nil || job.DurationMS > 3000 || time.Until(job.DeadlineAt) < 9*time.Minute {
+		if job.ID > batch.JobIDs[2] || job.StartedAt == nil || job.DurationMS > 3000 || job.TimeoutMS != QualityTestDefaultTimeout.Milliseconds() || time.Until(job.DeadlineAt) < QualityTestDefaultTimeout-time.Minute {
 			t.Fatalf("bad claim or timing: %+v", job)
 		}
 	}
@@ -101,13 +102,44 @@ func TestQualityTestPersistentQueueClaimsAndIdempotency(t *testing.T) {
 	if err != nil || summary.Counts["queued"] != 0 || summary.Counts["cancelling"] != 3 || summary.Counts["completed"] != 1 || summary.Counts["stopped"] != 26 {
 		t.Fatalf("batch cancel: %+v %v", summary, err)
 	}
-	if err = db.ExpireQualityTests(ctx, time.Now().Add(11*time.Minute)); err != nil {
+	if err = db.ExpireQualityTests(ctx, time.Now().Add(QualityTestDefaultTimeout+time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if job, err := db.ClaimQualityTest(ctx); err != nil || job != nil {
 		t.Fatalf("interrupted tasks must not replay: %+v %v", job, err)
 	}
 }
+func TestQualityTestQueuedTimeoutStartsAtClaim(t *testing.T) {
+	db, err := New("sqlite", filepath.Join(t.TempDir(), "timeout.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	ctx := context.Background()
+	for i, timeout := range []time.Duration{5 * time.Minute, 30 * time.Minute, 0} {
+		batch, err := db.EnqueueQualityTestBatch(ctx, fmt.Sprintf("timeout-%d", i), "single", []QualityTestJob{{AccountID: int64(i + 1), Channel: "codex", Model: "model", TimeoutMS: timeout.Milliseconds()}}, nil)
+		if err != nil || len(batch.JobIDs) != 1 {
+			t.Fatalf("enqueue: %+v %v", batch, err)
+		}
+		old := time.Now().UTC().Add(-time.Hour)
+		// Zero reproduces pending jobs persisted before configurable timeouts.
+		if _, err := db.conn.ExecContext(ctx, "UPDATE quality_test_jobs SET created_at=$1,deadline_at=$2 WHERE id=$3", db.timeArg(old), db.timeArg(old.Add(timeout)), batch.JobIDs[0]); err != nil {
+			t.Fatal(err)
+		}
+		job, err := db.ClaimQualityTest(ctx)
+		if err != nil || job == nil {
+			t.Fatalf("claim: %+v %v", job, err)
+		}
+		want := timeout
+		if want == 0 {
+			want = QualityTestDefaultTimeout
+		}
+		if job.StartedAt == nil || job.TimeoutMS != want.Milliseconds() || time.Until(job.DeadlineAt) < want-time.Second || job.DurationMS > 1000 {
+			t.Fatalf("queue time changed execution timeout: %+v, want %v", job, want)
+		}
+	}
+}
+
 func TestQualityTestLatestFiltersBeforeDedupAndPagination(t *testing.T) {
 	db, err := New("sqlite", filepath.Join(t.TempDir(), "latest.db"))
 	if err != nil {

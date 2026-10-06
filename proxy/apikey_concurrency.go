@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"fmt"
+	"math"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -94,11 +95,11 @@ func (h *Handler) acquireAPIKeyConcurrency(c *gin.Context) (func(), bool) {
 		}
 	}
 	row := apiKeyRowFromContext(c)
-	if row == nil || row.ID <= 0 || row.Limits.MaxConcurrency <= 0 {
+	if row == nil || row.ID <= 0 {
 		return nil, true
 	}
 	limiter := h.apiKeyConcurrencyLimiter()
-	release, current, ok := limiter.acquire(row.ID, row.Limits.MaxConcurrency)
+	release, current, ok := limiter.acquireTracked(row.ID, row.Limits.MaxConcurrency)
 	if ok {
 		return release, true
 	}
@@ -109,14 +110,37 @@ func (h *Handler) acquireAPIKeyConcurrency(c *gin.Context) (func(), bool) {
 
 func (h *Handler) acquireAPIKeyConcurrencyForWebSocket(c *gin.Context) (func(), *api.APIError, bool) {
 	row := apiKeyRowFromContext(c)
-	if row == nil || row.ID <= 0 || row.Limits.MaxConcurrency <= 0 {
+	if row == nil || row.ID <= 0 {
 		return nil, nil, true
 	}
 	limiter := h.apiKeyConcurrencyLimiter()
-	release, current, ok := limiter.acquire(row.ID, row.Limits.MaxConcurrency)
+	release, current, ok := limiter.acquireTracked(row.ID, row.Limits.MaxConcurrency)
 	if ok {
 		return release, nil, true
 	}
 	msg := fmt.Sprintf("API key concurrency limit exceeded: %d inflight requests (max %d)", current, row.Limits.MaxConcurrency)
 	return nil, api.NewAPIError(api.ErrCodeRateLimitReached, msg, api.ErrorTypeRateLimit), false
+}
+
+// acquireTracked 为不限并发的密钥保留计数，不改变限流器的旁路约定。
+func (l *apiKeyConcurrencyLimiter) acquireTracked(id int64, limit int) (func(), int64, bool) {
+	if limit <= 0 {
+		limit = math.MaxInt
+	}
+	return l.acquire(id, limit)
+}
+
+// APIKeyConcurrencySnapshot 返回当前进程中各密钥的并发快照。
+func (h *Handler) APIKeyConcurrencySnapshot() map[int64]int64 {
+	result := make(map[int64]int64)
+	if h == nil {
+		return result
+	}
+	limiter := h.apiKeyConcurrencyLimiter()
+	limiter.mu.Lock()
+	defer limiter.mu.Unlock()
+	for id, counter := range limiter.counters {
+		result[id] = atomic.LoadInt64(&counter.inflight)
+	}
+	return result
 }

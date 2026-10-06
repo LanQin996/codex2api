@@ -15,7 +15,6 @@ export type QuickConfigSaveError =
 export type QuickConfigReadySaveError = Exclude<QuickConfigSaveError, "not_ready">;
 
 export interface QuickConfigAccountSource {
-  openai_excel_bps?: boolean;
   account_type?: string;
   openai_responses_api?: boolean;
   grok_api?: boolean;
@@ -31,6 +30,7 @@ export interface QuickConfigAccountSource {
   base_concurrency_override?: number | null;
   scheduler_priority?: number | null;
   skip_warm_tier?: boolean;
+  keep_concurrency_on_degrade?: boolean;
   proxy_url?: string | null;
   custom_headers?: Record<string, string> | null;
   tags?: string[] | null;
@@ -38,8 +38,6 @@ export interface QuickConfigAccountSource {
 }
 
 export interface QuickConfigFormState {
-  excelBPSEnabled: boolean;
-  excelBPSAvailable: boolean;
   upstreamRequestIdHeader: string;
   accountId: number;
   fingerprintMode: CodexFingerprintMode;
@@ -49,6 +47,7 @@ export interface QuickConfigFormState {
   concurrencyInput: string;
   schedulerPriorityInput: string;
   skipWarmTier: boolean;
+  keepConcurrencyOnDegrade: boolean;
   proxyUrl: string;
   customHeadersText: string;
   tags: string[];
@@ -119,11 +118,6 @@ export function formStateFromAccount(
 ): QuickConfigFormState {
   return {
     accountId: account.id,
-    excelBPSEnabled: account.openai_excel_bps ?? false,
-    excelBPSAvailable: account.account_type === "oauth" &&
-      !account.openai_responses_api && !account.grok_api &&
-      !account.antigravity_api && !account.claude_api &&
-      !account.agent_identity && !account.at_only,
     upstreamRequestIdHeader: account.upstream_request_id_header ?? "",
     fingerprintMode: normalizeCodexFingerprintMode(account.codex_fingerprint_mode),
     scoreMode: account.score_bias_override != null ? "custom" : "default",
@@ -138,6 +132,7 @@ export function formStateFromAccount(
     schedulerPriorityInput:
       account.scheduler_priority != null ? String(account.scheduler_priority) : "",
     skipWarmTier: account.skip_warm_tier ?? false,
+    keepConcurrencyOnDegrade: account.keep_concurrency_on_degrade ?? false,
     proxyUrl: account.proxy_url ?? "",
     customHeadersText: formatCustomHeadersText(account.custom_headers),
     tags: account.tags ?? [],
@@ -210,12 +205,12 @@ export function buildQuickConfigSavePayload(
   return {
     ok: true,
     payload: {
-      ...(form.excelBPSAvailable ? { openai_excel_bps: form.excelBPSEnabled } : {}),
       score_bias_override: form.scoreMode === "custom" ? parsedScoreBias : null,
       base_concurrency_override:
         form.concurrencyMode === "custom" ? parsedBaseConcurrency : null,
       scheduler_priority: parsedSchedulerPriority,
       skip_warm_tier: form.skipWarmTier,
+      keep_concurrency_on_degrade: form.keepConcurrencyOnDegrade,
       proxy_url: form.proxyUrl.trim() || null,
       custom_headers: parsedHeaders.value,
       upstream_request_id_header: form.upstreamRequestIdHeader.trim(),

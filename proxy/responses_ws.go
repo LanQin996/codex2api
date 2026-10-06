@@ -1116,6 +1116,7 @@ func (h *Handler) streamResponsesWSUpstream(
 	options *responsesWSForwardOptions,
 	continuousRetryPolicy database.ContinuousRetryPolicy,
 ) error {
+	upstreamEndpoint := "/v1/responses"
 	account.Mu().RLock()
 	c.Set("x-account-email", account.Email)
 	account.Mu().RUnlock()
@@ -1441,7 +1442,7 @@ func (h *Handler) streamResponsesWSUpstream(
 		h.logPromptPolicyRetryUsage(c, database.UsageLogInput{
 			AccountID: account.ID(), Endpoint: "/v1/responses", Model: model, EffectiveModel: logEffectiveModel,
 			StatusCode: outcome.logStatusCode, DurationMs: totalDuration, FirstTokenMs: firstTokenMs, ReasoningEffort: reasoningEffort,
-			InboundEndpoint: "/v1/responses", UpstreamEndpoint: "/v1/responses", Stream: true, ViaWebsocket: viaWebsocket,
+			InboundEndpoint: "/v1/responses", UpstreamEndpoint: upstreamEndpoint, Stream: true, ViaWebsocket: viaWebsocket,
 			AttemptIndex: fallbackAttempt, UpstreamErrorKind: outcome.failureKind,
 			ErrorMessage: usageLogFailureMessage(outcome.logStatusCode, outcome.failureMessage),
 		}, promptPolicyIncidentID)
@@ -1529,7 +1530,7 @@ func (h *Handler) streamResponsesWSUpstream(
 		FirstTokenMs:           firstTokenMs,
 		ReasoningEffort:        reasoningEffort,
 		InboundEndpoint:        "/v1/responses",
-		UpstreamEndpoint:       "/v1/responses",
+		UpstreamEndpoint:       upstreamEndpoint,
 		Stream:                 true,
 		ViaWebsocket:           viaWebsocket,
 		ServiceTier:            usageTiers.ServiceTier,

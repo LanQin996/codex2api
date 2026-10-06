@@ -6,6 +6,7 @@ import (
 	"math"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/codex2api/auth"
@@ -28,6 +29,11 @@ func exhaustedResetAccountEligible(account *auth.Account) bool {
 
 func autoResetCreditsAccountEligible(account *auth.Account, settings autoResetCreditsConfig) bool {
 	if account == nil || strings.TrimSpace(account.GetAccessToken()) == "" {
+		return false
+	}
+	// 管理员禁用（DispatchPaused）或 401 即时摘除（Disabled）的账号不接流量，
+	// 自动消耗只会白白浪费重置券；手动重置不经过这里，仍可按需使用。
+	if atomic.LoadInt32(&account.DispatchPaused) != 0 || atomic.LoadInt32(&account.Disabled) != 0 {
 		return false
 	}
 	return (settings.Enabled && isAutoResetCreditsPlan(account.GetPlanType())) ||
@@ -60,9 +66,10 @@ func resetUsageExhausted(usage *proxy.WhamUsage, observedAt, now time.Time) bool
 	if credits := usage.RateLimitResetCredits; credits != nil && (credits.AvailableCount <= 0 || credits.ApplicableAvailableCount <= 0) {
 		return false
 	}
-	// Only shared Codex windows (e.g. 5h, 7d, monthly), not model-specific Spark.
+	// Only the shared long (7d-slot) window counts; a full 5h window recovers on its
+	// own within hours and is not worth a credit. Model-specific Spark is excluded.
 	for _, window := range []*proxy.WhamUsageWindow{usage.RateLimit.PrimaryWindow, usage.RateLimit.SecondaryWindow} {
-		if window == nil || math.IsNaN(window.UsedPercent) || math.IsInf(window.UsedPercent, 0) || window.UsedPercent < 100 || window.LimitWindowSeconds <= 0 {
+		if window == nil || math.IsNaN(window.UsedPercent) || math.IsInf(window.UsedPercent, 0) || window.UsedPercent < 100 || !proxy.IsWhamLongWindowSeconds(window.LimitWindowSeconds) {
 			continue
 		}
 		resetAt := time.Unix(window.ResetAt, 0)

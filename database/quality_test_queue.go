@@ -147,10 +147,18 @@ func (db *DB) EnqueueQualityTestBatch(ctx context.Context, key, fingerprint stri
 			}
 			return tx.Commit()
 		}
-		now := db.timeArg(time.Now().UTC())
+		createdAt := time.Now().UTC()
+		now := db.timeArg(createdAt)
 		for _, job := range jobs {
+			// While queued, preserve the requested duration relative to creation.
+			// Claim moves that full duration to the actual execution start.
+			timeout := time.Duration(job.TimeoutMS) * time.Millisecond
+			if timeout <= 0 {
+				timeout = QualityTestDefaultTimeout
+			}
+			timeout = min(max(timeout, QualityTestMinTimeout), QualityTestMaxTimeout)
 			var id int64
-			err = tx.QueryRowContext(ctx, "INSERT INTO quality_test_jobs(account_id,account_name,plan_type,channel,model,reasoning_effort,prompt,status,created_at,updated_at,deadline_at,preset_kind,preset_ref,preset_name,batch_id) VALUES($1,$2,$3,$4,$5,$6,$7,'queued',$8,$8,$8,$9,$10,$11,$12) ON CONFLICT DO NOTHING RETURNING id", job.AccountID, job.AccountName, job.PlanType, job.Channel, job.Model, job.ReasoningEffort, job.Prompt, now, job.PresetKind, job.PresetRef, job.PresetName, key).Scan(&id)
+			err = tx.QueryRowContext(ctx, "INSERT INTO quality_test_jobs(account_id,account_name,plan_type,channel,model,reasoning_effort,prompt,status,created_at,updated_at,deadline_at,preset_kind,preset_ref,preset_name,batch_id) VALUES($1,$2,$3,$4,$5,$6,$7,'queued',$8,$8,$13,$9,$10,$11,$12) ON CONFLICT DO NOTHING RETURNING id", job.AccountID, job.AccountName, job.PlanType, job.Channel, job.Model, job.ReasoningEffort, job.Prompt, now, job.PresetKind, job.PresetRef, job.PresetName, key, db.timeArg(createdAt.Add(timeout))).Scan(&id)
 			if errors.Is(err, sql.ErrNoRows) {
 				result.Rejected = append(result.Rejected, QualityTestRejection{job.AccountID, ErrQualityTestAccountBusy.Error()})
 				continue
@@ -187,8 +195,18 @@ func (db *DB) ClaimQualityTest(ctx context.Context) (*QualityTestJob, error) {
 	for slot := 1; slot <= QualityTestConcurrency; slot++ {
 		var id int64
 		err := db.withSQLiteWriteLock(ctx, func() error {
+			queued, err := scanQualityTestJob(db.conn.QueryRowContext(ctx, "SELECT "+qualityTestColumns+" FROM quality_test_jobs WHERE status='queued' ORDER BY id LIMIT 1"), false)
+			if err != nil {
+				return err
+			}
+			timeout := time.Duration(queued.TimeoutMS) * time.Millisecond
+			if timeout <= 0 {
+				// Jobs queued by older versions stored deadline_at=created_at.
+				timeout = QualityTestDefaultTimeout
+			}
+			timeout = min(max(timeout, QualityTestMinTimeout), QualityTestMaxTimeout)
 			now := time.Now().UTC()
-			return db.conn.QueryRowContext(ctx, "UPDATE quality_test_jobs SET status='running',slot=$1,started_at=$2,updated_at=$2,deadline_at=$3 WHERE id=(SELECT id FROM quality_test_jobs WHERE status='queued' ORDER BY id LIMIT 1) AND status='queued' AND NOT EXISTS(SELECT 1 FROM quality_test_jobs WHERE slot=$1) RETURNING id", slot, db.timeArg(now), db.timeArg(now.Add(10*time.Minute))).Scan(&id)
+			return db.conn.QueryRowContext(ctx, "UPDATE quality_test_jobs SET status='running',slot=$1,started_at=$2,updated_at=$2,deadline_at=$3 WHERE id=$4 AND status='queued' AND NOT EXISTS(SELECT 1 FROM quality_test_jobs WHERE slot=$1) RETURNING id", slot, db.timeArg(now), db.timeArg(now.Add(timeout)), queued.ID).Scan(&id)
 		})
 		if err == nil {
 			return db.GetQualityTestJob(ctx, id)

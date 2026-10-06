@@ -196,7 +196,7 @@ func (h *Handler) runCredentialOperation(ctx context.Context, s *credentialOpera
 			fail("账号巡检准备失败")
 			return
 		}
-		_, probeErr := proxy.FetchCodexModelsManifest(ctx, account, h.store.ResolveProxyForAccount(account), "", "")
+		_, probeErr := proxy.FetchCodexModelsManifest(ctx, account, h.store.ResolveProxyForAccount(account), "", "", nil)
 		if probeErr == nil {
 			job.Failures = 0
 			job.Message = "巡检正常"

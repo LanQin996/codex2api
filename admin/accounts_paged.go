@@ -331,7 +331,7 @@ func parseAccountPageQuery(c *gin.Context) (accountPageQuery, error) {
 	validSorts := map[string]bool{
 		"": true, "requests": true, "today": true, "usage": true, "created_at": true, "updated_at": true,
 		"scheduler_priority": true, "group": true, "risk": true, "dispatch_score": true,
-		"latency_penalty": true, "unauthorized": true,
+		"latency_penalty": true, "unauthorized": true, "id": true,
 	}
 	if !validSorts[query.Sort] {
 		return query, fmt.Errorf("unsupported sort")
@@ -1305,6 +1305,8 @@ func sortAccountListItems(items []*accountListSnapshotItem, key, order string) {
 			cmp = compareFloat64(accountListUsageValue(a), accountListUsageValue(b))
 		case "created_at":
 			cmp = compareTime(a.Row.CreatedAt, b.Row.CreatedAt)
+		case "id":
+			cmp = compareInt64(a.ID, b.ID)
 		case "updated_at":
 			cmp = compareTime(a.Row.UpdatedAt, b.Row.UpdatedAt)
 		case "scheduler_priority":
@@ -1547,7 +1549,7 @@ func intersectsInt64(a, b []int64) bool {
 
 func accountListSubscriptionPlan(plan string) bool {
 	switch strings.ToLower(strings.TrimSpace(plan)) {
-	case "pro", "prolite", "pro_lite", "pro-lite", "plus", "team", "teamplus", "k12", "edu", "education", "go":
+	case "pro", "prolite", "pro_lite", "pro-lite", "promax", "pro_max", "pro-max", "plus", "team", "teamplus", "k12", "edu", "edu_plus", "edu_pro", "education", "go":
 		return true
 	default:
 		return false

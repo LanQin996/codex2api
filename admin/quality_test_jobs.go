@@ -73,6 +73,11 @@ func (h *Handler) CreateQualityTestJob(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请选择模型，测试提示词不能为空且不能超过 16000 字节"})
 		return
 	}
+	timeout := time.Duration(req.TimeoutMinutes) * time.Minute
+	if req.TimeoutMinutes != 0 && (timeout < database.QualityTestMinTimeout || timeout > database.QualityTestMaxTimeout) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("超时上限需在 %d-%d 分钟之间", int(database.QualityTestMinTimeout.Minutes()), int(database.QualityTestMaxTimeout.Minutes()))})
+		return
+	}
 	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
 	if err != nil || id <= 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "无效的账号 ID"})
@@ -115,7 +120,7 @@ func (h *Handler) CreateQualityTestJob(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	presetKind, presetRef, presetName := h.resolveQualityTestPreset(ctx, req)
-	batch, err := h.db.EnqueueQualityTestBatch(ctx, newQualityBatchID(), "single", []database.QualityTestJob{{AccountID: id, AccountName: name, PlanType: plan, Channel: channel, Model: req.Model, ReasoningEffort: req.ReasoningEffort, Prompt: req.Prompt, PresetKind: presetKind, PresetRef: presetRef, PresetName: presetName}}, nil)
+	batch, err := h.db.EnqueueQualityTestBatch(ctx, newQualityBatchID(), "single", []database.QualityTestJob{{AccountID: id, AccountName: name, PlanType: plan, Channel: channel, Model: req.Model, ReasoningEffort: req.ReasoningEffort, Prompt: req.Prompt, TimeoutMS: timeout.Milliseconds(), PresetKind: presetKind, PresetRef: presetRef, PresetName: presetName}}, nil)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "保存检测任务失败"})
 		return
@@ -237,6 +242,8 @@ func (h *Handler) runQualityTestJob(parent context.Context, job database.Quality
 	defer cancel()
 	var mu sync.Mutex
 	complete, dirty := false, false
+	// interrupted tracks whether the latest error event was a transport/stream break.
+	interrupted := false
 	secrets := codexTestSecrets(h.store.FindByID(job.AccountID))
 	emit := func(event testEvent) {
 		mu.Lock()
@@ -255,12 +262,14 @@ func (h *Handler) runQualityTestJob(parent context.Context, job database.Quality
 			}
 		case "error":
 			job.Error = sanitizeCodexTestText(event.Error, secrets)
+			interrupted = event.Interrupted
 		case "test_complete":
 			complete = event.Success
 		}
 		if d := event.CodexDiagnostics; d != nil {
 			job.ResponseModel = d.ResponseModel
-			if d.FirstContentMS != nil {
+			// Diagnostics time from the attempt start; after a retry keep the job-relative value.
+			if d.FirstContentMS != nil && job.Retries == 0 {
 				job.FirstContentMS = d.FirstContentMS
 			}
 			if d.Usage != nil {
@@ -271,7 +280,7 @@ func (h *Handler) runQualityTestJob(parent context.Context, job database.Quality
 		}
 		if d := event.Diagnostics; d != nil {
 			job.ResponseModel = d.ResponseModel
-			if d.FirstContentMS != nil {
+			if d.FirstContentMS != nil && job.Retries == 0 {
 				job.FirstContentMS = d.FirstContentMS
 			}
 			if d.Usage != nil {
@@ -336,9 +345,11 @@ func (h *Handler) runQualityTestJob(parent context.Context, job database.Quality
 			job.Error = "服务关闭，检测已中断"
 		case errors.Is(ctx.Err(), context.DeadlineExceeded):
 			job.Status = "error"
-			job.Error = "检测超过 10 分钟，已停止"
+			job.Error = fmt.Sprintf("检测超过 %d 分钟，已停止", int(job.DeadlineAt.Sub(startedAt).Round(time.Minute).Minutes()))
 		case job.Error != "":
 			job.Status = "error"
+			// A break caused by our own cancellation is not an upstream interruption.
+			job.Interrupted = interrupted && ctx.Err() == nil
 		case ctx.Err() != nil:
 			job.Status = "stopped"
 		case complete:
@@ -355,7 +366,9 @@ func (h *Handler) runQualityTestJob(parent context.Context, job database.Quality
 	}()
 	status, err := h.db.QualityTestStatus(ctx, job.ID)
 	if err != nil {
+		mu.Lock()
 		job.Error = "读取检测任务状态失败"
+		mu.Unlock()
 		return
 	}
 	if status != "running" {
@@ -364,20 +377,56 @@ func (h *Handler) runQualityTestJob(parent context.Context, job database.Quality
 	}
 	account := h.store.FindByID(job.AccountID)
 	if account == nil {
+		mu.Lock()
 		job.Error = "账号不在运行时池中"
+		mu.Unlock()
 		return
 	}
 	if err := h.validateQualityTestForAccount(ctx, account, req); err != nil {
+		mu.Lock()
 		job.Error = err.Error()
+		mu.Unlock()
 		return
 	}
-	writer := &qualityJobWriter{header: make(http.Header), emit: emit}
 	router := gin.New()
 	router.POST("/accounts/:id/test", func(c *gin.Context) { h.testConnection(c, &req) })
-	request, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("/accounts/%d/test", job.AccountID), nil)
-	if err != nil {
-		job.Error = "创建检测请求失败"
-		return
+	for {
+		request, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("/accounts/%d/test", job.AccountID), nil)
+		if err != nil {
+			mu.Lock()
+			job.Error = "创建检测请求失败"
+			mu.Unlock()
+			return
+		}
+		router.ServeHTTP(&qualityJobWriter{header: make(http.Header), emit: emit}, request)
+		if !h.retryQualityTestAttempt(ctx, &mu, &job, &interrupted, &dirty, complete) {
+			return
+		}
 	}
-	router.ServeHTTP(writer, request)
+}
+
+// qualityTestMaxRetries bounds automatic re-attempts. Only a break before any
+// output is retried: once output exists a retry would regenerate (and bill) it all.
+const qualityTestMaxRetries = 1
+
+var qualityTestRetryDelay = 2 * time.Second
+
+func (h *Handler) retryQualityTestAttempt(ctx context.Context, mu *sync.Mutex, job *database.QualityTestJob, interrupted, dirty *bool, complete bool) bool {
+	mu.Lock()
+	retry := !complete && *interrupted && job.Output == "" && job.Error != "" && job.Retries < qualityTestMaxRetries && ctx.Err() == nil
+	if retry {
+		log.Printf("[quality-test] job=%d attempt %d interrupted before output, retrying: %s", job.ID, job.Retries+1, job.Error)
+		job.Retries++
+		job.Error, *interrupted, *dirty = "", false, true
+	}
+	mu.Unlock()
+	if !retry {
+		return false
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case <-time.After(qualityTestRetryDelay):
+		return true
+	}
 }
