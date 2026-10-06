@@ -14176,6 +14176,7 @@ function AccountMobileCard({
                   <AccountConcurrencyBadge account={account} />
                 </>
               )}
+              <DaybreakBadge models={account.daybreak_models} />
               {isFullCard && resetCredits > 0 && (
                 <button
                   type="button"
@@ -14187,7 +14188,6 @@ function AccountMobileCard({
                   {resetCredits}
                 </button>
               )}
-              <DaybreakBadge models={account.daybreak_models} />
               {isFullCard && creditBalance !== null && (
                 <button
                   type="button"
