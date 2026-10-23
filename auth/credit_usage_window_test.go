@@ -207,12 +207,13 @@ func TestUsingCreditsRequiresBothToggles(t *testing.T) {
 }
 
 // 上游真的 429（走 cooldown）说明积分没顶住，必须暴露真实状态，不能被 using_credits 盖掉。
+// /responses 的真 429 记为 ResponsesRateLimitedCooldownReason；rate_limited_5h 是本地判罚。
 func TestUsingCreditsDoesNotMaskUpstreamCooldown(t *testing.T) {
 	acc := withCredits(plus5hExhausted(), "1000.0000000000", true, false, false)
-	acc.SetCooldownUntil(time.Now().Add(30*time.Minute), "rate_limited_5h")
+	acc.SetCooldownUntil(time.Now().Add(30*time.Minute), ResponsesRateLimitedCooldownReason)
 
-	if got := acc.RuntimeStatus(); got != "rate_limited_5h" {
-		t.Fatalf("RuntimeStatus() = %q, want rate_limited_5h — a real upstream 429 must not be hidden", got)
+	if got := acc.RuntimeStatus(); got != ResponsesRateLimitedCooldownReason {
+		t.Fatalf("RuntimeStatus() = %q, want %s — a real upstream 429 must not be hidden", got, ResponsesRateLimitedCooldownReason)
 	}
 	if acc.UsingCredits() {
 		t.Error("UsingCredits() = true, want false — a real 429 means credits did not cover it")
@@ -739,5 +740,171 @@ func TestApplySparseCreditsHeadersClearsReachedType(t *testing.T) {
 	acc.ApplySparseCreditsHeaders(true, false, nil, nil, "")
 	if !acc.UsingCredits() {
 		t.Fatal("UsingCredits() = false after response without reached-type, want true")
+	}
+}
+
+// plus5hNearAutoPause 构造一个 5h 用到 96%、阈值 95% 的 plus 账号：没有积分顶替时它被自动暂停。
+func plus5hNearAutoPause() *Account {
+	acc := &Account{
+		DBID:                1,
+		AccessToken:         "at-test",
+		Status:              StatusReady,
+		HealthTier:          HealthTierHealthy,
+		PlanType:            "plus",
+		UsagePercent5h:      96,
+		UsagePercent5hValid: true,
+		Reset5hAt:           time.Now().Add(2 * time.Hour),
+	}
+	acc.effectiveAutoPause5h = 0.95
+	return acc
+}
+
+// issue #791：自动暂停阈值最高只到 100%，若它压过积分开关，窗口永远走不到「打满后扣积分」，
+// 弹窗显示「已生效」、列表挂着「使用积分」徽章，账号却始终不被调度。
+func TestCreditsBypassQuotaAutoPause(t *testing.T) {
+	near := withCredits(plus5hNearAutoPause(), "62500.00", true, false, false)
+	if !near.IsAvailable() {
+		t.Fatal("IsAvailable() = false at 96% with credits covering, want auto-pause to yield")
+	}
+	if got := near.RuntimeStatus(); got != "active" {
+		t.Fatalf("RuntimeStatus() = %q, want active while credits cover the threshold", got)
+	}
+
+	full := withCredits(plus5hExhausted(), "62500.00", true, false, false)
+	full.effectiveAutoPause5h = 0.95
+	full.effectiveAutoPause7d = 0.9
+	full.UsagePercent7d = 100
+	full.UsagePercent7dValid = true
+	full.Reset7dAt = time.Now().Add(72 * time.Hour)
+	if !full.IsAvailable() {
+		t.Fatal("IsAvailable() = false with both windows exhausted and credits covering, want true")
+	}
+	if !full.UsingCredits() {
+		t.Fatal("UsingCredits() = false, want true while credits cover an exhausted window")
+	}
+}
+
+// 积分门关着（开关未开 / 积分归零 / 工作区 hard-stop）时自动暂停照常生效。
+func TestQuotaAutoPauseStillAppliesWithoutCredits(t *testing.T) {
+	cases := map[string]*Account{
+		"toggle off": func() *Account {
+			acc := withCredits(plus5hNearAutoPause(), "62500.00", true, false, false)
+			acc.CreditSkipUsageWindow = false
+			return acc
+		}(),
+		"drained": withCredits(plus5hNearAutoPause(), "0", false, false, false),
+		"hard stop": func() *Account {
+			acc := withCredits(plus5hNearAutoPause(), "62500.00", true, false, false)
+			acc.CreditsRateLimitReachedType = "workspace_member_credits_depleted"
+			return acc
+		}(),
+	}
+	for name, acc := range cases {
+		if acc.IsAvailable() {
+			t.Errorf("%s: IsAvailable() = true, want auto-pause to hold", name)
+		}
+		if got := acc.RuntimeStatus(); got != "quota_paused" {
+			t.Errorf("%s: RuntimeStatus() = %q, want quota_paused", name, got)
+		}
+	}
+}
+
+// 5h 护栏带属于自动暂停的一部分：积分顶替时不能把并发压到 0，也不该扣调度分。
+func TestCreditsBypassAutoPause5hGuardBand(t *testing.T) {
+	plain := plus5hNearAutoPause()
+	plain.UsagePercent5h = 95.5 // 阈值内、护栏带内
+	plain.autoPause5hGuardBandPercent = 5
+	plain.autoPause5hGuardConcurrency = 1
+
+	covered := withCredits(plus5hNearAutoPause(), "62500.00", true, false, false)
+	covered.UsagePercent5h = 100
+	covered.autoPause5hGuardBandPercent = 5
+	covered.autoPause5hGuardConcurrency = 1
+
+	now := time.Now()
+	covered.mu.RLock()
+	limit := covered.quotaAutoPause5hGuardConcurrencyLimitLocked(8, now)
+	penalty := covered.quotaAutoPause5hGuardDispatchPenaltyLocked(now)
+	covered.mu.RUnlock()
+	if limit != 8 {
+		t.Errorf("guard concurrency limit = %d with credits covering, want 8 (untouched)", limit)
+	}
+	if penalty != 0 {
+		t.Errorf("guard dispatch penalty = %v with credits covering, want 0", penalty)
+	}
+
+	// 对照：没积分时护栏照常收紧，确认上面的断言不是空转。
+	plain.UsagePercent5h = 96
+	plain.mu.RLock()
+	plainLimit := plain.quotaAutoPause5hGuardConcurrencyLimitLocked(8, now)
+	plain.mu.RUnlock()
+	if plainLimit != 0 {
+		t.Errorf("guard concurrency limit = %d past threshold without credits, want 0", plainLimit)
+	}
+}
+
+// issue #791：Plus/Pro 先撞 5h（响应头 / WHAM 落下 rate_limited_5h）再开积分开关，
+// 判罚必须被释放，不能干等到 5h 重置。
+func TestReleaseUsageWindowCooldownReleasesPremium5hPenalty(t *testing.T) {
+	store := NewStore(nil, nil, nil)
+	acc := &Account{
+		DBID:        1,
+		AccessToken: "at-test",
+		PlanType:    "plus",
+		Status:      StatusReady,
+		HealthTier:  HealthTierHealthy,
+	}
+	store.MarkPremium5hRateLimited(acc, time.Now().Add(2*time.Hour))
+	if acc.IsAvailable() {
+		t.Fatal("IsAvailable() = true, want false while the 5h penalty stands")
+	}
+
+	acc.CreditEnabled = true
+	acc.CreditSkipUsageWindow = true
+	acc.SetCreditBalance("62500.00", true, false, false)
+
+	if !acc.UsageWindowCooldown() {
+		t.Fatal("UsageWindowCooldown() = false, want true for a local rate_limited_5h penalty")
+	}
+	if !store.ReleaseUsageWindowCooldownForCredits(acc) {
+		t.Fatal("ReleaseUsageWindowCooldownForCredits() = false, want the 5h penalty released")
+	}
+	if acc.HasActiveCooldown() {
+		t.Error("cooldown still active after release")
+	}
+	if !acc.IsAvailable() {
+		t.Error("IsAvailable() = false after release, want true")
+	}
+	if !acc.UsingCredits() {
+		t.Error("UsingCredits() = false after release, want true — the 5h window is still exhausted")
+	}
+}
+
+// /responses 真 429 的 5h 冷却（ResponsesRateLimitedCooldownReason）是上游拒绝，积分不放行。
+func TestReleaseUsageWindowCooldownKeepsUpstream5h429(t *testing.T) {
+	store := NewStore(nil, nil, nil)
+	acc := &Account{
+		DBID:        1,
+		AccessToken: "at-test",
+		PlanType:    "plus",
+		Status:      StatusReady,
+		HealthTier:  HealthTierHealthy,
+	}
+	acc.CreditEnabled = true
+	acc.CreditSkipUsageWindow = true
+	acc.SetCreditBalance("62500.00", true, false, false)
+	store.MarkResponsesPremium5hRateLimited(acc, time.Now().Add(2*time.Hour))
+
+	if acc.UsageWindowCooldown() {
+		t.Fatal("UsageWindowCooldown() = true, want false for an upstream 5h 429")
+	}
+	if store.ReleaseUsageWindowCooldownForCredits(acc) {
+		t.Fatal("released an upstream 5h 429 cooldown, want it preserved")
+	}
+	if acc.IsAvailable() {
+		t.Error("IsAvailable() = true, want the upstream 429 cooldown to hold")
+	}
+	if acc.UsingCredits() {
+		t.Error("UsingCredits() = true, want false — upstream rejected despite credits")
 	}
 }

@@ -1062,6 +1062,22 @@ func TestAddAccountRTRefreshUsesImportProbeGate(t *testing.T) {
 }
 
 func TestImportedATAndRTWarmupsReserveCapacityAtHighProbeSetting(t *testing.T) {
+	// probeImportedAccountUsage 结束时还会检查 Daybreak 模型能力；probeUsage
+	// 回调没有替换这条请求。使用不转发的本地代理，让该检查确定地快速失败，
+	// 避免假凭证真的访问上游并占住导入并发槽。
+	t.Setenv("CODEX_TRANSPORT_MODE", "standard")
+	var modelChecks atomic.Int64
+	modelsProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodConnect || r.Host != "chatgpt.com:443" {
+			t.Errorf("unexpected models proxy request: %s %s", r.Method, r.Host)
+			http.Error(w, "unexpected target", http.StatusBadGateway)
+			return
+		}
+		modelChecks.Add(1)
+		http.Error(w, "models probe isolated by test", http.StatusBadGateway)
+	}))
+	t.Cleanup(modelsProxy.Close)
+
 	store := auth.NewStore(nil, nil, &database.SystemSettings{
 		MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.4", UsageProbeConcurrency: 64,
 	})
@@ -1108,7 +1124,7 @@ func TestImportedATAndRTWarmupsReserveCapacityAtHighProbeSetting(t *testing.T) {
 
 	accounts := make([]*auth.Account, 0, 8)
 	for id := int64(1); id <= 8; id++ {
-		account := &auth.Account{DBID: id, RefreshToken: fmt.Sprintf("rt-%d", id)}
+		account := &auth.Account{DBID: id, RefreshToken: fmt.Sprintf("rt-%d", id), ProxyURL: modelsProxy.URL}
 		if id <= 4 {
 			account.AccessToken = fmt.Sprintf("at-%d", id)
 		}
@@ -1119,16 +1135,24 @@ func TestImportedATAndRTWarmupsReserveCapacityAtHighProbeSetting(t *testing.T) {
 	// 4 个 AT 各探测一次；4 个 RT 各刷新并探测一次。
 	const wantFinished = 12
 	deadline := time.Now().Add(3 * time.Second)
-	for finished.Load() < wantFinished {
+	for {
+		handler.importProbeQueueMu.Lock()
+		workers, queued := handler.importProbeWorkers, len(handler.importProbeQueue)
+		handler.importProbeQueueMu.Unlock()
+		if workers == 0 && queued == 0 && handler.importProbeActive.Load() == 0 {
+			break
+		}
 		if time.Now().After(deadline) {
-			t.Fatalf("finished warmup operations = %d, want %d", finished.Load(), wantFinished)
+			t.Fatalf("warmups did not drain: finished=%d, want=%d, workers=%d, queued=%d", finished.Load(), wantFinished, workers, queued)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	// 等待一个完整 worker 周期，确保 RT 刷新内部没有偷偷多跑一次 probe。
-	time.Sleep(100 * time.Millisecond)
+	// 队列和 worker 均已退出，检查 RT 刷新没有偷偷多跑一次 probe。
 	if got := finished.Load(); got != wantFinished {
 		t.Fatalf("finished warmup operations = %d, want exactly %d (RT refresh probed twice)", got, wantFinished)
+	}
+	if got := modelChecks.Load(); got != 8 {
+		t.Fatalf("isolated model checks = %d, want 8 (one per imported account)", got)
 	}
 	const wantHighLoadConcurrency = 4
 	if got := maxConcurrent.Load(); got > wantHighLoadConcurrency {

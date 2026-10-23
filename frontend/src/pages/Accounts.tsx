@@ -1,3 +1,6 @@
+import { useIntelligenceBars } from "../hooks/useIntelligenceBars";
+import AccountIntelligenceBar, { AccountIntelligenceActions } from "../components/AccountIntelligenceBar";
+import type { IntelligenceBar } from "../lib/intelligenceCheck";
 import type { ChangeEvent, DragEvent, ReactNode } from "react";
 import { memo, useCallback, useEffect, useRef, useState, useMemo } from "react";
 import "./accounts-cards.css";
@@ -360,7 +363,7 @@ function AccountConcurrencyBadge({ account }: { account: AccountRow }) {
 
   return (
     <span
-      className="inline-flex items-center gap-1 rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
+      className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-md bg-blue-50 px-1.5 py-0.5 text-[11px] font-medium tabular-nums text-blue-600 ring-1 ring-inset ring-blue-500/20 dark:bg-blue-950 dark:text-blue-400 dark:ring-blue-400/20"
       title={titleLines.join("\n")}
     >
       <span
@@ -1198,6 +1201,8 @@ const AccountTableRow = memo(function AccountTableRow({
   allGroups,
   proxyCtx,
   healthBuckets,
+  intelligenceBar,
+  intelligenceError,
   lazyMode,
   refreshing,
   authJsonExporting,
@@ -1214,6 +1219,8 @@ const AccountTableRow = memo(function AccountTableRow({
   allGroups: AccountGroup[];
   proxyCtx: ProxyBindingContext;
   healthBuckets: AccountHealthBucket[] | undefined;
+  intelligenceBar?: IntelligenceBar;
+  intelligenceError?: boolean;
   lazyMode: boolean;
   refreshing: boolean;
   authJsonExporting: boolean;
@@ -1556,17 +1563,20 @@ const AccountTableRow = memo(function AccountTableRow({
                                       .filter(Boolean)
                                       .join("\n")}
                                   >
-                                    <div className="flex min-h-6 flex-wrap items-center gap-1.5">
-                                      <StatusBadge
-                                        status={getAccountStatusBadgeStatus(account)}
-                                        detail={
-                                          account.status === "overload_paused"
-                                            ? undefined
-                                            : getAccountRateLimitWindow(account) ??
-                                              undefined
-                                        }
-                                        errorMessage={account.error_message}
-                                      />
+                                    <div className="flex min-h-6 flex-nowrap items-center gap-1.5 whitespace-nowrap">
+                                      <div className="inline-flex shrink-0 items-center gap-1.5">
+                                        <StatusBadge
+                                          status={getAccountStatusBadgeStatus(account)}
+                                          detail={
+                                            account.status === "overload_paused"
+                                              ? undefined
+                                              : getAccountRateLimitWindow(account) ??
+                                                undefined
+                                          }
+                                          errorMessage={account.error_message}
+                                        />
+                                        <AccountIntelligenceActions bar={intelligenceBar} accountID={account.id} accountName={account.email || account.name} />
+                                      </div>
                                       <UsingCreditsBadge account={account} />
                                       <ModelMismatchBadge account={account} />
                                       {account.status !== "overload_paused" && (
@@ -1577,6 +1587,7 @@ const AccountTableRow = memo(function AccountTableRow({
                                     <AccountHealthBar
                                       buckets={healthBuckets}
                                     />
+                                    <AccountIntelligenceBar bar={intelligenceBar} accountID={account.id} accountName={account.email || account.name} error={intelligenceError} />
                                   </div>
                                 )}
                               </TableCell>
@@ -1738,6 +1749,8 @@ const AccountCardItem = memo(function AccountCardItem({
   lazyMode,
   showEmailDomainTags,
   healthBuckets,
+  intelligenceBar,
+  intelligenceError,
   refreshing,
   authJsonExporting,
   variant,
@@ -1755,6 +1768,8 @@ const AccountCardItem = memo(function AccountCardItem({
   lazyMode: boolean;
   showEmailDomainTags: boolean;
   healthBuckets: AccountHealthBucket[] | undefined;
+  intelligenceBar?: IntelligenceBar;
+  intelligenceError?: boolean;
   refreshing: boolean;
   authJsonExporting: boolean;
   variant: AccountCardVariant;
@@ -1774,6 +1789,8 @@ const AccountCardItem = memo(function AccountCardItem({
       lazyMode={lazyMode}
       showEmailDomainTags={showEmailDomainTags}
       healthBuckets={healthBuckets}
+      intelligenceBar={intelligenceBar}
+      intelligenceError={intelligenceError}
       refreshing={refreshing}
       authJsonExporting={authJsonExporting}
       variant={variant}
@@ -2830,7 +2847,7 @@ export default function Accounts() {
   useEffect(() => {
     if (providerView !== "codex") return;
     let cancelled = false;
-    void api.getAPIKeys()
+    void api.getAPIKeys({ view: 'lite' })
       .then((response) => { if (!cancelled) setAPIKeys(response.keys ?? []); })
       .catch(() => undefined);
     void api.listAccountGroups()
@@ -3054,6 +3071,17 @@ export default function Accounts() {
     () => allAccounts.filter((account) => !account.grok_api),
     [allAccounts],
   );
+  // 只随“缺用量、需要补探”的账号集合变化，而不是随 1 秒 live 合并产生的
+  // 数组身份变化；否则下面的补探 effect 每秒被清理重建，定时器永远不触发。
+  const usageReloadIdsKey = useMemo(
+    () =>
+      accounts
+        .filter(needsUsageReload)
+        .map((account) => account.id)
+        .sort((a, b) => a - b)
+        .join(","),
+    [accounts],
+  );
   const accountPageIDsKey = useMemo(
     () => accounts.map((account) => account.id).join(","),
     [accounts],
@@ -3081,6 +3109,7 @@ export default function Accounts() {
   }, [accountPageIDsKey, healthBarsReloadToken]);
 
   const healthBarsAutoRefreshedAtRef = useRef(0);
+  const { bars: intelligenceBars, error: intelligenceBarsError } = useIntelligenceBars(accountPageIDsKey, healthBarsReloadToken);
   useEffect(() => {
     if (providerView !== "codex") return undefined;
     if (!accountPageIDsKey) {
@@ -3175,6 +3204,8 @@ export default function Accounts() {
   // 测试连接后需要强制刷新用量的账号 id：即使其用量数据已存在（如已显示 100%），
   // 也要在后台探针跑完后重新拉取，确保进度条更新为最新值。
   const forceUsageReloadRef = useRef<Set<number>>(new Set());
+  // 强制刷新是命令式信号，ref 本身不触发 effect；用计数器明确唤醒补探调度。
+  const [usageReloadTick, setUsageReloadTick] = useState(0);
 
   useEffect(() => {
     persistAnalysisVisibility(showAnalysisCharts);
@@ -3216,12 +3247,14 @@ export default function Accounts() {
 
   useEffect(() => {
     if (providerView !== "codex") return;
-    const missingUsageIds = accounts
-      .filter(needsUsageReload)
-      .map((account) => account.id);
+    const missingUsageIds = usageReloadIdsKey
+      ? usageReloadIdsKey.split(",").map(Number)
+      : [];
     // 测试连接后被标记强制刷新的账号也要参与重拉，即使其用量数据已存在。
     // 仅保留仍在当前列表中的 id，避免泄漏。
-    const accountIdSet = new Set(accounts.map((account) => account.id));
+    const accountIdSet = new Set(
+      accountPageIDsKey ? accountPageIDsKey.split(",").map(Number) : [],
+    );
     const forceIds = Array.from(forceUsageReloadRef.current).filter((id) =>
       accountIdSet.has(id),
     );
@@ -3248,23 +3281,28 @@ export default function Accounts() {
         usageReloadAttemptsRef.current.get(id) ?? 0,
       );
     }
-    for (const id of retryIds) {
-      usageReloadAttemptsRef.current.set(
-        id,
-        (usageReloadAttemptsRef.current.get(id) ?? 0) + 1,
-      );
-    }
-    // 强制刷新的账号已安排本轮重拉，移除标记，避免无谓地反复重拉到上限。
-    // 若重拉后数据仍未更新且该账号确实缺数据，会由 needsUsageReload 接管继续重试。
-    for (const id of forceIds) {
-      forceUsageReloadRef.current.delete(id);
-    }
-
     // 指数退避:2.5s/5s/10s/20s/40s/80s。固定 2.5s 会让列表加载后的十几秒里
     // 反复整树重渲染;退避既压低churn,又把慢探针的覆盖窗口拉长到 ~2.5 分钟。
     // 测试连接触发的强制刷新保持首档延迟,用户在等即时反馈。
     const delay =
       forceIds.length > 0 ? 2500 : 2500 * 2 ** Math.min(minAttempt, 5);
+    const fire = () => {
+      // 只在真正发起重拉时消耗重试次数；被 live 更新取消的定时器不算一次。
+      for (const id of retryIds) {
+        usageReloadAttemptsRef.current.set(
+          id,
+          (usageReloadAttemptsRef.current.get(id) ?? 0) + 1,
+        );
+      }
+      // 强制刷新的账号已安排本轮重拉，移除标记，避免无谓地反复重拉到上限。
+      // 若重拉后数据仍未更新且该账号确实缺数据，会由 needsUsageReload 接管继续重试。
+      for (const id of forceIds) {
+        forceUsageReloadRef.current.delete(id);
+      }
+      void reloadSilently();
+      // 集合不变时也要把下一档退避排上；否则一次尝试后重试链会断。
+      setUsageReloadTick((tick) => tick + 1);
+    };
     let visibilityHandler: (() => void) | null = null;
     const timer = window.setTimeout(() => {
       // 页面在后台时挂起本轮重拉,回到前台再补,不在不可见标签页里空转打请求。
@@ -3273,12 +3311,12 @@ export default function Accounts() {
           if (document.hidden || visibilityHandler === null) return;
           document.removeEventListener("visibilitychange", visibilityHandler);
           visibilityHandler = null;
-          void reloadSilently();
+          fire();
         };
         document.addEventListener("visibilitychange", visibilityHandler);
         return;
       }
-      void reloadSilently();
+      fire();
     }, delay);
 
     return () => {
@@ -3288,13 +3326,24 @@ export default function Accounts() {
         visibilityHandler = null;
       }
     };
-  }, [accounts, reloadSilently, providerView]);
+    // 不依赖 accounts：1 秒 live 合并会不断产生新的数组身份，但只有
+    // “需要补探的 id 集合 / 页面 id 集合 / 强制刷新信号”变化时才应重建定时器。
+  }, [
+    usageReloadIdsKey,
+    usageReloadTick,
+    accountPageIDsKey,
+    reloadSilently,
+    providerView,
+  ]);
 
   // stats_state 补拉:统计缓存分两层(请求数缓存→列表快照)且都是"先返回旧值
   // 后台重建",从 stale 转 ready 需要连续两三次轮询。上面的静默刷新退避后间隔
   // 最长 80s,不补拉的话「统计刷新中…」会常驻几分钟。这里在非 ready 时用 3s
   // 短间隔追到 ready 为止;带次数上限,防后端统计查询持续失败时退化成常驻轮询。
   const statsStaleRetriesRef = useRef(0);
+  // 自增触发重试链，不依赖 data 对象身份：1 秒 live 合并会不断替换 data，
+  // 但 statsState 可能连续多次都是 stale，字符串不变时也必须继续补拉。
+  const [statsRetryTick, setStatsRetryTick] = useState(0);
   useEffect(() => {
     if (loading) return undefined;
     if (data.statsState === "ready") {
@@ -3306,12 +3355,11 @@ export default function Accounts() {
     const timer = window.setTimeout(() => {
       if (document.hidden) return;
       statsStaleRetriesRef.current += 1;
+      setStatsRetryTick((tick) => tick + 1);
       void reloadSilently();
     }, 3000);
     return () => window.clearTimeout(timer);
-    // 依赖 data 本身(而非 data.statsState):连续两次都返回 stale 时字符串不变,
-    // 只有对象身份变化才能把补拉定时器重新拉起来。
-  }, [loading, data, reloadSilently]);
+  }, [loading, data.statsState, data.disabledSorts, statsRetryTick, reloadSilently]);
 
   const accountSummary = {
     totalAccounts: data.summary?.total ?? data.total,
@@ -6339,7 +6387,10 @@ export default function Accounts() {
   if (providerView === "antigravity") {
     return (
       <div key="provider-antigravity" className="animate-channel-switch-in">
-        <AntigravityAccounts headerSlot={providerSwitcher} />
+        <AntigravityAccounts
+          headerSlot={providerSwitcher}
+          showOperationResults={showOperationResults}
+        />
       </div>
     );
   }
@@ -7599,6 +7650,8 @@ export default function Accounts() {
                         lazyMode={lazyMode}
                         showEmailDomainTags={showEmailDomainTags}
                         healthBuckets={healthBars[String(account.id)]}
+                          intelligenceBar={intelligenceBars[String(account.id)]}
+                          intelligenceError={intelligenceBarsError}
                         refreshing={refreshingIds.has(account.id)}
                         authJsonExporting={authJsonExportingIds.has(account.id)}
                         variant={
@@ -7881,6 +7934,8 @@ export default function Accounts() {
                           allGroups={allGroups}
                           proxyCtx={proxyBindingCtx}
                           healthBuckets={healthBars[String(account.id)]}
+                          intelligenceBar={intelligenceBars[String(account.id)]}
+                          intelligenceError={intelligenceBarsError}
                           lazyMode={lazyMode}
                           refreshing={refreshingIds.has(account.id)}
                           authJsonExporting={authJsonExportingIds.has(account.id)}
@@ -9209,6 +9264,7 @@ export default function Accounts() {
                 // 标记该账号强制刷新用量，配合后台探针确保进度条更新为最新值。
                 forceUsageReloadRef.current.add(testingAccount.id);
                 usageReloadAttemptsRef.current.delete(testingAccount.id);
+                setUsageReloadTick((tick) => tick + 1);
                 void reloadSilently();
               }}
               onClose={() => setTestingAccount(null)}
@@ -9224,6 +9280,7 @@ export default function Accounts() {
                 forceUsageReloadRef.current.add(detectorAccount.id);
                 usageReloadAttemptsRef.current.delete(detectorAccount.id);
                 setDetectorAccount(null);
+                setUsageReloadTick((tick) => tick + 1);
                 void reloadSilently();
               }}
             />
@@ -9249,6 +9306,8 @@ export default function Accounts() {
           )}
 
           <AccountDetailSheet
+            intelligenceBar={detailAccount ? intelligenceBars[String(detailAccount.id)] : undefined}
+            intelligenceError={intelligenceBarsError}
             account={detailAccount}
             groups={
               detailAccount
@@ -13959,6 +14018,8 @@ function AccountMobileCard({
   lazyMode,
   showEmailDomainTags,
   healthBuckets,
+  intelligenceBar,
+  intelligenceError,
   refreshing,
   authJsonExporting,
   variant = "mobile",
@@ -13996,6 +14057,8 @@ function AccountMobileCard({
   lazyMode: boolean;
   showEmailDomainTags: boolean;
   healthBuckets: AccountHealthBucket[] | undefined;
+  intelligenceBar?: IntelligenceBar;
+  intelligenceError?: boolean;
   refreshing: boolean;
   authJsonExporting: boolean;
   variant?: AccountCardVariant;
@@ -14181,7 +14244,7 @@ function AccountMobileCard({
                   {account.status !== "overload_paused" && (
                     <AccountStatusCountdown account={account} />
                   )}
-                  <AccountConcurrencyBadge account={account} />
+                  {overlayKind && <AccountConcurrencyBadge account={account} />}
                 </>
               )}
               <DaybreakBadge models={account.daybreak_models} />
@@ -14220,11 +14283,15 @@ function AccountMobileCard({
               {renderAccountStateOverlay(account, t, { compact: true, markerOnly: true })}
             </div>
           ) : !overlayKind && showColumn("status") ? (
-            <StatusBadge
-              status={getAccountStatusBadgeStatus(account)}
-              detail={getAccountRateLimitWindow(account) ?? undefined}
-              errorMessage={account.error_message}
-            />
+            <div className="inline-flex shrink-0 items-center gap-1.5">
+              <StatusBadge
+                status={getAccountStatusBadgeStatus(account)}
+                detail={getAccountRateLimitWindow(account) ?? undefined}
+                errorMessage={account.error_message}
+              />
+              <AccountIntelligenceActions bar={intelligenceBar} accountID={account.id} accountName={account.email || account.name} />
+              <AccountConcurrencyBadge account={account} />
+            </div>
           ) : null}
         </div>
       </header>
@@ -14291,6 +14358,7 @@ function AccountMobileCard({
                   </span>
                 </div>
                 <AccountHealthBar buckets={healthBuckets} />
+                <AccountIntelligenceBar bar={intelligenceBar} accountID={account.id} accountName={account.email || account.name} error={intelligenceError} />
               </div>
             </section>
           )}

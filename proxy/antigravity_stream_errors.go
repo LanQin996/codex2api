@@ -89,7 +89,7 @@ func (r *antigravitySSEReader) next() ([]byte, error) {
 		case r.err != nil:
 			err = r.err
 		default:
-			line, err = r.reader.ReadBytes('\n')
+			line, err = readBoundedSSELine(r.reader, maxSSELineBytes)
 		}
 		if len(line) > 0 {
 			line = bytes.TrimRight(line, "\r\n")

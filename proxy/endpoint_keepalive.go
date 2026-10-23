@@ -9,6 +9,14 @@ import (
 	"github.com/codex2api/database"
 )
 
+// Error responses are inspected as a bounded prefix. Success JSON has a
+// separate, larger budget so media-bearing responses are not capped at 1 MiB.
+const maxUpstreamResponseBodyBytes = 64 << 20
+
+func readUpstreamErrorBody(ctx context.Context, reader io.Reader) ([]byte, error) {
+	return readAllWithContinuousRetryKeepalive(ctx, io.LimitReader(reader, maxUpstreamErrorBodyBytes))
+}
+
 // upstreamResponseReadContext 保留普通请求取消后的有界 usage 补读窗口。
 // 持续重试的私有尝试则随下游立即结束，不能因补读而延长重试生命周期。
 func upstreamResponseReadContext(downstreamCtx, upstreamCtx context.Context, policy database.ContinuousRetryPolicy) context.Context {

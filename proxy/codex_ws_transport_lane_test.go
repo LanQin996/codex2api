@@ -144,3 +144,19 @@ func TestResolveCodexWebsocketTransportSessionKeySubagentLane(t *testing.T) {
 		t.Fatalf("body-embedded subagent lane = %q, want header-equivalent lane %q", got, lane)
 	}
 }
+
+func TestCodexTransportSeparatesResponseStreams(t *testing.T) {
+	headers := http.Header{"Session-Id": []string{"same"}, "Thread-Id": []string{"same"}}
+	a := []byte(`{"stream_id":"planner"}`)
+	b := []byte(`{"stream_id":"review"}`)
+	first := ResolveCodexWebsocketTransportSessionKeyWithBody("upstream", headers, a)
+	if first == "upstream" || first == ResolveCodexWebsocketTransportSessionKeyWithBody("upstream", headers, b) {
+		t.Fatal("independent streams collapsed onto one transport lease")
+	}
+	if first != ResolveCodexWebsocketTransportSessionKeyWithBody("upstream", headers, a) {
+		t.Fatal("same stream transport key was unstable")
+	}
+	if strings.Contains(first, "planner") {
+		t.Fatal("raw stream identity leaked into pool key")
+	}
+}

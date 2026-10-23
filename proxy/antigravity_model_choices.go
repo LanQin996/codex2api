@@ -27,6 +27,22 @@ func antigravityModelChoiceGroups(models []api.Model) (map[string]string, map[st
 	return fold, levels
 }
 
+func antigravityModelChoiceDefaultLevel(model string, available []string) string {
+	// Argon defaults to high, but a scoped key may only allow lower tiers.
+	// Keep the existing default selection for older model families.
+	if strings.EqualFold(model, "gemini-4-argon") {
+		for _, level := range available {
+			if level == "high" {
+				return level
+			}
+		}
+	}
+	if len(available) > 0 {
+		return available[0]
+	}
+	return "none"
+}
+
 func collapseAntigravityModelChoices(models []api.Model) []api.Model {
 	fold, levels := antigravityModelChoiceGroups(models)
 	result := make([]api.Model, 0, len(models))
@@ -41,7 +57,7 @@ func collapseAntigravityModelChoices(models []api.Model) []api.Model {
 		}
 		seen[key] = true
 		if available := levels[key]; len(available) > 0 {
-			model.DefaultReasoningLevel = available[0]
+			model.DefaultReasoningLevel = antigravityModelChoiceDefaultLevel(key, available)
 			for _, effort := range available {
 				model.SupportedReasoningLevels = append(model.SupportedReasoningLevels, api.ModelReasoningLevel{Effort: effort, Description: "Antigravity " + effort + " reasoning"})
 			}

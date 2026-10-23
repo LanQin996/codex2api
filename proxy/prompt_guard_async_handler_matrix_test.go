@@ -33,29 +33,20 @@ type asyncShadowHandlerMatrixCase struct {
 	invoke              func(*Handler, *gin.Context)
 }
 
-func TestAsyncShadowAuxiliaryRealHandlerUpstreamMatrix(t *testing.T) {
-	gin.SetMode(gin.TestMode)
+const promptGuardHandlerMatrixResinPlatform = "prompt-guard-handler-matrix"
 
-	originalDispatcher := defaultPromptGuardShadowDispatcher
-	dispatcher := newPromptGuardShadowDispatcher()
-	defaultPromptGuardShadowDispatcher = dispatcher
-	t.Cleanup(func() {
-		waitPromptGuardShadowDispatcherIdle(t, dispatcher)
-		defaultPromptGuardShadowDispatcher = originalDispatcher
-	})
-
-	previousResin := resinCfg.Load()
-	previousSettings := CurrentRuntimeSettings()
-	nextSettings := previousSettings
-	nextSettings.CodexForceWebsocket = false
-	ApplyRuntimeSettings(nextSettings)
-	t.Cleanup(func() {
-		resinCfg.Store(previousResin)
-		ApplyRuntimeSettings(previousSettings)
-	})
-
-	var upstreamCalls atomic.Int32
+func newPromptGuardHandlerMatrixUpstream(t *testing.T, upstreamCalls *atomic.Int32) *httptest.Server {
+	t.Helper()
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Earlier tests can leave telemetry queued in process-global workers.
+		// Resin is resolved when a job sends, so those background requests may
+		// reach this server. Count generation endpoints, never account/body
+		// markers: a wrongly forwarded blocked request must still be detected.
+		responsesPath := "/" + promptGuardHandlerMatrixResinPlatform + "/https/chatgpt.com/backend-api/codex/responses"
+		if r.Method != http.MethodPost || (r.URL.Path != responsesPath && r.URL.Path != responsesPath+"/compact") {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
 		upstreamCalls.Add(1)
 		body := readUpstreamRequestBody(r)
 		if strings.Contains(r.URL.Path, "/responses/compact") {
@@ -80,7 +71,98 @@ func TestAsyncShadowAuxiliaryRealHandlerUpstreamMatrix(t *testing.T) {
 		}
 	}))
 	t.Cleanup(upstream.Close)
-	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: "prompt-guard-handler-matrix"})
+	return upstream
+}
+
+func TestAsyncShadowAuxiliaryHandlerUpstreamIgnoresBackgroundTelemetry(t *testing.T) {
+	var upstreamCalls atomic.Int32
+	upstream := newPromptGuardHandlerMatrixUpstream(t, &upstreamCalls)
+	previousResin := GetResinConfig()
+	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: promptGuardHandlerMatrixResinPlatform})
+	t.Cleanup(func() { SetResinConfig(previousResin) })
+
+	// The process-global telemetry queue can outlive another test and resolve
+	// its Resin destination after this fixture is installed. Send the real
+	// analytics/metrics transport through it for both this and another account.
+	accounts := []*auth.Account{
+		{DBID: 1, AccessToken: "at-handler-matrix", AccountID: "acct-handler-matrix"},
+		{DBID: 7, AccessToken: "synthetic-previous-test", AccountID: "acct-previous-test"},
+	}
+	for _, account := range accounts {
+		client := codexTelemetryClient{account: account, accessToken: account.AccessToken, accountID: account.AccountID}
+		for _, metrics := range []bool{false, true} {
+			endpoint := codexAnalyticsEndpointDefault
+			if metrics {
+				endpoint = codexMetricsEndpointDefault
+			}
+			if err := sendCodexTelemetryJob(codexTelemetryJob{client: client, url: endpoint,
+				body: []byte(`{"synthetic_background_probe":true}`), metrics: metrics}); err != nil {
+				t.Fatalf("inject background telemetry: %v", err)
+			}
+		}
+	}
+	if got := upstreamCalls.Load(); got != 0 {
+		t.Fatalf("background telemetry counted as model forwarding: got %d calls, want 0", got)
+	}
+
+	// Do not filter by account, authorization or body. Even an incorrectly
+	// forwarded blocked request or a request using another account must count
+	// when it reaches either generation endpoint.
+	var wantCalls int32
+	for _, account := range accounts {
+		for _, suffix := range []string{"/responses", "/responses/compact"} {
+			egress := ResolveCodexEgress(account, CodexBaseURL+suffix, "")
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			request, err := http.NewRequestWithContext(ctx, http.MethodPost, egress.URL,
+				strings.NewReader(`{"model":"gpt-5.5","input":"synthetic forwarded request"}`))
+			if err != nil {
+				cancel()
+				t.Fatal(err)
+			}
+			egress.ApplyHeaders(request.Header)
+			response, err := egress.Client().Do(request)
+			if err != nil {
+				cancel()
+				t.Fatalf("inject model forwarding: %v", err)
+			}
+			_, readErr := io.Copy(io.Discard, response.Body)
+			_ = response.Body.Close()
+			cancel()
+			if response.StatusCode != http.StatusOK || readErr != nil {
+				t.Fatalf("injected forwarding status=%d readErr=%v", response.StatusCode, readErr)
+			}
+			wantCalls++
+			if got := upstreamCalls.Load(); got != wantCalls {
+				t.Fatalf("model forwarding was hidden: got %d calls, want %d", got, wantCalls)
+			}
+		}
+	}
+}
+
+func TestAsyncShadowAuxiliaryRealHandlerUpstreamMatrix(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	originalDispatcher := defaultPromptGuardShadowDispatcher
+	dispatcher := newPromptGuardShadowDispatcher()
+	defaultPromptGuardShadowDispatcher = dispatcher
+	t.Cleanup(func() {
+		waitPromptGuardShadowDispatcherIdle(t, dispatcher)
+		defaultPromptGuardShadowDispatcher = originalDispatcher
+	})
+
+	previousResin := resinCfg.Load()
+	previousSettings := CurrentRuntimeSettings()
+	nextSettings := previousSettings
+	nextSettings.CodexForceWebsocket = false
+	ApplyRuntimeSettings(nextSettings)
+	t.Cleanup(func() {
+		resinCfg.Store(previousResin)
+		ApplyRuntimeSettings(previousSettings)
+	})
+
+	var upstreamCalls atomic.Int32
+	upstream := newPromptGuardHandlerMatrixUpstream(t, &upstreamCalls)
+	SetResinConfig(&ResinConfig{BaseURL: upstream.URL, PlatformName: promptGuardHandlerMatrixResinPlatform})
 
 	db, err := database.New("sqlite", filepath.Join(t.TempDir(), "codex2api.db"))
 	if err != nil {

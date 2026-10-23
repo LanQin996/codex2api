@@ -168,7 +168,11 @@ func (h *Handler) CreateExternalImageJob(c *gin.Context) {
 		}
 		h.runImageGenerationJob(jobID, req, apiKey, opts)
 	}()
-	c.JSON(http.StatusAccepted, externalImageJobResponse{Job: job})
+	// 202 只返回小回执；params_json 可能包含全部输入图（数十 MB），
+	// 不能随响应回显给客户端，否则单请求即可放大内存/带宽。
+	responseJob := *job
+	responseJob.ParamsJSON = ""
+	c.JSON(http.StatusAccepted, externalImageJobResponse{Job: &responseJob})
 }
 
 func (h *Handler) GetExternalImageJob(c *gin.Context) {
@@ -258,14 +262,23 @@ func normalizeExternalImageJobFields(req *imageGenerationJobPayload) (bool, erro
 }
 
 func normalizeExternalImageJobInputs(ctx context.Context, req *imageGenerationJobPayload) error {
+	return normalizeExternalImageJobInputsWithLimit(ctx, req, queueInputBudget)
+}
+
+func normalizeExternalImageJobInputsWithLimit(ctx context.Context, req *imageGenerationJobPayload, limit int64) error {
 	if req == nil {
 		return fmt.Errorf("body is required")
 	}
 	images := make([]string, 0, len(req.InputImages))
+	total := 0
 	for _, imageURL := range req.InputImages {
 		normalizedImage, err := normalizeExternalInputImage(ctx, imageURL)
 		if err != nil {
 			return err
+		}
+		total += len(normalizedImage)
+		if int64(total) > limit {
+			return fmt.Errorf("input_images total size exceeds %d bytes", limit)
 		}
 		images = append(images, normalizedImage)
 	}

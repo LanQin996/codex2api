@@ -863,7 +863,7 @@ func TestApplyCodexRequestHeadersGeneratedDesktopClientSendsMatchingOriginator(t
 
 	applyCodexRequestHeaders(req, &auth.Account{DBID: 42}, "token-123", "", "api-key-1", nil, downstreamHeaders)
 
-	wantUA := "Codex Desktop/0.153.3 (Windows 10.0.26100; x86_64) unknown (Codex Desktop; 26.901.51231)"
+	wantUA := "Codex Desktop/0.153.3 (Windows 10.0.26100; x86_64) unknown (Codex Desktop; 26.930.51102)"
 	if got := req.Header.Get("User-Agent"); got != wantUA {
 		t.Fatalf("User-Agent = %q, want %q", got, wantUA)
 	}
@@ -1085,8 +1085,8 @@ func TestApplyCodexRequestHeadersAutoUpgradesOldDesktopClient(t *testing.T) {
 	if got := req.Header.Get("Originator"); got != Originator {
 		t.Fatalf("Originator = %q, want generated client originator %q", got, Originator)
 	}
-	if got := req.Header.Get("Version"); got != "0.153.3" {
-		t.Fatalf("Version = %q, want auto minimum 0.153.3", got)
+	if got := req.Header.Get("Version"); got != latestCodexCLIVersion {
+		t.Fatalf("Version = %q, want generated client version %s", got, latestCodexCLIVersion)
 	}
 }
 

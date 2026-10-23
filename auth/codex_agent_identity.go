@@ -201,9 +201,19 @@ func registerAgentIdentityTask(ctx context.Context, key agentIdentityRuntimeKey,
 	if err != nil {
 		return "", err
 	}
+	boundProxy, accountBound := AccountBoundEgress(ctx)
+	if accountBound {
+		proxyURL = boundProxy
+	}
 	client, err := grokHTTPClient(proxyURL) // 复用带代理配置的通用客户端构造器
 	if err != nil {
 		return "", err
+	}
+	if accountBound {
+		if proxyURL == "" {
+			client.Transport.(*http.Transport).Proxy = nil
+		}
+		defer client.CloseIdleConnections()
 	}
 	client.Timeout = agentIdentityTaskRegistrationTimeout
 	body, err := json.Marshal(map[string]string{"timestamp": timestamp, "signature": signature})

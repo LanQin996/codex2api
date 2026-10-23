@@ -47,6 +47,11 @@ func (h *Handler) RealtimeWebSocket(c *gin.Context) {
 		), http.StatusUpgradeRequired)
 		return
 	}
+	releaseWS, ok := h.acquireDownstreamWebSocket(c)
+	if !ok {
+		return
+	}
+	defer releaseWS()
 	if h != nil && h.store != nil {
 		cfg := h.promptFilterConfigForRequest(c)
 		if h.rejectRequiredNewAPIIdentity(c, cfg.Advanced.NewAPI, nil) {

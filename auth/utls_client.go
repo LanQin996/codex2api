@@ -3,6 +3,7 @@ package auth
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"net"
@@ -193,14 +194,31 @@ func buildAuthProxyDialer(proxyURL string) (xproxy.Dialer, error) {
 }
 
 type authHTTPConnectDialer struct {
-	proxyAddr  string
-	authHeader string
+	proxyAddr       string
+	proxyServerName string
+	useTLS          bool
+	authHeader      string
 }
 
 func (d *authHTTPConnectDialer) Dial(network, addr string) (net.Conn, error) {
 	conn, err := net.DialTimeout("tcp", d.proxyAddr, 10*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("连接代理服务器失败: %w", err)
+	}
+
+	// https:// 代理先与代理完成 TLS，避免 Basic 凭据明文传输。
+	if d.useTLS {
+		tlsConn := tls.Client(conn, &tls.Config{
+			ServerName: d.proxyServerName,
+			MinVersion: tls.VersionTLS12,
+		})
+		_ = tlsConn.SetDeadline(time.Now().Add(10 * time.Second))
+		if err := tlsConn.Handshake(); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("代理 TLS 握手失败: %w", err)
+		}
+		_ = tlsConn.SetDeadline(time.Time{})
+		conn = tlsConn
 	}
 
 	connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n", addr, addr)
@@ -252,7 +270,11 @@ func buildAuthHTTPProxyDialer(u *url.URL) (xproxy.Dialer, error) {
 		}
 	}
 
-	d := &authHTTPConnectDialer{proxyAddr: addr}
+	d := &authHTTPConnectDialer{
+		proxyAddr:       addr,
+		proxyServerName: u.Hostname(),
+		useTLS:          strings.EqualFold(u.Scheme, "https"),
+	}
 
 	if u.User != nil {
 		username := u.User.Username()

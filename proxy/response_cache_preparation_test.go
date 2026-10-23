@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"encoding/json"
+	"net/http"
 	"testing"
 
 	"github.com/codex2api/cache"
@@ -34,7 +35,7 @@ func TestPrepareResponsesBodyDetailedCacheHitAndDependentMiss(t *testing.T) {
 	}
 }
 
-func TestPrepareResponsesBodyDetailedCompleteContextBypassesLookup(t *testing.T) {
+func TestPrepareResponsesBodyDetailedCompleteContextStillRequiresParent(t *testing.T) {
 	resetResponseCacheStateForTest(testResponseCacheConfig())
 	backend := newRecordingResponseContextBackend(true)
 	backend.bounded = cache.ResponseContextReadResult{Status: cache.ResponseContextReadCorrupt}
@@ -46,24 +47,30 @@ func TestPrepareResponsesBodyDetailedCompleteContextBypassesLookup(t *testing.T)
 
 	raw := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_remote","input":[{"type":"function_call","call_id":"call_1","name":"lookup","arguments":"{}"},{"type":"function_call_output","call_id":"call_1","output":"ok"}]}`)
 	got := prepareResponsesBodyForOwnerDetailed(raw, "key:1")
-	if !got.Bypassed || got.RequiresLocalContext {
-		t.Fatalf("preparation bypass=%v required=%v, want complete-context bypass", got.Bypassed, got.RequiresLocalContext)
+	if got.Bypassed || !got.RequiresLocalContext {
+		t.Fatalf("preparation bypass=%v required=%v, want required parent proof before any replay bypass", got.Bypassed, got.RequiresLocalContext)
 	}
-	if _, gets := backend.counts(); gets != 0 {
-		t.Fatalf("backend gets = %d, want zero on complete-context bypass", gets)
+	if _, gets := backend.counts(); gets != 1 {
+		t.Fatalf("backend gets = %d, want parent lookup before bypassing expansion", gets)
+	}
+	if status, _, unavailable := responseCachePreparationFailure(got); !unavailable || status != http.StatusConflict {
+		t.Fatalf("corrupt parent proof must reject complete tool input: status=%d unavailable=%v", status, unavailable)
 	}
 }
 
-func TestPrepareResponsesBodyDetailedOrdinaryMissWithoutDependentOutputIsLegacy(t *testing.T) {
+func TestPrepareResponsesBodyDetailedOrdinaryMissFailsClosed(t *testing.T) {
 	resetResponseCacheStateForTest(testResponseCacheConfig())
 	raw := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_unknown","input":[{"role":"user","content":"continue"}]}`)
 	got := prepareResponsesBodyForOwnerDetailed(raw, "key:1")
-	if got.CacheLookup.Kind != responseCacheLookupMiss || got.RequiresLocalContext {
-		t.Fatalf("preparation = kind:%v required:%v, want non-blocking legacy miss", got.CacheLookup.Kind, got.RequiresLocalContext)
+	if got.CacheLookup.Kind != responseCacheLookupMiss || !got.RequiresLocalContext {
+		t.Fatalf("preparation = kind:%v required:%v, want required parent miss", got.CacheLookup.Kind, got.RequiresLocalContext)
+	}
+	if status, _, unavailable := responseCachePreparationFailure(got); !unavailable || status != http.StatusConflict {
+		t.Fatalf("ordinary continuation miss must return 409: status=%d unavailable=%v", status, unavailable)
 	}
 }
 
-func TestPrepareResponsesBodyDetailedBackendErrorWithoutDependentOutputIsLegacy(t *testing.T) {
+func TestPrepareResponsesBodyDetailedOrdinaryBackendErrorFailsClosed(t *testing.T) {
 	resetResponseCacheStateForTest(testResponseCacheConfig())
 	backend := newRecordingResponseContextBackend(true)
 	backend.boundedErr = errSyntheticBackend
@@ -74,11 +81,11 @@ func TestPrepareResponsesBodyDetailedBackendErrorWithoutDependentOutputIsLegacy(
 	})
 	raw := []byte(`{"model":"gpt-5.4","previous_response_id":"resp_unknown","input":[{"role":"user","content":"continue"}]}`)
 	got := prepareResponsesBodyForOwnerDetailed(raw, "key:1")
-	if got.CacheLookup.Kind != responseCacheLookupBackendError || got.RequiresLocalContext {
-		t.Fatalf("preparation = kind:%v required:%v, want non-dependent backend error", got.CacheLookup.Kind, got.RequiresLocalContext)
+	if got.CacheLookup.Kind != responseCacheLookupBackendError || !got.RequiresLocalContext {
+		t.Fatalf("preparation = kind:%v required:%v, want required parent backend error", got.CacheLookup.Kind, got.RequiresLocalContext)
 	}
-	if _, _, unavailable := responseCachePreparationFailure(got); unavailable {
-		t.Fatal("backend error without dependent output must preserve legacy routing")
+	if status, _, unavailable := responseCachePreparationFailure(got); !unavailable || status != http.StatusServiceUnavailable {
+		t.Fatalf("ordinary continuation backend error must return 503: status=%d unavailable=%v", status, unavailable)
 	}
 }
 

@@ -11,6 +11,8 @@ import (
 	"github.com/codex2api/database"
 )
 
+// TestSelectionCancellationStopsInitialScan 断言上下文取消后初次扫描立即停止：过滤器
+// 至多再被调用一次，不选入账号、不启动队列等待，并返回 context.Canceled。
 func TestSelectionCancellationStopsInitialScan(t *testing.T) {
 	for _, engine := range []string{"legacy", "indexed"} {
 		for _, cancelBefore := range []bool{true, false} {
@@ -36,7 +38,7 @@ func TestSelectionCancellationStopsInitialScan(t *testing.T) {
 					return false
 				}
 				h := &Handler{store: store}
-				account, _, _, err := h.nextRetryAccountWithGuard(ctx, "", 0, newRetryAccountExclusions(), filter, false, auth.DispatchPolicyStandard)
+				account, _, _, err := h.nextRetryAccountWithGuard(ctx, "", 0, newRetryAccountExclusions(), filter, false, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 				if account != nil {
 					store.Release(account)
 					t.Fatal("selected an account after cancellation")
@@ -59,6 +61,8 @@ func TestSelectionCancellationStopsInitialScan(t *testing.T) {
 	}
 }
 
+// TestSelectionBudgetIncludesInitialScan 断言选号预算把初次扫描自身算进去：慢过滤器
+// 返回后预算已到期，必须直接返回 DeadlineExceeded，不再启动任何队列等待。
 func TestSelectionBudgetIncludesInitialScan(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, SchedulerEngine: "legacy"})
@@ -75,7 +79,7 @@ func TestSelectionBudgetIncludesInitialScan(t *testing.T) {
 			return false
 		}
 		h := &Handler{store: store}
-		account, _, _, err := h.nextRetryAccountWithGuard(context.Background(), "", 0, newRetryAccountExclusions(), filter, false, auth.DispatchPolicyStandard)
+		account, _, _, err := h.nextRetryAccountWithGuard(context.Background(), "", 0, newRetryAccountExclusions(), filter, false, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 		if account != nil || !errors.Is(err, context.DeadlineExceeded) || calls != 2 {
 			t.Fatalf("selection returned account=%v, error=%v, filter calls=%d", account, err, calls)
 		}
@@ -85,6 +89,9 @@ func TestSelectionBudgetIncludesInitialScan(t *testing.T) {
 	})
 }
 
+// TestSelectionSuccessPreservesRequestLifetime 断言选号超时只约束选号阶段：成功选号后
+// 即便超过 accountSelectionTimeout，父上下文不受影响、账号仍被持有，不误伤后续上游
+// 流式响应。
 func TestSelectionSuccessPreservesRequestLifetime(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1})
@@ -94,7 +101,7 @@ func TestSelectionSuccessPreservesRequestLifetime(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		h := &Handler{store: store}
-		got, _, _, err := h.nextRetryAccountWithGuard(ctx, "", 0, newRetryAccountExclusions(), nil, false, auth.DispatchPolicyStandard)
+		got, _, _, err := h.nextRetryAccountWithGuard(ctx, "", 0, newRetryAccountExclusions(), nil, false, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 		if err != nil || got != account {
 			t.Fatalf("selection = %v, %v", got, err)
 		}
@@ -106,6 +113,8 @@ func TestSelectionSuccessPreservesRequestLifetime(t *testing.T) {
 	})
 }
 
+// TestSelectionDeadlineStopsPoolWait 断言请求截止时间到点即退出号池等待，不遗留队列
+// 等待者，也不会一直等到 accountSelectionTimeout。
 func TestSelectionDeadlineStopsPoolWait(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, FastSchedulerEnabled: true})
 	t.Cleanup(store.Stop)
@@ -113,7 +122,7 @@ func TestSelectionDeadlineStopsPoolWait(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	account, _, _, err := h.nextRetryAccountWithGuard(ctx, "", 0, newRetryAccountExclusions(), nil, false, auth.DispatchPolicyStandard)
+	account, _, _, err := h.nextRetryAccountWithGuard(ctx, "", 0, newRetryAccountExclusions(), nil, false, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 	if account != nil || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("selection returned account=%v, error=%v", account, err)
 	}
@@ -145,7 +154,7 @@ func TestSelectionResetsRequestExclusionsCoveringWholePool(t *testing.T) {
 
 				h := &Handler{store: store}
 				start := time.Now()
-				got, _, _, err := h.nextRetryAccountWithGuard(context.Background(), "", 0, exclusions, nil, false, auth.DispatchPolicyStandard)
+				got, _, _, err := h.nextRetryAccountWithGuard(context.Background(), "", 0, exclusions, nil, false, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 				if err != nil || got != account {
 					t.Fatalf("selection = %v, %v; want the %s-excluded account after reset", got, err, kind)
 				}
@@ -162,6 +171,8 @@ func TestSelectionResetsRequestExclusionsCoveringWholePool(t *testing.T) {
 	}
 }
 
+// TestSelectionTransientResetKeepsHardExclusions 断言多轮暂态重置只会重新放开暂态排除
+// 的账号，MarkHard 标记的硬排除账号在每一轮都必须继续被拦住。
 func TestSelectionTransientResetKeepsHardExclusions(t *testing.T) {
 	for _, engine := range []string{"legacy", "indexed"} {
 		t.Run(engine, func(t *testing.T) {
@@ -177,7 +188,7 @@ func TestSelectionTransientResetKeepsHardExclusions(t *testing.T) {
 
 			h := &Handler{store: store}
 			for i := 0; i < 3; i++ {
-				got, _, _, err := h.nextRetryAccountWithGuard(context.Background(), "", 0, exclusions, nil, false, auth.DispatchPolicyStandard)
+				got, _, _, err := h.nextRetryAccountWithGuard(context.Background(), "", 0, exclusions, nil, false, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 				if err != nil || got != transient {
 					t.Fatalf("round %d selection = %v, %v; want only the transient account", i, got, err)
 				}
@@ -188,6 +199,8 @@ func TestSelectionTransientResetKeepsHardExclusions(t *testing.T) {
 	}
 }
 
+// TestSelectionTransientResetKeepsAccountCooldown 断言暂态重置不会绕过账号级冷却：唯一
+// 候选仍处于冷却时只能等到上下文超时，不能借重置把它重新选入。
 func TestSelectionTransientResetKeepsAccountCooldown(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, SchedulerEngine: "indexed"})
 	t.Cleanup(store.Stop)
@@ -200,7 +213,7 @@ func TestSelectionTransientResetKeepsAccountCooldown(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 	h := &Handler{store: store}
-	got, _, _, err := h.nextRetryAccountWithGuard(ctx, "", 0, exclusions, nil, false, auth.DispatchPolicyStandard)
+	got, _, _, err := h.nextRetryAccountWithGuard(ctx, "", 0, exclusions, nil, false, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 	if got != nil {
 		store.Release(got)
 		t.Fatal("transient reset bypassed the account cooldown")
@@ -223,7 +236,7 @@ func TestSelectionStillWaitsForSaturatedCandidate(t *testing.T) {
 	exclusions.MarkTransient(failed.DBID)
 
 	h := &Handler{store: store}
-	held, _, _, err := h.nextRetryAccountWithGuard(context.Background(), "", 0, exclusions, nil, false, auth.DispatchPolicyStandard)
+	held, _, _, err := h.nextRetryAccountWithGuard(context.Background(), "", 0, exclusions, nil, false, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 	if err != nil || held != busy {
 		t.Fatalf("setup selection = %v, %v", held, err)
 	}
@@ -233,7 +246,7 @@ func TestSelectionStillWaitsForSaturatedCandidate(t *testing.T) {
 		store.Release(held)
 		close(released)
 	}()
-	got, _, _, err := h.nextRetryAccountWithGuard(context.Background(), "", 0, exclusions, nil, false, auth.DispatchPolicyStandard)
+	got, _, _, err := h.nextRetryAccountWithGuard(context.Background(), "", 0, exclusions, nil, false, auth.SelectionOptions{Policy: auth.DispatchPolicyStandard})
 	<-released
 	if err != nil || got != busy {
 		t.Fatalf("selection = %v, %v; want the released saturated account", got, err)

@@ -39,3 +39,25 @@ func TestCORSMiddlewareAllowsCodex2APIAffinityHeaderPreflight(t *testing.T) {
 		t.Fatalf("Access-Control-Allow-Headers = %q, missing X-Codex2API-Affinity-Key", recorder.Header().Get("Access-Control-Allow-Headers"))
 	}
 }
+
+func TestBodyCacheSkipsLargeImportUpload(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(BodyCacheMiddleware())
+	rawBodyCached := false
+	router.POST("/api/admin/accounts/import", func(c *gin.Context) {
+		_, rawBodyCached = c.Get("raw_body")
+		c.Status(http.StatusOK)
+	})
+
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodPost, "/api/admin/accounts/import", strings.NewReader("not read before auth"))
+	router.ServeHTTP(recorder, request)
+
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+	if rawBodyCached {
+		t.Fatal("large import body must not be cached/read before authentication")
+	}
+}

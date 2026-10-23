@@ -28,6 +28,7 @@ import (
 	"github.com/codex2api/internal/imageproc"
 	"github.com/codex2api/internal/imagestore"
 	"github.com/codex2api/internal/imageupscale"
+	"github.com/codex2api/proxy/internal/jsonbody"
 	"github.com/codex2api/security"
 	"github.com/codex2api/security/promptfilter"
 	"github.com/gin-gonic/gin"
@@ -669,19 +670,31 @@ func responsesBodyHasImageGenerationTool(body []byte) bool {
 	return strings.EqualFold(strings.TrimSpace(choice.Get("type").String()), "image_generation")
 }
 
+var responsesImageGenerationRequestFields = append([]string{"model", "tool_choice"}, responsesImageGenerationOptionFields...)
+
 func responsesBodyRequestsImageGeneration(body []byte) bool {
-	if isImageOnlyModel(gjson.GetBytes(body, "model").String()) {
+	values, single := jsonbody.TopLevel(body, responsesImageGenerationRequestFields...)
+	field := func(i int) gjson.Result {
+		if single {
+			return values[i]
+		}
+		return gjson.GetBytes(body, responsesImageGenerationRequestFields[i])
+	}
+	if isImageOnlyModel(field(0).String()) {
 		return true
 	}
-	choice := gjson.GetBytes(body, "tool_choice")
+	choice := field(1)
 	if choice.Type == gjson.String && strings.EqualFold(strings.TrimSpace(choice.String()), "image_generation") {
 		return true
 	}
 	if choice.Exists() && strings.EqualFold(strings.TrimSpace(choice.Get("type").String()), "image_generation") {
 		return true
 	}
-	for _, key := range responsesImageGenerationOptionFields {
-		value := gjson.GetBytes(body, key)
+	for i, key := range responsesImageGenerationOptionFields {
+		value := field(i + 2)
+		if key == "background" && value.Type != gjson.String {
+			continue
+		}
 		if value.Exists() && value.Type != gjson.Null {
 			return true
 		}
@@ -1803,14 +1816,14 @@ func (h *Handler) forwardImagesRequest(c *gin.Context, inboundEndpoint, requestM
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			errBody, _ := readAllWithContinuousRetryKeepalive(c.Request.Context(), resp.Body)
+			errBody, _ := readUpstreamErrorBody(c.Request.Context(), resp.Body)
 			rememberContinuousRetryHTTPFailure(c.Request.Context(), resp, errBody)
 			resp.Body.Close()
 			if continuousRetryCommitExpired(c, continuousRetryProtocolResponses) {
 				h.store.Release(account)
 				return
 			}
-			if kind := classifyHTTPFailure(resp.StatusCode); kind != "" {
+			if kind := classifyHTTPFailure(resp.StatusCode, errBody); kind != "" {
 				h.store.ReportRequestFailure(account, kind, time.Duration(durationMs)*time.Millisecond)
 			}
 			SyncCodexUsageState(h.store, account, resp)

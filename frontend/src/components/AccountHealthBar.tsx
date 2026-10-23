@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import AccountStatusBar from './AccountStatusBar'
 import { useTranslation } from 'react-i18next'
 import type { AccountHealthBucket } from '../types'
 
@@ -45,11 +45,6 @@ function formatClock(timestamp: number): string {
   const h = date.getHours().toString().padStart(2, '0')
   const m = date.getMinutes().toString().padStart(2, '0')
   return `${h}:${m}`
-}
-
-function formatSuccessRate(rate: number): string {
-  const rounded = rate.toFixed(1)
-  return `${rounded.endsWith('.0') ? rounded.slice(0, -2) : rounded}%`
 }
 
 // statusBarDataFromBuckets 把后端的成败分桶（由旧到新）转换为渲染所需结构。
@@ -111,9 +106,6 @@ export default function AccountHealthBar({
   blockMinutes = 10,
 }: Props) {
   const { t } = useTranslation()
-  const [activeTooltip, setActiveTooltip] = useState<number | null>(null)
-  const blocksRef = useRef<HTMLDivElement>(null)
-
   const data = statusBarDataFromBuckets(buckets ?? [], blockCount, blockMinutes)
   const hasData = data.totalSuccess + data.totalFailure > 0
   const rateClass = !hasData
@@ -124,43 +116,13 @@ export default function AccountHealthBar({
         ? 'bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-400'
         : 'bg-red-100 text-red-600 dark:bg-red-950 dark:text-red-400'
 
-  // 点击外部关闭 tooltip（移动端 / 触摸）。
-  useEffect(() => {
-    if (activeTooltip === null) return
-    const handler = (e: PointerEvent) => {
-      if (blocksRef.current && !blocksRef.current.contains(e.target as Node)) {
-        setActiveTooltip(null)
-      }
-    }
-    document.addEventListener('pointerdown', handler)
-    return () => document.removeEventListener('pointerdown', handler)
-  }, [activeTooltip])
-
-  const handlePointerEnter = useCallback((e: React.PointerEvent, idx: number) => {
-    if (e.pointerType === 'mouse') setActiveTooltip(idx)
-  }, [])
-  const handlePointerLeave = useCallback((e: React.PointerEvent) => {
-    if (e.pointerType === 'mouse') setActiveTooltip(null)
-  }, [])
-  const handlePointerDown = useCallback((e: React.PointerEvent, idx: number) => {
-    if (e.pointerType === 'touch') {
-      e.preventDefault()
-      setActiveTooltip((prev) => (prev === idx ? null : idx))
-    }
-  }, [])
-
-  const total = data.blockDetails.length
-
-  const renderTooltip = (detail: StatusBlockDetail, idx: number) => {
+  const renderTooltip = (detail: StatusBlockDetail) => {
     const count = detail.success + detail.failure
-    // 边缘块靠左/右对齐，避免 tooltip 溢出。
-    const posClass =
-      idx <= 2 ? 'left-0 translate-x-0' : idx >= total - 3 ? 'right-0 left-auto translate-x-0' : 'left-1/2 -translate-x-1/2'
     const timeRange = `${formatClock(detail.startTime)} – ${formatClock(detail.endTime)}`
 
     return (
       <div
-        className={`pointer-events-none absolute bottom-[calc(100%+8px)] z-30 whitespace-nowrap rounded-md border bg-popover px-2.5 py-1.5 text-[11px] leading-snug text-popover-foreground shadow-md ${posClass}`}
+        className="contents"
       >
         <span className="mb-0.5 block text-muted-foreground">{timeRange}</span>
         {count > 0 ? (
@@ -180,36 +142,12 @@ export default function AccountHealthBar({
     )
   }
 
-  return (
-    <div className="flex max-w-full items-center gap-1.5">
-      <div className="relative flex min-w-[120px] flex-1 gap-[2px]" ref={blocksRef}>
-        {data.blockDetails.map((detail, idx) => {
-          const isIdle = detail.rate === -1
-          const isActive = activeTooltip === idx
-          return (
-            <div
-              key={idx}
-              className="group relative min-w-[4px] flex-1 cursor-pointer"
-              onPointerEnter={(e) => handlePointerEnter(e, idx)}
-              onPointerLeave={handlePointerLeave}
-              onPointerDown={(e) => handlePointerDown(e, idx)}
-            >
-              <div
-                className={`h-1.5 w-full rounded-[2px] transition-transform duration-150 group-hover:scale-y-[1.8] ${
-                  isIdle ? 'bg-border' : ''
-                } ${isActive ? 'scale-y-[1.8] opacity-90' : ''}`}
-                style={isIdle ? undefined : { backgroundColor: rateToColor(detail.rate) }}
-              />
-              {isActive && renderTooltip(detail, idx)}
-            </div>
-          )
-        })}
-      </div>
-      <span
-        className={`inline-flex items-center rounded px-1.5 py-0.5 text-[11px] font-semibold tabular-nums ${rateClass}`}
-      >
-        {hasData ? formatSuccessRate(data.successRate) : '--'}
-      </span>
-    </div>
-  )
+  return <AccountStatusBar
+    blocks={data.blockDetails.map(detail => ({
+      color: detail.rate === -1 ? undefined : rateToColor(detail.rate),
+      tooltip: renderTooltip(detail),
+    }))}
+    rate={hasData ? data.successRate : null}
+    rateClass={rateClass}
+  />
 }

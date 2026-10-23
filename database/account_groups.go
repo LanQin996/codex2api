@@ -366,6 +366,10 @@ func containsInt64(slice []int64, target int64) bool {
 
 func (db *DB) SetAccountGroups(ctx context.Context, accountID int64, groupIDs []int64) error {
 	err := db.withWriteTx(ctx, func(tx *sql.Tx) error {
+		if err := db.intelligenceManualMutationTx(ctx, tx, []int64{accountID}, false); err != nil {
+			return err
+		}
+
 		ph := "$1"
 		insertQ := "INSERT INTO account_group_members (account_id, group_id) VALUES ($1, $2)"
 		if db.isSQLite() {
@@ -407,6 +411,10 @@ func (db *DB) BatchSetAccountGroups(ctx context.Context, accountIDs []int64, gro
 		return nil
 	}
 	err := db.withWriteTx(ctx, func(tx *sql.Tx) error {
+		if err := db.intelligenceManualMutationTx(ctx, tx, accountIDs, false); err != nil {
+			return err
+		}
+
 		return db.batchReplaceAccountGroups(ctx, tx, accountIDs, groupIDs)
 	})
 	if err != nil {

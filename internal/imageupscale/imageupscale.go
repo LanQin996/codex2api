@@ -22,6 +22,13 @@ import (
 
 const maxUpscalerResponseBytes = 64 << 20
 
+// 目标尺寸上限：单边 16384，总像素 4000 万（RGBA 约 160MB）。
+// 超过上限的 strict_size 不会被当作精确目标，避免 NewRGBA 直接分配 GB 级内存。
+const (
+	maxTargetDimension = 16384
+	maxTargetPixels    = 40_000_000
+)
+
 // Result describes one applied upscale. Data is the re-encoded image.
 type Result struct {
 	Data         []byte
@@ -116,6 +123,10 @@ func parseSize(size string) (int, int, bool) {
 	}
 	height, err := strconv.Atoi(strings.TrimSpace(parts[1]))
 	if err != nil || height <= 0 {
+		return 0, 0, false
+	}
+	if width > maxTargetDimension || height > maxTargetDimension ||
+		int64(width)*int64(height) > maxTargetPixels {
 		return 0, 0, false
 	}
 	return width, height, true

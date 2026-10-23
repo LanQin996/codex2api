@@ -197,7 +197,19 @@ func MaskResinBaseURL(raw string) string {
 }
 
 // ResolveCodexRequestEgress picks the websocket or HTTP egress for one request.
-func ResolveCodexRequestEgress(_ context.Context, account *auth.Account, targetURL, proxyURL string, websocket bool) CodexEgress {
+func ResolveCodexRequestEgress(ctx context.Context, account *auth.Account, targetURL, proxyURL string, websocket bool) CodexEgress {
+	if boundProxy, ok := AccountBoundEgress(ctx); ok {
+		boundProxy = strings.TrimSpace(boundProxy)
+		kind := CodexEgressDirect
+		if boundProxy != "" {
+			kind = CodexEgressProxy
+		}
+		egress := CodexEgress{Kind: kind, URL: targetURL, ProxyURL: boundProxy, DialProxyURL: boundProxy, account: account}
+		if !websocket && account != nil {
+			egress.client = getRequestClient(ctx, account, boundProxy)
+		}
+		return egress
+	}
 	if websocket {
 		return ResolveCodexWebsocketEgress(account, targetURL, proxyURL)
 	}

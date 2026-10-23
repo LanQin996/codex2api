@@ -404,8 +404,15 @@ func TestNormalizeResponsesWebSocketClientPayload(t *testing.T) {
 
 	t.Run("rejects append", func(t *testing.T) {
 		_, _, apiErr := normalizeResponsesWebSocketClientPayload([]byte(`{"type":"response.append","model":"gpt-5.5"}`))
-		if apiErr == nil || !strings.Contains(apiErr.Message, "response.append") {
+		if apiErr == nil || apiErr.Code != api.ErrCodeUnsupportedFeature || !strings.Contains(apiErr.Message, "response.append") {
 			t.Fatalf("error = %#v, want response.append rejection", apiErr)
+		}
+	})
+
+	t.Run("rejects steer explicitly", func(t *testing.T) {
+		_, _, apiErr := normalizeResponsesWebSocketClientPayload([]byte(`{"type":"response.steer","previous_response_id":"resp_123","input":"continue"}`))
+		if apiErr == nil || apiErr.Code != api.ErrCodeUnsupportedFeature || !strings.Contains(apiErr.Message, "response.steer") {
+			t.Fatalf("error = %#v, want response.steer rejection", apiErr)
 		}
 	})
 
@@ -1167,10 +1174,10 @@ func TestResponsesWebSocketSuccessPreservesNewerUsageLimitCooldown(t *testing.T)
 	}
 
 	deadline := time.Now().Add(time.Second)
-	for atomic.LoadInt64(&account.ActiveRequests) != 0 && time.Now().Before(deadline) {
+	for account.ActiveRequests.Load() != 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
-	if got := atomic.LoadInt64(&account.ActiveRequests); got != 0 {
+	if got := account.ActiveRequests.Load(); got != 0 {
 		t.Fatalf("ActiveRequests = %d after completed response, want 0", got)
 	}
 	if !account.HasActiveCooldown() || account.IsAvailable() {
@@ -1491,16 +1498,16 @@ func TestResponsesWebSocketFallsBackToHTTPWhenUpstreamMessageTooBig(t *testing.T
 		t.Fatalf("HTTP fallback account = %q, want same leased WS account %d", httpAccountID, wsAccountID)
 	}
 	deadline := time.Now().Add(time.Second)
-	for atomic.LoadInt64(&primary.ActiveRequests) != 0 && time.Now().Before(deadline) {
+	for primary.ActiveRequests.Load() != 0 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
-	if got := atomic.LoadInt64(&primary.ActiveRequests); got != 0 {
+	if got := primary.ActiveRequests.Load(); got != 0 {
 		t.Fatalf("primary ActiveRequests after fallback = %d, want 0", got)
 	}
-	if got := atomic.LoadInt64(&primary.TotalRequests); got != 1 {
+	if got := primary.TotalRequests.Load(); got != 1 {
 		t.Fatalf("primary TotalRequests = %d, want one logical dispatch", got)
 	}
-	if got := atomic.LoadInt64(&secondary.TotalRequests); got != 0 {
+	if got := secondary.TotalRequests.Load(); got != 0 {
 		t.Fatalf("secondary TotalRequests = %d, want no fallback redispatch", got)
 	}
 }
@@ -1612,13 +1619,13 @@ func TestResponsesHTTPIngressFallsBackToHTTPWhenForcedWebsocketMessageTooBig(t *
 	if httpAccountID != fmt.Sprint(wsAccountID) {
 		t.Fatalf("HTTP fallback account = %q, want same leased WS account %d", httpAccountID, wsAccountID)
 	}
-	if got := atomic.LoadInt64(&primary.ActiveRequests); got != 0 {
+	if got := primary.ActiveRequests.Load(); got != 0 {
 		t.Fatalf("primary ActiveRequests after fallback = %d, want 0", got)
 	}
-	if got := atomic.LoadInt64(&primary.TotalRequests); got != 1 {
+	if got := primary.TotalRequests.Load(); got != 1 {
 		t.Fatalf("primary TotalRequests = %d, want one logical dispatch", got)
 	}
-	if got := atomic.LoadInt64(&secondary.TotalRequests); got != 0 {
+	if got := secondary.TotalRequests.Load(); got != 0 {
 		t.Fatalf("secondary TotalRequests = %d, want no fallback redispatch", got)
 	}
 }
@@ -1803,10 +1810,10 @@ func TestResponsesHTTPIngressRetainsAccountWhenWebsocketRequestReturnsMessageToo
 	if got := <-httpAccountIDs; got != "1" {
 		t.Fatalf("HTTP fallback account = %q, want retained account 1", got)
 	}
-	if got := atomic.LoadInt64(&account.TotalRequests); got != 1 {
+	if got := account.TotalRequests.Load(); got != 1 {
 		t.Fatalf("TotalRequests = %d, want one logical dispatch", got)
 	}
-	if got := atomic.LoadInt64(&account.ActiveRequests); got != 0 {
+	if got := account.ActiveRequests.Load(); got != 0 {
 		t.Fatalf("ActiveRequests after fallback = %d, want 0", got)
 	}
 }
@@ -1916,13 +1923,13 @@ func TestCompatibilityEndpointsRetainAccountForWebsocketMessageTooBigHTTPFallbac
 			if httpAccountID != fmt.Sprint(wsAccountID) {
 				t.Fatalf("HTTP fallback account = %q, want same leased WS account %d", httpAccountID, wsAccountID)
 			}
-			if got := atomic.LoadInt64(&primary.ActiveRequests); got != 0 {
+			if got := primary.ActiveRequests.Load(); got != 0 {
 				t.Fatalf("primary ActiveRequests after fallback = %d, want 0", got)
 			}
-			if got := atomic.LoadInt64(&primary.TotalRequests); got != 1 {
+			if got := primary.TotalRequests.Load(); got != 1 {
 				t.Fatalf("primary TotalRequests = %d, want one logical dispatch", got)
 			}
-			if got := atomic.LoadInt64(&secondary.TotalRequests); got != 0 {
+			if got := secondary.TotalRequests.Load(); got != 0 {
 				t.Fatalf("secondary TotalRequests = %d, want no fallback redispatch", got)
 			}
 		})
@@ -2087,7 +2094,7 @@ func TestResponsesDoesNotFallbackOrPenalizeAfterWebSocketContent(t *testing.T) {
 	if failureStreak != 0 || recentResults != 0 {
 		t.Fatalf("1009 changed account health: FailureStreak=%d RecentResultsCnt=%d", failureStreak, recentResults)
 	}
-	if got := atomic.LoadInt64(&account.ActiveRequests); got != 0 {
+	if got := account.ActiveRequests.Load(); got != 0 {
 		t.Fatalf("ActiveRequests after non-fallback 1009 = %d, want 0", got)
 	}
 }
@@ -2278,8 +2285,8 @@ func TestConcurrencySaturatedPoolReturnsDistinctError(t *testing.T) {
 	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 1, TestModel: "gpt-5.5"})
 	account := &auth.Account{DBID: 1, AccessToken: "at-1", PlanType: "plus", AccountID: "acct-1", Status: auth.StatusReady}
 	store.AddAccount(account)
-	atomic.StoreInt64(&account.ActiveRequests, 1)
-	atomic.StoreInt64(&account.OccupiedRequests, 1)
+	account.ActiveRequests.Store(1)
+	account.OccupiedRequests.Store(1)
 	handler := NewHandler(store, nil, nil, nil)
 
 	tests := []struct {
@@ -2685,7 +2692,7 @@ func TestResponsesCompactReadCancellationDoesNotPenalizeAccount(t *testing.T) {
 	if account.FailureStreak != 0 || account.LastFailureKind != "" {
 		t.Fatalf("downstream cancellation penalized account: streak=%d kind=%q", account.FailureStreak, account.LastFailureKind)
 	}
-	if got := atomic.LoadInt64(&account.ActiveRequests); got != 0 {
+	if got := account.ActiveRequests.Load(); got != 0 {
 		t.Fatalf("ActiveRequests after cancellation = %d, want 0", got)
 	}
 }
@@ -3725,6 +3732,109 @@ func TestResponseFailedModelUnsupportedRetryable(t *testing.T) {
 	plain := []byte(`{"type":"response.failed","response":{"error":{"code":"invalid_request_error","message":"Invalid value for 'temperature'"}}}`)
 	if responseFailedRetryable(plain) {
 		t.Fatal("普通 invalid_request 的 response.failed 不应重试")
+	}
+}
+
+func TestUnsupportedModelCooldownFollowsSettingAndSkipsHealth(t *testing.T) {
+	body := []byte(`{"error":{"message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account.","type":"invalid_request_error"}}`)
+	resp := &http.Response{Header: make(http.Header)}
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestConcurrency: 1, TestModel: "gpt-5.5"})
+	defer store.Stop()
+	account := &auth.Account{DBID: 1, AccessToken: "at", PlanType: "free", Status: auth.StatusReady}
+	store.AddAccount(account)
+	handler := &Handler{store: store}
+	failureStreak := func() int {
+		account.Mu().RLock()
+		defer account.Mu().RUnlock()
+		return account.FailureStreak
+	}
+
+	decision := handler.applyCooldownForModel(account, http.StatusBadRequest, body, resp, "gpt-5.6-sol")
+	if decision.Reason != auth.ModelCooldownReasonUnsupported || time.Until(decision.ResetAt) < 29*time.Minute {
+		t.Fatalf("decision = %#v, want default 30m cooldown", decision)
+	}
+	if streak := failureStreak(); streak != 0 {
+		t.Fatalf("failure streak = %d, unsupported model must not count as account failure", streak)
+	}
+	if kind := classifyHTTPFailure(http.StatusBadRequest, body); kind != "" {
+		t.Fatalf("classifyHTTPFailure = %q, want no health report", kind)
+	}
+	if kind := classifyHTTPFailure(http.StatusBadRequest, []byte(`{"error":{"message":"bad"}}`)); kind != "client" {
+		t.Fatalf("ordinary 400 kind = %q, want client", kind)
+	}
+	payload := []byte(`{"type":"response.failed","response":{"error":{"code":"invalid_request_error","message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}}`)
+	outcome := classifyResponseFailedOutcome(payload)
+	if !outcome.penalize || !outcome.modelUnsupported {
+		t.Fatalf("outcome = %#v, want retryable but health-neutral", outcome)
+	}
+	handler.reportStreamOutcomeFailure(account, outcome, time.Millisecond)
+	if failureStreak() != 0 {
+		t.Fatal("stream unsupported-model failure must not count as account failure")
+	}
+
+	store.ClearAllModelCooldowns(account)
+	store.SetModelCooldownSettings(database.ModelCooldownSettings{OAuthUnsupportedDisabled: true})
+	decision = handler.applyCooldownForModel(account, http.StatusBadRequest, body, resp, "gpt-5.6-sol")
+	if !decision.ResetAt.IsZero() || account.IsModelRateLimited("gpt-5.6-sol") {
+		t.Fatalf("disabled setting still wrote a cooldown: %#v", decision)
+	}
+}
+
+func TestUnsupportedModelPoolReturnsModelNotSupportedError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	originalWait := dispatchAccountWaitTimeout
+	dispatchAccountWaitTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { dispatchAccountWaitTimeout = originalWait })
+
+	store := auth.NewStore(nil, nil, &database.SystemSettings{MaxConcurrency: 2, TestModel: "gpt-5.5"})
+	defer store.Stop()
+	for id := int64(1); id <= 2; id++ {
+		account := &auth.Account{DBID: id, AccessToken: fmt.Sprintf("at-%d", id), PlanType: "free", AccountID: fmt.Sprintf("acct-%d", id), Status: auth.StatusReady}
+		store.AddAccount(account)
+		store.MarkModelUnsupported(account, "gpt-5.5", 10*time.Minute)
+	}
+	handler := NewHandler(store, nil, nil, nil)
+
+	tests := []struct {
+		name    string
+		path    string
+		body    string
+		handler gin.HandlerFunc
+	}{
+		{name: "responses", path: "/v1/responses", body: `{"model":"gpt-5.5","input":"hello"}`, handler: handler.Responses},
+		{name: "chat", path: "/v1/chat/completions", body: `{"model":"gpt-5.5","messages":[{"role":"user","content":"hello"}]}`, handler: handler.ChatCompletions},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodPost, test.path, strings.NewReader(test.body))
+			req.Header.Set("Content-Type", "application/json")
+			recorder := httptest.NewRecorder()
+			ginCtx, _ := gin.CreateTestContext(recorder)
+			ginCtx.Request = req
+
+			test.handler(ginCtx)
+
+			if recorder.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
+			}
+			if code := gjson.Get(recorder.Body.String(), "error.code").String(); code != auth.ModelCooldownReasonUnsupported {
+				t.Fatalf("code = %q, want model_not_supported; body=%s", code, recorder.Body.String())
+			}
+			if message := gjson.Get(recorder.Body.String(), "error.message").String(); !strings.Contains(message, "not supported when using Codex") {
+				t.Fatalf("message = %q, want the upstream reason", message)
+			}
+		})
+	}
+}
+
+func TestLastFailureModelUnsupported(t *testing.T) {
+	body := []byte(`{"error":{"message":"The 'gpt-5.6-sol' model is not supported when using Codex with a ChatGPT account."}}`)
+	if !lastFailureModelUnsupported(http.StatusBadRequest, body) {
+		t.Fatal("unsupported-model 400 must be passed through")
+	}
+	if lastFailureModelUnsupported(http.StatusBadRequest, []byte(`{"error":{"message":"bad"}}`)) || lastFailureModelUnsupported(http.StatusTooManyRequests, body) || lastFailureModelUnsupported(0, nil) {
+		t.Fatal("only the unsupported-model 400 qualifies")
 	}
 }
 

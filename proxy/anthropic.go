@@ -73,18 +73,41 @@ type anthropicContentBlock struct {
 	Source       *anthropicImageSource  `json:"source,omitempty"`
 	ID           string                 `json:"id,omitempty"`
 	Name         string                 `json:"name,omitempty"`
+	ToolName     string                 `json:"tool_name,omitempty"`
 	Input        json.RawMessage        `json:"input,omitempty"`
 	ToolUseID    string                 `json:"tool_use_id,omitempty"`
 	Content      json.RawMessage        `json:"content,omitempty"`
 	IsError      bool                   `json:"is_error,omitempty"`
 	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
+	Title        string                 `json:"title,omitempty"`
+	Context      string                 `json:"context,omitempty"`
+	Structured   json.RawMessage        `json:"-"`
 }
 
 type anthropicCacheControl struct {
 	Type string `json:"type,omitempty"`
 }
 
+func (b *anthropicContentBlock) UnmarshalJSON(data []byte) error {
+	kind := gjson.GetBytes(data, "type").String()
+	if kind == "search_result" || kind == "browser_state" {
+		// These blocks have different source/state shapes; retain all original fields.
+		*b = anthropicContentBlock{Type: kind, Structured: bytes.Clone(data)}
+		return nil
+	}
+	type plainBlock anthropicContentBlock
+	var decoded plainBlock
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*b = anthropicContentBlock(decoded)
+	return nil
+}
+
 func (b anthropicContentBlock) MarshalJSON() ([]byte, error) {
+	if b.Type == "search_result" || b.Type == "browser_state" {
+		return b.Structured, nil
+	}
 	type contentBlock struct {
 		Type      string                `json:"type"`
 		Text      *string               `json:"text,omitempty"`
@@ -93,10 +116,13 @@ func (b anthropicContentBlock) MarshalJSON() ([]byte, error) {
 		Source    *anthropicImageSource `json:"source,omitempty"`
 		ID        string                `json:"id,omitempty"`
 		Name      string                `json:"name,omitempty"`
+		ToolName  string                `json:"tool_name,omitempty"`
 		Input     json.RawMessage       `json:"input,omitempty"`
 		ToolUseID string                `json:"tool_use_id,omitempty"`
 		Content   json.RawMessage       `json:"content,omitempty"`
 		IsError   bool                  `json:"is_error,omitempty"`
+		Title     string                `json:"title,omitempty"`
+		Context   string                `json:"context,omitempty"`
 	}
 
 	out := contentBlock{
@@ -105,10 +131,13 @@ func (b anthropicContentBlock) MarshalJSON() ([]byte, error) {
 		Source:    b.Source,
 		ID:        b.ID,
 		Name:      b.Name,
+		ToolName:  b.ToolName,
 		Input:     b.Input,
 		ToolUseID: b.ToolUseID,
 		Content:   b.Content,
 		IsError:   b.IsError,
+		Title:     b.Title,
+		Context:   b.Context,
 	}
 	if b.Type == "text" || b.Text != "" {
 		out.Text = &b.Text
@@ -126,11 +155,15 @@ type anthropicImageSource struct {
 }
 
 type anthropicTool struct {
-	Type         string                 `json:"type,omitempty"`
-	Name         string                 `json:"name"`
-	Description  string                 `json:"description,omitempty"`
-	InputSchema  json.RawMessage        `json:"input_schema"`
-	CacheControl *anthropicCacheControl `json:"cache_control,omitempty"`
+	Type           string                 `json:"type,omitempty"`
+	Name           string                 `json:"name"`
+	Description    string                 `json:"description,omitempty"`
+	InputSchema    json.RawMessage        `json:"input_schema"`
+	AllowedDomains []string               `json:"allowed_domains,omitempty"`
+	BlockedDomains []string               `json:"blocked_domains,omitempty"`
+	UserLocation   map[string]any         `json:"user_location,omitempty"`
+	CacheControl   *anthropicCacheControl `json:"cache_control,omitempty"`
+	DeferLoading   bool                   `json:"defer_loading,omitempty"`
 }
 
 // ==================== Anthropic 响应类型 ====================
@@ -268,15 +301,33 @@ func canonicalizeCodexModel(model string, supportedModels []string) string {
 // resolveAnthropicModel 将 Anthropic 模型名解析为 Codex 模型名
 // 优先使用数据库中的动态映射，回退到默认映射
 func resolveAnthropicModel(model string, dynamicMappingJSON string, supportedModels []string) string {
+	return resolveAnthropicModelForRoute(model, dynamicMappingJSON, supportedModels, nil)
+}
+
+// resolveAnthropicModelForRoute 是带请求路由信息的 resolveAnthropicModel。
+// servedDirectly 报告某个模型 ID 是否有本次请求可用的账号以原名服务；命中时内置
+// 默认映射让位，原样保留该 ID。显式配置的映射仍最先生效。servedDirectly 为 nil
+// 或不命中时行为与 resolveAnthropicModel 一致，没有对应账号的部署照旧走 Codex 兜底。
+func resolveAnthropicModelForRoute(model string, dynamicMappingJSON string, supportedModels []string, servedDirectly func(string) bool) string {
 	model = strings.TrimSpace(model)
 
 	// 1. 尝试动态映射（从系统设置，支持精确和 * 通配）
 	if mapped, ok := resolveConfiguredModelMapping(model, dynamicMappingJSON, supportedModels); ok {
 		return mapped
 	}
+	// Logical Antigravity names are callable even though discovery lists their
+	// fixed tiers. Preserve a directly served name before any Codex fallback.
+	if _, logical := antigravityLogicalCompatibilityModel(model); logical && servedDirectly != nil && servedDirectly(model) {
+		return model
+	}
 
-	// 2. 尝试默认映射
+	// 2. 尝试默认映射。默认表只是"没有账号能服务 Claude 模型"时的 Codex 兜底：
+	// 请求的 ID 若有账号以原名服务（如 Antigravity 发布的 claude-sonnet-4-6），
+	// 保留原名，否则 Antigravity 专用 Key 会 503，混用 Key 会静默拿到 GPT 的回答。
 	if mapped, ok := defaultAnthropicModelMap[model]; ok {
+		if servedDirectly != nil && servedDirectly(model) {
+			return model
+		}
 		return canonicalizeCodexModel(mapped, supportedModels)
 	}
 
@@ -343,7 +394,14 @@ func shouldUseCodexPriorityForAnthropicSpeed(speed string) bool {
 // TranslateAnthropicToCodexWithModels 将 Anthropic Messages 请求转换为 Codex Responses 格式
 // 返回: (codex 请求体, 原始 Anthropic model 名, error)
 func TranslateAnthropicToCodexWithModels(rawJSON []byte, modelMappingJSON string, supportedModels []string) ([]byte, string, error) {
-	return translateAnthropicToResponses(rawJSON, modelMappingJSON, supportedModels, false)
+	return translateAnthropicToResponses(rawJSON, modelMappingJSON, supportedModels, false, nil)
+}
+
+// translateAnthropicToCodexForRoute 与 TranslateAnthropicToCodexWithModels 相同，
+// 但模型解析使用请求级的 servedDirectly 判定（见 resolveAnthropicModelForRoute），
+// 使翻译体里的 model 与选号时的路由模型一致。
+func translateAnthropicToCodexForRoute(rawJSON []byte, modelMappingJSON string, supportedModels []string, servedDirectly func(string) bool) ([]byte, string, error) {
+	return translateAnthropicToResponses(rawJSON, modelMappingJSON, supportedModels, false, servedDirectly)
 }
 
 // TranslateAnthropicToResponsesForGrok converts Messages into a canonical
@@ -351,17 +409,27 @@ func TranslateAnthropicToCodexWithModels(rawJSON []byte, modelMappingJSON string
 // Responses can represent. The existing Codex converter intentionally omits
 // these controls because the Codex endpoint rejects them.
 func TranslateAnthropicToResponsesForGrok(rawJSON []byte, modelMappingJSON string, supportedModels []string) ([]byte, string, error) {
-	return translateAnthropicToResponses(rawJSON, modelMappingJSON, supportedModels, true)
+	return translateAnthropicToResponses(rawJSON, modelMappingJSON, supportedModels, true, nil)
 }
 
-func translateAnthropicToResponses(rawJSON []byte, modelMappingJSON string, supportedModels []string, preserveControls bool) ([]byte, string, error) {
+func translateAnthropicToResponses(rawJSON []byte, modelMappingJSON string, supportedModels []string, preserveControls bool, servedDirectly func(string) bool) ([]byte, string, error) {
 	var req anthropicRequest
 	if err := json.Unmarshal(rawJSON, &req); err != nil {
 		return nil, "", fmt.Errorf("parse anthropic request: %w", err)
 	}
 
 	originalModel := req.Model
-	codexModel := resolveAnthropicModel(req.Model, modelMappingJSON, supportedModels)
+	codexModel := resolveAnthropicModelForRoute(req.Model, modelMappingJSON, supportedModels, servedDirectly)
+	if !preserveControls {
+		if err := validateAnthropicCodexContent(req.Messages); err != nil {
+			return nil, originalModel, err
+		}
+		tools, err := selectAnthropicCodexTools(req)
+		if err != nil {
+			return nil, originalModel, err
+		}
+		req.Tools = tools
+	}
 	if err := validateAnthropicToolReferences(req.Messages); err != nil {
 		return nil, originalModel, err
 	}
@@ -420,7 +488,7 @@ func translateAnthropicToResponses(rawJSON []byte, modelMappingJSON string, supp
 
 	// tool_choice
 	if len(req.ToolChoice) > 0 {
-		if tc := convertAnthropicToolChoice(req.ToolChoice); tc != nil {
+		if tc := convertAnthropicToolChoiceForTools(req.ToolChoice, req.Tools); tc != nil {
 			out["tool_choice"] = tc
 		}
 	}
@@ -457,20 +525,16 @@ func copyAnthropicResponsesControls(out map[string]any, req anthropicRequest) er
 	}
 
 	if len(req.ToolChoice) > 0 && strings.TrimSpace(string(req.ToolChoice)) != "null" {
-		choice := convertAnthropicToolChoice(req.ToolChoice)
+		choice := convertAnthropicToolChoiceForTools(req.ToolChoice, req.Tools)
 		if choice == nil {
 			return fmt.Errorf("Messages tool_choice cannot be represented by Responses")
 		}
+		// convertAnthropicToolChoice 已返回 Responses 的扁平形态；字符串形态
+		// （auto/required/none）直接透传。这里只需校验 function 选择确实带了 name。
 		if choiceMap, ok := choice.(map[string]any); ok {
-			function, _ := choiceMap["function"].(map[string]any)
-			name := strings.TrimSpace(firstNonEmptyAnyString(choiceMap["name"]))
-			if name == "" {
-				name = strings.TrimSpace(firstNonEmptyAnyString(function["name"]))
-			}
-			if name == "" {
+			if strings.TrimSpace(firstNonEmptyAnyString(choiceMap["name"])) == "" {
 				return fmt.Errorf("Messages tool_choice type tool requires name")
 			}
-			choice = map[string]any{"type": "function", "name": name}
 		}
 		out["tool_choice"] = choice
 	}
@@ -580,6 +644,10 @@ func appendTranslatedMessages(input []any, messages []anthropicMessage) []any {
 			input = appendUserBlocks(input, blocks)
 		case "assistant":
 			input = appendAssistantBlocks(input, blocks)
+		case "system", "developer":
+			if text := parseAnthropicSystem(msg.Content); text != "" {
+				input = append(input, grokDeveloperMessage(text))
+			}
 		}
 	}
 	return input
@@ -627,7 +695,9 @@ func parseAnthropicSystem(raw json.RawMessage) string {
 	var parts []string
 	for _, block := range parseAnthropicSystemBlocks(raw) {
 		if block.Type == "text" && block.Text != "" {
-			parts = append(parts, block.Text)
+			if text := stripClaudeCodeSystemMetadata(block.Text); text != "" {
+				parts = append(parts, text)
+			}
 		}
 	}
 	return strings.Join(parts, "\n\n")
@@ -698,7 +768,13 @@ func appendUserBlocks(input []any, blocks []anthropicContentBlock) []any {
 	for _, b := range blocks {
 		switch b.Type {
 		case "text":
-			contentParts = append(contentParts, map[string]any{"type": "input_text", "text": b.Text})
+			if text := normalizeClaudeCodeTransportReminder(b.Text); text != "" || b.Text == "" {
+				contentParts = append(contentParts, map[string]any{"type": "input_text", "text": text})
+			}
+		case "document":
+			contentParts = append(contentParts, map[string]any{"type": "input_text", "text": anthropicTextDocument(b)})
+		case "search_result":
+			contentParts = append(contentParts, map[string]any{"type": "input_text", "text": string(b.Structured)})
 		case "image":
 			if b.Source != nil {
 				dataURI := fmt.Sprintf("data:%s;base64,%s", b.Source.MediaType, b.Source.Data)
@@ -757,6 +833,11 @@ func appendAssistantBlocks(input []any, blocks []anthropicContentBlock) []any {
 		switch b.Type {
 		case "text":
 			textParts = append(textParts, map[string]any{"type": "output_text", "text": b.Text})
+		case "server_tool_use":
+			// Hosted search history is context, not a client tool to execute again.
+			textParts = append(textParts, map[string]any{"type": "output_text", "text": fmt.Sprintf("[Previous server_tool_use %q, id %q]\n%s", b.Name, b.ID, b.Input)})
+		case "web_search_tool_result":
+			textParts = append(textParts, map[string]any{"type": "output_text", "text": fmt.Sprintf("[Previous web_search_tool_result for %q]\n%s", b.ToolUseID, b.Content)})
 		case "tool_use":
 			// 先把已有文本作为 message 输出
 			if len(textParts) > 0 {
@@ -865,6 +946,14 @@ func extractToolResultText(b anthropicContentBlock) string {
 		for _, cb := range blocks {
 			if cb.Type == "text" && cb.Text != "" {
 				parts = append(parts, cb.Text)
+			} else if cb.Type == "document" {
+				parts = append(parts, anthropicTextDocument(cb))
+			} else if cb.Type == "tool_reference" {
+				// Codex has no tool_reference block; keep it in the paired tool output.
+				reference, _ := json.Marshal(cb)
+				parts = append(parts, string(reference))
+			} else if cb.Type == "search_result" || cb.Type == "browser_state" {
+				parts = append(parts, string(cb.Structured))
 			}
 		}
 		return strings.Join(parts, "\n")
@@ -944,10 +1033,82 @@ func convertAnthropicToolsForGrok(tools []anthropicTool, orderKey string) []any 
 	return stabilizeGrokToolOrder(orderKey, convertAnthropicTools(tools))
 }
 
+// anthropicServerToolTypes 把 Anthropic 的「服务端工具」类型映射到 Codex 上游的
+// hosted tool 类型。这类工具没有 input_schema，由上游在推理时自行执行，客户端
+// 从不收到 tool_use 回调（Anthropic 用 server_tool_use / web_search_tool_result
+// 表达同一语义）。
+var anthropicServerToolTypes = map[string]string{
+	"web_search":                    "web_search",
+	"web_search_20250305":           "web_search",
+	"web_search_20260209":           "web_search",
+	"web_search_20260318":           "web_search",
+	"web_search_preview":            "web_search",
+	"web_search_preview_2025_03_11": "web_search",
+}
+
+// anthropicHostedToolType 判断该工具是否为服务端工具，返回对应的 hosted 类型。
+// 客户端有两种声明形态，都要认：
+//   - 服务端形态：{"type":"web_search_20250305", "name":"web_search"}
+//   - name-only 形态：{"name":"web_search"}（部分 Anthropic 客户端会这样摊平）
+//
+// name-only 只有在没有 input_schema 时才按服务端工具处理；如果调用方显式声明了
+// input_schema，说明这是用户自定义的同名客户端 function，必须保留 function 语义。
+func anthropicHostedToolType(t anthropicTool) (string, bool) {
+	if hosted, ok := anthropicServerToolTypes[strings.TrimSpace(t.Type)]; ok {
+		return hosted, true
+	}
+	if strings.TrimSpace(t.Type) == "" && strings.TrimSpace(t.Name) == "web_search" && !anthropicToolHasInputSchema(t) {
+		return "web_search", true
+	}
+	return "", false
+}
+
+func anthropicToolHasInputSchema(t anthropicTool) bool {
+	if len(t.InputSchema) == 0 {
+		return false
+	}
+	raw := strings.TrimSpace(string(t.InputSchema))
+	return raw != "" && raw != "null"
+}
+
+func anthropicHostedTool(t anthropicTool, hosted string) map[string]any {
+	out := map[string]any{"type": hosted}
+	if len(t.UserLocation) > 0 {
+		out["user_location"] = t.UserLocation
+	}
+	filters := map[string]any{}
+	if len(t.AllowedDomains) > 0 {
+		filters["allowed_domains"] = append([]string(nil), t.AllowedDomains...)
+	}
+	if len(t.BlockedDomains) > 0 {
+		filters["blocked_domains"] = append([]string(nil), t.BlockedDomains...)
+	}
+	if len(filters) > 0 {
+		out["filters"] = filters
+	}
+	return out
+}
+
+func anthropicServerToolUseID(item gjson.Result) string {
+	id := strings.TrimSpace(item.Get("id").String())
+	if id == "" {
+		id = strings.TrimSpace(item.Get("call_id").String())
+	}
+	if id == "" {
+		id = uuid.New().String()[:24]
+	}
+	return "srvtoolu_" + id
+}
+
 // convertAnthropicTools 将 Anthropic 工具格式转为 Codex 格式
 func convertAnthropicTools(tools []anthropicTool) []any {
 	result := make([]any, 0, len(tools))
 	for _, t := range tools {
+		// 服务端工具（联网检索等）转成 hosted tool，保留「上游代跑」语义。
+		if hosted, ok := anthropicHostedToolType(t); ok {
+			result = append(result, anthropicHostedTool(t, hosted))
+			continue
+		}
 		item := map[string]any{
 			"type": "function",
 			"name": t.Name,
@@ -963,6 +1124,15 @@ func convertAnthropicTools(tools []anthropicTool) []any {
 			if json.Unmarshal(t.InputSchema, &params) == nil {
 				sanitizeSchemaForUpstream(params)
 				item["parameters"] = params
+			}
+		}
+		// 上游要求 function 工具必须带 parameters，缺失会 400
+		// "code 11129 invalid function call parameters"。Anthropic 客户端有时会发
+		// 不带 input_schema 的普通工具（例如空参数工具），这里补一个空 schema 兜底。
+		if _, ok := item["parameters"]; !ok {
+			item["parameters"] = map[string]any{
+				"type":       "object",
+				"properties": map[string]any{},
 			}
 		}
 		result = append(result, item)
@@ -995,17 +1165,64 @@ func convertAnthropicToolChoice(raw json.RawMessage) any {
 		return "none"
 	case "tool":
 		if tc.Name != "" {
+			// Responses 的 function tool_choice 是扁平形态
+			// {type:"function", name:"..."}；写成 Chat Completions 的嵌套形态
+			// {type:"function", function:{name:...}} 会被上游以
+			// "Missing required parameter: 'tool_choice.name'" 拒绝。
 			return map[string]any{
 				"type": "function",
-				"function": map[string]any{
-					"name": tc.Name,
-				},
+				"name": tc.Name,
 			}
 		}
 		return "auto"
 	default:
 		return nil
 	}
+}
+
+func convertAnthropicToolChoiceForTools(raw json.RawMessage, tools []anthropicTool) any {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var tc struct {
+		Type string `json:"type"`
+		Name string `json:"name,omitempty"`
+	}
+	if json.Unmarshal(raw, &tc) == nil && tc.Type == "tool" && tc.Name != "" && anthropicToolsContainHostedName(tools, tc.Name) {
+		// Anthropic 的 {"type":"tool","name":"web_search"} 要求「必须调用 web_search」。
+		// Responses 的字符串 "required" 只保证「调用某个工具」，工具表里同时存在普通
+		// function 时模型可能改选它（实测确实会选中别的 function），违反命名选择语义；
+		// 命名 function 形态又会因 web_search 是 hosted 而非 function 而 400
+		// ("Tool choice 'web_search' not found in 'tools' parameter")。
+		// allowed_tools + mode=required 把可选集合收敛到 web_search 本身。
+		return map[string]any{
+			"type": "allowed_tools",
+			"mode": "required",
+			"tools": []any{
+				map[string]any{"type": "web_search"},
+			},
+		}
+	}
+	return convertAnthropicToolChoice(raw)
+}
+
+func anthropicToolsContainHostedName(tools []anthropicTool, name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	for _, tool := range tools {
+		if hosted, ok := anthropicHostedToolType(tool); ok && hosted == "web_search" {
+			toolName := strings.TrimSpace(tool.Name)
+			if toolName == "" {
+				toolName = "web_search"
+			}
+			if toolName == name {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // ==================== 响应翻译: Codex SSE → Anthropic ====================
@@ -1019,6 +1236,7 @@ type anthropicStreamTranslator struct {
 	contentBlockOpen          bool
 	currentBlockType          string // "text" | "thinking" | "tool_use"
 	currentToolUseID          string
+	currentToolItemID         string
 	currentToolUseName        string
 	currentToolInputBuffer    strings.Builder
 	currentToolCustom         bool
@@ -1061,8 +1279,26 @@ func (t *anthropicStreamTranslator) translateEvent(eventData []byte) []anthropic
 	case "response.reasoning_summary_text.delta", "response.reasoning_text.delta":
 		return t.handleThinkingDelta(eventData)
 
+	case "response.reasoning_summary_part.added":
+		if gjson.GetBytes(eventData, "part.type").String() != "summary_text" {
+			return nil
+		}
+		events := t.ensureThinkingBlock()
+		if text := gjson.GetBytes(eventData, "part.text").String(); text != "" {
+			events = append(events, t.contentBlockDelta(anthropicDelta{Type: "thinking_delta", Thinking: text})...)
+		}
+		return events
+	case "response.reasoning_summary_part.done":
+		// The full part text repeats deltas; keep the block open for the item's signature.
+		return nil
+
 	case "response.function_call_arguments.delta", "response.custom_tool_call_input.delta":
 		return t.handleToolInputDelta(eventData)
+	case "response.function_call_arguments.done":
+		if t.contentBlockOpen && t.currentBlockType == "tool_use" && !t.currentToolCustom && t.checkToolInputItem(gjson.GetBytes(eventData, "item_id").String()) {
+			return t.finishFunctionToolInput(gjson.GetBytes(eventData, "arguments"))
+		}
+		return nil
 	case "response.custom_tool_call_input.done":
 		if t.currentToolCustom && t.contentBlockOpen {
 			return t.finishCustomToolInput(gjson.GetBytes(eventData, "input"))
@@ -1170,6 +1406,7 @@ func (t *anthropicStreamTranslator) handleOutputItemAdded(data []byte) []anthrop
 		t.currentBlockType = "tool_use"
 		t.currentToolUseID = callID
 		t.currentToolUseName = name
+		t.currentToolItemID = gjson.GetBytes(data, "item.id").String()
 		t.currentToolCustom = itemType == "custom_tool_call"
 		t.currentToolInputFinalized = false
 		if t.currentToolCustom {
@@ -1190,6 +1427,20 @@ func (t *anthropicStreamTranslator) handleOutputItemAdded(data []byte) []anthrop
 		if t.currentToolCustom {
 			events = append(events, t.contentBlockDelta(anthropicDelta{Type: "input_json_delta", PartialJSON: `{"input":"`})...)
 		}
+
+	case "web_search_call":
+		// hosted 检索：上游代跑，不回调客户端。开一个 server_tool_use 块，
+		// 收尾（output_item.done）时补 web_search_tool_result 并关块。
+		events = append(events, t.closeCurrentBlock()...)
+		callID := anthropicServerToolUseID(gjson.GetBytes(data, "item"))
+		t.currentBlockType = "server_tool_use"
+		t.currentToolUseID = callID
+		t.currentToolUseName = "web_search"
+		events = append(events, t.startContentBlock(anthropicContentBlock{
+			Type: "server_tool_use",
+			ID:   callID,
+			Name: "web_search",
+		})...)
 
 	case "message":
 		// text block 延迟到第一个 delta 时打开
@@ -1236,6 +1487,14 @@ func (t *anthropicStreamTranslator) handleThinkingDelta(data []byte) []anthropic
 		return nil
 	}
 
+	events := t.ensureThinkingBlock()
+	return append(events, t.contentBlockDelta(anthropicDelta{
+		Type:     "thinking_delta",
+		Thinking: delta,
+	})...)
+}
+
+func (t *anthropicStreamTranslator) ensureThinkingBlock() []anthropicStreamEvent {
 	var events []anthropicStreamEvent
 	if !t.messageStartSent {
 		events = append(events, t.handleCreated()...)
@@ -1251,10 +1510,6 @@ func (t *anthropicStreamTranslator) handleThinkingDelta(data []byte) []anthropic
 		})...)
 	}
 
-	events = append(events, t.contentBlockDelta(anthropicDelta{
-		Type:     "thinking_delta",
-		Thinking: delta,
-	})...)
 	return events
 }
 
@@ -1266,8 +1521,20 @@ func (t *anthropicStreamTranslator) handleToolInputDelta(data []byte) []anthropi
 	if delta == "" {
 		return nil
 	}
+	if !t.contentBlockOpen || t.currentBlockType != "tool_use" || !t.checkToolInputItem(gjson.GetBytes(data, "item_id").String()) {
+		t.toolInputError = fmt.Errorf("tool input delta has no matching open tool call")
+		return nil
+	}
 	if t.currentToolCustom {
 		return t.customToolInputDelta(delta)
+	}
+	if t.currentToolInputFinalized {
+		t.toolInputError = fmt.Errorf("function tool arguments continued after the done event")
+		return nil
+	}
+	if len(delta) > responseCacheMaxEntry-t.currentToolInputBuffer.Len() {
+		t.toolInputError = fmt.Errorf("function tool arguments exceed the size limit")
+		return nil
 	}
 	t.currentToolInputBuffer.WriteString(delta)
 	return t.contentBlockDelta(anthropicDelta{
@@ -1291,8 +1558,39 @@ func (t *anthropicStreamTranslator) handleContentDone() []anthropicStreamEvent {
 // reasoning item 携带 encrypted_content 时先发 signature_delta 再关块：
 // signature 即密文本身，输入侧据此重建 reasoning item 回传上游。
 func (t *anthropicStreamTranslator) handleOutputItemDone(data []byte) []anthropicStreamEvent {
+	// hosted 检索收尾：补 web_search_tool_result 块，再关掉 server_tool_use。
+	if t.contentBlockOpen && t.currentBlockType == "server_tool_use" &&
+		gjson.GetBytes(data, "item.type").String() == "web_search_call" {
+		var events []anthropicStreamEvent
+		for _, block := range anthropicServerToolBlocks(gjson.GetBytes(data, "item")) {
+			switch block.Type {
+			case "server_tool_use":
+				if len(block.Input) > 0 && json.Valid(block.Input) && string(block.Input) != "{}" {
+					events = append(events, t.contentBlockDelta(anthropicDelta{Type: "input_json_delta", PartialJSON: string(block.Input)})...)
+				}
+				events = append(events, t.closeCurrentBlock()...)
+			case "web_search_tool_result":
+				events = append(events, t.startContentBlock(block)...)
+				events = append(events, t.closeCurrentBlock()...)
+			}
+		}
+		if len(events) == 0 {
+			events = append(events, t.closeCurrentBlock()...)
+		}
+		return events
+	}
 	if t.contentBlockOpen && t.currentToolCustom && t.currentBlockType == "tool_use" && gjson.GetBytes(data, "item.type").String() == "custom_tool_call" {
 		events := t.finishCustomToolInput(gjson.GetBytes(data, "item.input"))
+		if t.toolInputError != nil {
+			return nil
+		}
+		return append(events, t.closeCurrentBlock()...)
+	}
+	if t.contentBlockOpen && !t.currentToolCustom && t.currentBlockType == "tool_use" && gjson.GetBytes(data, "item.type").String() == "function_call" {
+		if !t.checkToolInputItem(gjson.GetBytes(data, "item.id").String()) {
+			return nil
+		}
+		events := t.finishFunctionToolInput(gjson.GetBytes(data, "item.arguments"))
 		if t.toolInputError != nil {
 			return nil
 		}
@@ -1319,7 +1617,18 @@ func (t *anthropicStreamTranslator) handleCompleted(data []byte) []anthropicStre
 		events = append(events, t.handleCreated()...)
 	}
 
+	if t.contentBlockOpen && t.currentBlockType == "tool_use" && !t.currentToolCustom {
+		for _, item := range gjson.GetBytes(data, "response.output").Array() {
+			if item.Get("type").String() == "function_call" && ((t.currentToolItemID != "" && item.Get("id").String() == t.currentToolItemID) || (t.currentToolUseID != "" && fromCodexCallID(item.Get("call_id").String()) == t.currentToolUseID)) {
+				events = append(events, t.finishFunctionToolInput(item.Get("arguments"))...)
+				break
+			}
+		}
+	}
 	events = append(events, t.closeCurrentBlock()...)
+	if t.toolInputError != nil {
+		return nil
+	}
 
 	// 提取 usage
 	usage := gjson.GetBytes(data, "response.usage")
@@ -1386,7 +1695,7 @@ func (t *anthropicStreamTranslator) handleFailed() []anthropicStreamEvent {
 }
 
 // closeCurrentBlock 关闭当前打开的 content block。
-// tool_use 的 arguments 已在 handleToolInputDelta 按碎片下发，这里只关块。
+// Streamed arguments are validated before closing; done events already supplied missing suffixes.
 func (t *anthropicStreamTranslator) closeCurrentBlock() []anthropicStreamEvent {
 	if !t.contentBlockOpen {
 		return nil
@@ -1395,8 +1704,15 @@ func (t *anthropicStreamTranslator) closeCurrentBlock() []anthropicStreamEvent {
 	if t.currentBlockType == "tool_use" && t.currentToolCustom && !t.currentToolInputFinalized {
 		events = append(events, t.finishCustomToolInput(gjson.Result{})...)
 	}
+	if t.currentBlockType == "tool_use" && !t.currentToolCustom && !t.currentToolInputFinalized {
+		events = append(events, t.finishFunctionToolInput(gjson.Result{})...)
+	}
+	if t.toolInputError != nil {
+		return nil
+	}
 	t.contentBlockOpen = false
 	t.currentToolCustom = false
+	t.currentToolItemID = ""
 	idx := t.contentBlockIndex - 1
 	t.currentToolInputBuffer.Reset()
 
@@ -1524,12 +1840,156 @@ func compactAnthropicContent(content []anthropicContentBlock) []anthropicContent
 			} else if block.Input == nil || !json.Valid(block.Input) {
 				block.Input = json.RawMessage("{}")
 			}
+		case "server_tool_use":
+			if block.Input == nil || !json.Valid(block.Input) {
+				block.Input = json.RawMessage("{}")
+			}
+		case "web_search_tool_result":
+			if block.Content == nil || !json.Valid(block.Content) {
+				block.Content = json.RawMessage("[]")
+			}
 		default:
 			continue
 		}
 		out = append(out, block)
 	}
 	return out
+}
+
+// anthropicServerToolBlocks 把一个 Codex hosted tool item（目前只有
+// web_search_call）转成 Anthropic 的服务端工具块对：
+// server_tool_use（客户端据此展示「正在检索」）+ web_search_tool_result。
+//
+// 状态映射遵循 Anthropic 的服务端工具约定：
+//   - completed：正常结果（无命中时 content 为空数组，不是错误）
+//   - failed / incomplete：检索本身失败，content 为单个
+//     web_search_tool_result_error 对象，仍要配对下发，否则 server_tool_use
+//     会悬空，客户端拿不到终态
+//   - 其它（in_progress / searching）：仍在进行，不下发
+//
+// Codex 默认不回传完整 results（正文和链接通常在随后的 message 块承载），
+// 因此这里只转发上游明确给出的 results，不从 action.sources 或正文里伪造结果。
+func anthropicServerToolBlocks(item gjson.Result) []anthropicContentBlock {
+	status := strings.TrimSpace(item.Get("status").String())
+	switch status {
+	case "completed":
+	case "failed", "incomplete":
+		return anthropicServerToolErrorBlocks(item)
+	default:
+		// in_progress / searching / 未知状态：检索还没终态，等 done 事件再发。
+		return nil
+	}
+	callID := anthropicServerToolUseID(item)
+
+	// 查询词：新版回 action.queries 数组，旧版回单个 action.query。
+	var queries []string
+	item.Get("action.queries").ForEach(func(_, q gjson.Result) bool {
+		if s := strings.TrimSpace(q.String()); s != "" {
+			queries = append(queries, s)
+		}
+		return true
+	})
+	if len(queries) == 0 {
+		if q := strings.TrimSpace(item.Get("action.query").String()); q != "" {
+			queries = append(queries, q)
+		}
+	}
+
+	results := make([]any, 0)
+	item.Get("results").ForEach(func(_, r gjson.Result) bool {
+		entry := map[string]any{"type": "web_search_result"}
+		for _, key := range []string{"url", "title", "page_age"} {
+			if v := r.Get(key).String(); v != "" {
+				entry[key] = v
+			}
+		}
+		if enc := r.Get("encrypted_content").String(); enc != "" {
+			entry["encrypted_content"] = enc
+		}
+		results = append(results, entry)
+		return true
+	})
+	resultJSON, err := json.Marshal(results)
+	if err != nil {
+		resultJSON = []byte("[]")
+	}
+
+	return []anthropicContentBlock{
+		anthropicServerToolUseBlock(item, callID, queries),
+		{
+			Type:      "web_search_tool_result",
+			ToolUseID: callID,
+			Content:   json.RawMessage(resultJSON),
+		},
+	}
+}
+
+// anthropicServerToolErrorBlocks 为 failed / incomplete 的检索下发配对块：
+// server_tool_use + content 为单个 web_search_tool_result_error 的结果块。
+// Anthropic 把工具级失败表达成 200 响应内的错误结果对象，而不是 HTTP 错误。
+func anthropicServerToolErrorBlocks(item gjson.Result) []anthropicContentBlock {
+	callID := anthropicServerToolUseID(item)
+
+	var queries []string
+	item.Get("action.queries").ForEach(func(_, q gjson.Result) bool {
+		if s := strings.TrimSpace(q.String()); s != "" {
+			queries = append(queries, s)
+		}
+		return true
+	})
+	if len(queries) == 0 {
+		if q := strings.TrimSpace(item.Get("action.query").String()); q != "" {
+			queries = append(queries, q)
+		}
+	}
+
+	// 只有 Anthropic 文档列出的错误码才原样透传；上游给不出已知错误码时用
+	// unavailable，而不是把上游内部原因当作客户端可见错误码编造出来。
+	errorCode := strings.TrimSpace(item.Get("error.code").String())
+	if !anthropicWebSearchErrorCodes[errorCode] {
+		errorCode = "unavailable"
+	}
+	contentJSON, err := json.Marshal(map[string]any{
+		"type":       "web_search_tool_result_error",
+		"error_code": errorCode,
+	})
+	if err != nil {
+		contentJSON = []byte(`{"type":"web_search_tool_result_error","error_code":"unavailable"}`)
+	}
+
+	return []anthropicContentBlock{
+		anthropicServerToolUseBlock(item, callID, queries),
+		{
+			Type:      "web_search_tool_result",
+			ToolUseID: callID,
+			Content:   json.RawMessage(contentJSON),
+		},
+	}
+}
+
+// anthropicWebSearchErrorCodes 是 Anthropic 文档列出的服务端检索错误码。
+var anthropicWebSearchErrorCodes = map[string]bool{
+	"too_many_requests":  true,
+	"invalid_tool_input": true,
+	"max_uses_exceeded":  true,
+	"query_too_long":     true,
+	"request_too_large":  true,
+	"unavailable":        true,
+}
+
+// anthropicServerToolUseBlock 构造配对的 server_tool_use 块。
+// query 为空时仍下发空对象，保持与结果块的 id 配对。
+func anthropicServerToolUseBlock(item gjson.Result, callID string, queries []string) anthropicContentBlock {
+	inputJSON, err := json.Marshal(map[string]any{"query": strings.Join(queries, " ")})
+	if err != nil {
+		inputJSON = []byte("{}")
+	}
+	return anthropicContentBlock{
+		Type:  "server_tool_use",
+		ID:    callID,
+		Name:  "web_search",
+		Input: json.RawMessage(inputJSON),
+	}
 }
 
 // buildAnthropicResponseFromCompleted 从 response.completed 事件构建完整的 Anthropic 响应
@@ -1591,6 +2051,14 @@ func buildAnthropicResponseFromCompleted(completedData []byte, model string) *an
 				}
 				return true
 			})
+
+		case "web_search_call":
+			// hosted 检索：上游已代跑完成，模型不会回调客户端。转成 Anthropic 的
+			// 服务端工具对（server_tool_use + web_search_tool_result），让客户端的
+			// 检索展示与引用计数正常工作。缺失该分支时结果会被静默丢弃。
+			blocks := anthropicServerToolBlocks(item)
+			content = append(content, blocks...)
+			lastBlockIsToolUse = false
 
 		case "function_call", "custom_tool_call":
 			// function_call/custom_tool_call → tool_use block

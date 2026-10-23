@@ -4,7 +4,6 @@ import (
 	"context"
 	"log"
 	"strings"
-	"sync/atomic"
 	"time"
 )
 
@@ -134,31 +133,44 @@ func (a *Account) GetUsageSnapshot5h() (pct float64, resetAt time.Time, ok bool)
 
 // PersistUsageSnapshot5hOnly 持久化仅包含 5h 数据的用量快照。
 func (s *Store) PersistUsageSnapshot5hOnly(acc *Account) {
+	s.PublishUsageSnapshot5hOnly(acc, time.Now(), true)
+}
+
+// PublishUsageSnapshot5hOnly updates the in-memory 5h snapshot and scheduler.
+// persist=false skips the DB write for the throttled WS frame path.
+func (s *Store) PublishUsageSnapshot5hOnly(acc *Account, observedAt time.Time, persist bool) bool {
 	if acc == nil || s == nil {
-		return
+		return false
 	}
 
 	pct5h, reset5hAt, ok := acc.GetUsageSnapshot5h()
 	if !ok {
-		return
+		return false
 	}
 
-	updatedAt := time.Now()
+	if observedAt.IsZero() {
+		observedAt = time.Now()
+	}
 	acc.mu.Lock()
-	acc.UsageUpdatedAt5h = updatedAt
+	acc.UsageUpdatedAt5h = observedAt
 	acc.mu.Unlock()
 
 	s.fastSchedulerUpdate(acc)
 
-	if s.db == nil {
-		return
+	if !persist || s.db == nil {
+		return false
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := s.db.UpdateUsageSnapshot5h(ctx, acc.DBID, pct5h, reset5hAt, updatedAt); err != nil {
+	err := s.withUsageSnapshotWrite(acc, func() error {
+		return s.db.UpdateUsageSnapshot5h(ctx, acc.DBID, pct5h, reset5hAt, observedAt)
+	})
+	if err != nil {
 		log.Printf("[账号 %d] 持久化 5h 用量快照失败: %v", acc.DBID, err)
+		return false
 	}
+	return true
 }
 
 // Persist5hWindowActivated 把「已为哪个 Reset5hAt 发过开窗请求」写入 credentials，重启后不重复打。
@@ -216,7 +228,6 @@ func (s *Store) ClearAbsentUsageSnapshot5hAt(acc *Account, observedAt time.Time)
 	acc.usageObservedAt = observedAt
 	had5h := acc.UsagePercent5hValid
 	cleared5hCooldown := s != nil && acc.Status == StatusCooldown && acc.CooldownReason == premium5hCooldownReason
-	priorCooldownUntil := acc.CooldownUtil
 	if !had5h && !cleared5hCooldown {
 		acc.mu.Unlock()
 		return false
@@ -236,7 +247,7 @@ func (s *Store) ClearAbsentUsageSnapshot5hAt(acc *Account, observedAt time.Time)
 		}
 	}
 	if s != nil {
-		acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+		acc.recomputeSchedulerLocked(s.maxConcurrency.Load())
 	}
 	acc.mu.Unlock()
 
@@ -246,32 +257,22 @@ func (s *Store) ClearAbsentUsageSnapshot5hAt(acc *Account, observedAt time.Time)
 		return true
 	}
 	s.fastSchedulerUpdate(acc)
-	if cleared5hCooldown {
-		s.deleteCachedAccountCooldown(acc.DBID)
-		// A newer 401/generic 429 can land after the in-memory transition but
-		// before the cache delete. Restore that newer cooldown if present.
-		acc.mu.RLock()
-		status := acc.Status
-		reason := acc.CooldownReason
-		until := acc.CooldownUtil
-		acc.mu.RUnlock()
-		if status == StatusCooldown && reason != "" {
-			s.setCachedAccountCooldown(acc.DBID, reason, until)
-		}
-	}
 	if s.db == nil {
+		if cleared5hCooldown {
+			s.persistAccountCooldownState(acc, true, false)
+		}
 		return true
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := s.db.ClearUsageSnapshot5h(ctx, acc.DBID); err != nil {
+	if err := s.withUsageSnapshotWrite(acc, func() error {
+		return s.db.ClearUsageSnapshot5h(ctx, acc.DBID)
+	}); err != nil {
 		log.Printf("[账号 %d] 清除 5h 用量快照失败: %v", acc.DBID, err)
 	}
 	if cleared5hCooldown {
-		if _, err := s.db.ClearCooldownIfReasonAndUntil(ctx, acc.DBID, premium5hCooldownReason, priorCooldownUntil); err != nil {
-			log.Printf("[账号 %d] 清除 premium 5h 冷却状态失败: %v", acc.DBID, err)
-		}
+		s.persistAccountCooldownState(acc, true, false)
 	}
 	return true
 }
@@ -290,7 +291,7 @@ func (s *Store) MarkPremium5hRateLimitedAt(acc *Account, resetAt, observedAt tim
 	return acc.ApplyUsageObservation(observedAt, func() {
 		// observedAt orders competing upstream observations; stateAt reflects
 		// when the state is actually applied after any preceding DB/identity work.
-		s.markPremium5hRateLimited(acc, resetAt, time.Now(), premium5hCooldownReason)
+		s.markPremium5hRateLimited(acc, resetAt, time.Now(), premium5hCooldownReason, true)
 	})
 }
 
@@ -303,11 +304,11 @@ func (s *Store) MarkResponsesPremium5hRateLimited(acc *Account, resetAt time.Tim
 	}
 	now := time.Now()
 	_ = acc.ApplyUsageObservation(now, func() {
-		s.markPremium5hRateLimited(acc, resetAt, time.Now(), ResponsesRateLimitedCooldownReason)
+		s.markPremium5hRateLimited(acc, resetAt, time.Now(), ResponsesRateLimitedCooldownReason, true)
 	})
 }
 
-func (s *Store) markPremium5hRateLimited(acc *Account, resetAt, observedAt time.Time, cooldownReason string) {
+func (s *Store) markPremium5hRateLimited(acc *Account, resetAt, observedAt time.Time, cooldownReason string, persist bool) {
 	now := observedAt
 	if now.IsZero() {
 		now = time.Now()
@@ -317,33 +318,44 @@ func (s *Store) markPremium5hRateLimited(acc *Account, resetAt, observedAt time.
 	}
 
 	acc.mu.Lock()
+	snapshotChanged := !acc.UsagePercent5hValid || acc.UsagePercent5h != 100 || !acc.Reset5hAt.Equal(resetAt)
 	acc.UsagePercent5h = 100
 	acc.UsagePercent5hValid = true
 	acc.Reset5hAt = resetAt
 	acc.UsageUpdatedAt5h = now
-	acc.LastRateLimitedAt = now
-	acc.Status = StatusCooldown
-	acc.CooldownUtil = resetAt
-	acc.CooldownReason = cooldownReason
-	if acc.HealthTier != HealthTierBanned {
-		acc.HealthTier = HealthTierRisky
+	until, reason, cooldownChanged := acc.usageCooldownTargetLocked(now, resetAt, cooldownReason)
+	// A repeated real 429 is new rejection evidence even when its deadline is
+	// unchanged. An older in-flight success must not clear that evidence.
+	if cooldownReason == ResponsesRateLimitedCooldownReason {
+		acc.LastRateLimitedAt = now
 	}
-	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	if cooldownChanged {
+		acc.LastRateLimitedAt = now
+		acc.Status = StatusCooldown
+		acc.CooldownUtil = until
+		acc.CooldownReason = reason
+		acc.usageCooldownPersistPending = true
+		if acc.HealthTier != HealthTierBanned {
+			acc.HealthTier = HealthTierRisky
+		}
+	}
+	acc.recomputeSchedulerLocked(s.maxConcurrency.Load())
 	acc.mu.Unlock()
 
 	s.fastSchedulerUpdate(acc)
-	s.setCachedAccountCooldown(acc.DBID, cooldownReason, resetAt)
+	if persist {
+		s.persistUsageCooldown(acc)
+	}
 
-	if s.db == nil {
+	if !persist || s.db == nil || (!cooldownChanged && !snapshotChanged) {
 		return
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := s.db.SetCooldown(ctx, acc.DBID, cooldownReason, resetAt); err != nil {
-		log.Printf("[账号 %d] 持久化 premium 5h 限流冷却状态失败: %v", acc.DBID, err)
-	}
-	if err := s.db.UpdateUsageSnapshot5h(ctx, acc.DBID, 100, resetAt, now); err != nil {
+	if err := s.withUsageSnapshotWrite(acc, func() error {
+		return s.db.UpdateUsageSnapshot5h(ctx, acc.DBID, 100, resetAt, now)
+	}); err != nil {
 		log.Printf("[账号 %d] 持久化 premium 5h 限流快照失败: %v", acc.DBID, err)
 	}
 }

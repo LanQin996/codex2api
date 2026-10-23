@@ -436,7 +436,7 @@ func (s *Store) finishReloadedOAuthRefresh(ctx context.Context, acc *Account) {
 		acc.CooldownReason = ""
 	}
 	acc.ErrorMsg = ""
-	acc.recomputeSchedulerLocked(atomic.LoadInt64(&s.maxConcurrency))
+	acc.recomputeSchedulerLocked(s.maxConcurrency.Load())
 	accessToken := acc.AccessToken
 	expiresAt := acc.ExpiresAt
 	dbID := acc.DBID
@@ -453,11 +453,8 @@ func (s *Store) finishReloadedOAuthRefresh(ctx context.Context, acc *Account) {
 		}
 	}
 	if expiredCooldown {
-		s.deleteCachedAccountCooldown(dbID)
-		if s.db != nil {
-			_ = s.db.ClearCooldown(ctx, dbID)
-		}
+		s.persistAccountCooldownState(acc, true, false)
 	} else if !activeCooldown && s.db != nil {
-		_ = s.db.ClearError(ctx, dbID)
+		s.persistAccountCooldownState(acc, true, true)
 	}
 }

@@ -21,7 +21,12 @@ import (
 //
 // 键使用 affinityKey(下游会话标识 + API Key,与账号粘性绑定同源),保证
 // 同一段对话的记录/守卫两侧落在同一键上。无会话标识时不做跟踪(保持透传)。
-const codexTurnStateProvenanceTTL = time.Hour
+const (
+	codexTurnStateProvenanceTTL = time.Hour
+	// 溯源表只用于剥离跨账号回带，条目可以安全丢弃；设硬上限避免高基数
+	// 会话键在 TTL 内无限增长。
+	codexTurnStateMaxOrigins = 65536
+)
 
 type codexTurnStateOrigin struct {
 	accountID int64
@@ -183,11 +188,28 @@ func sweepCodexTurnStateOrigins() {
 		return
 	}
 	now := time.Now()
+	live := 0
 	codexTurnStateOrigins.Range(func(key, value any) bool {
 		origin, ok := value.(codexTurnStateOrigin)
 		if !ok || (!origin.expiresAt.IsZero() && now.After(origin.expiresAt)) {
 			codexTurnStateOrigins.Delete(key)
+			return true
 		}
+		live++
+		return true
+	})
+	if live <= codexTurnStateMaxOrigins {
+		return
+	}
+	// 超过上限时丢弃任意条目。溯源缺失只会让守卫放行一次回带，不会影响
+	// 转发正确性；这比让内存随会话键数量持续增长更安全。
+	excess := live - codexTurnStateMaxOrigins
+	codexTurnStateOrigins.Range(func(key, _ any) bool {
+		if excess <= 0 {
+			return false
+		}
+		codexTurnStateOrigins.Delete(key)
+		excess--
 		return true
 	})
 }

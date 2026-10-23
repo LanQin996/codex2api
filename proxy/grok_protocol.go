@@ -1084,11 +1084,21 @@ func (r *chatToResponsesReader) emitChatTerminal(status string) {
 func readSSEDataLine(reader *bufio.Reader) ([]byte, error) {
 	var data []byte
 	for {
-		line, err := reader.ReadBytes('\n')
+		line, err := readBoundedSSELine(reader, maxSSELineBytes)
+		if err != nil && err != io.EOF {
+			return nil, err
+		}
 		if len(line) > 0 {
 			line = bytes.TrimRight(line, "\r\n")
 			if bytes.HasPrefix(line, []byte("data:")) {
 				part := bytes.TrimSpace(bytes.TrimPrefix(line, []byte("data:")))
+				separator := 0
+				if len(data) > 0 {
+					separator = 1
+				}
+				if len(part) > maxSSEEventBytes-len(data)-separator {
+					return nil, errSSEEventTooLarge
+				}
 				if len(data) > 0 {
 					data = append(data, '\n')
 				}

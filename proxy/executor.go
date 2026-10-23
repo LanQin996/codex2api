@@ -19,6 +19,8 @@ import (
 	"time"
 
 	"github.com/codex2api/auth"
+	"github.com/codex2api/proxy/internal/jsonbody"
+	"github.com/codex2api/security"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -224,7 +226,14 @@ func shouldRecyclePooledClient(err error) bool {
 }
 
 func recyclePooledClient(account *auth.Account, proxyURL string) {
+	recyclePooledClientForRoute(account, proxyURL, false)
+}
+
+func recyclePooledClientForRoute(account *auth.Account, proxyURL string, accountBound bool) {
 	key := clientPoolKey(account, proxyURL, codexAccountTransportMode(account))
+	if accountBound {
+		key = "account-bound|" + key
+	}
 	if v, ok := clientPool.LoadAndDelete(key); ok {
 		releaseEvictedClient(v.(*poolEntry).client)
 	}
@@ -259,7 +268,7 @@ func newCodexStandardTransport(proxyURL string) http.RoundTripper {
 	baseDialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	transport.DialContext = baseDialer.DialContext
 	if err := auth.ConfigureTransportProxy(transport, proxyURL, baseDialer); err != nil {
-		log.Printf("[CodexTransport] 代理配置失败，回退直连: proxy=%s err=%v", proxyURL, err)
+		log.Printf("[CodexTransport] 代理配置失败，回退直连: proxy=%s err_type=%T", security.MaskURLCredentials(proxyURL), err)
 		transport.Proxy = nil
 		transport.DialContext = baseDialer.DialContext
 	}
@@ -338,17 +347,28 @@ func codexAccountTransportMode(account *auth.Account) string {
 }
 
 func getPooledClient(account *auth.Account, proxyURL string) *http.Client {
+	return getPooledClientForRoute(account, proxyURL, false)
+}
+
+func getPooledClientForRoute(account *auth.Account, proxyURL string, accountBound bool) *http.Client {
 	transportMode := codexAccountTransportMode(account)
 	key := clientPoolKey(account, proxyURL, transportMode)
+	if accountBound {
+		key = "account-bound|" + key
+	}
 	if v, ok := clientPool.Load(key); ok {
 		entry := v.(*poolEntry)
 		entry.touch()
 		return entry.client
 	}
 
-	transport := newLegacyCodexTransport(proxyURL)
-	if transportMode == "codex_tls" {
+	var transport http.RoundTripper
+	if accountBound {
+		transport = newAccountBoundTransportForMode(proxyURL, transportMode)
+	} else if transportMode == "codex_tls" {
 		transport = newCodexProfileTransport(proxyURL)
+	} else {
+		transport = newLegacyCodexTransport(proxyURL)
 	}
 
 	entry := &poolEntry{
@@ -424,17 +444,15 @@ func prepareCodexResponsesLiteTransport(requestBody []byte, headers http.Header,
 			if err == nil {
 				requestBody = updated
 			}
-		} else if updated, err := sjson.DeleteBytes(requestBody, codexResponsesLiteWSMetadataPath); err == nil {
+		} else {
 			// 信号被模型门禁剥离（或下游标记非 true）时，清掉体内残留标记，
 			// 避免不支持 lite 的模型把标记带上 WS 上游触发 400。
-			requestBody = updated
+			requestBody = jsonbody.DeletePath(requestBody, codexResponsesLiteWSMetadataPath)
 		}
 		return requestBody, forwardHeaders
 	}
 
-	if updated, err := sjson.DeleteBytes(requestBody, codexResponsesLiteWSMetadataPath); err == nil {
-		requestBody = updated
-	}
+	requestBody = jsonbody.DeletePath(requestBody, codexResponsesLiteWSMetadataPath)
 	if enabled {
 		if !headersCloned {
 			forwardHeaders = headers.Clone()
@@ -672,6 +690,7 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	if proxyOverride != "" {
 		proxyURL = proxyOverride
 	}
+	proxyURL = requestProxyURL(ctx, proxyURL)
 
 	isAgentIdentity := account.IsCodexAgentIdentity()
 	// Agent Identity 无 access_token，鉴权靠 AgentAssertion；请求前确保 task 已注册。
@@ -694,24 +713,25 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 	}
 
 	// 2. 清理可能导致上游报错的多余字段
-	requestBody, _ = sjson.DeleteBytes(requestBody, "previous_response_id")
+	requestBody = jsonbody.DeletePath(requestBody, "previous_response_id")
 	// 注意：HTTP /responses 上游不接受 prompt_cache_retention（会 400），必须删除；
 	// 该字段的 cache 收益只在 WS 路径注入（见 wsrelay 的 prepareWebsocketBody）。
-	requestBody, _ = sjson.DeleteBytes(requestBody, "prompt_cache_retention")
-	requestBody, _ = sjson.DeleteBytes(requestBody, "safety_identifier")
-	requestBody, _ = sjson.DeleteBytes(requestBody, "disable_response_storage")
+	requestBody = jsonbody.DeletePath(requestBody, "prompt_cache_retention")
+	requestBody = jsonbody.DeletePath(requestBody, "safety_identifier")
+	requestBody = jsonbody.DeletePath(requestBody, "disable_response_storage")
 	// 顶层 type 是 Responses WS 事件信封字段（response.create），native WS ingress 的
 	// 1009 降级、生图强制 HTTP、Agent Identity 强制 HTTP 都会复用带信封的 body，而
 	// HTTP /responses 上游不接受它（400 Unsupported parameter: type）。此处为出站
 	// 收口兜底；sjson 只删顶层路径，input[] 等嵌套 type 不受影响（issue #548）。
-	requestBody, _ = sjson.DeleteBytes(requestBody, "type")
+	requestBody = jsonbody.DeletePath(requestBody, "type")
+	requestBody = jsonbody.DeletePath(requestBody, "stream_id")
 
 	// 3. 注入 prompt_cache_key（如果请求体中没有，且 sessionID 不为空）
 	existingCacheKey := strings.TrimSpace(gjson.GetBytes(requestBody, "prompt_cache_key").String())
 	cacheKey := existingCacheKey
 	if sessionID != "" {
 		cacheKey = sessionID
-		requestBody, _ = sjson.SetBytes(requestBody, "prompt_cache_key", cacheKey)
+		requestBody = jsonbody.SetString(requestBody, "prompt_cache_key", cacheKey)
 	}
 
 	endpoint := CodexBaseURL + "/responses"
@@ -807,7 +827,7 @@ func ExecuteRequest(ctx context.Context, account *auth.Account, requestBody []by
 		resp, err := doTracedUpstreamRequest(client, req, account, proxyURL)
 		if err != nil {
 			if shouldRecyclePooledClient(err) {
-				recyclePooledClient(account, proxyURL)
+				recycleRequestClient(ctx, account, proxyURL)
 			}
 			return nil, ErrUpstream(0, "请求上游失败", err)
 		}
@@ -855,6 +875,7 @@ func ExecuteOpenAIResponsesRequest(ctx context.Context, account *auth.Account, r
 	if proxyOverride != "" {
 		proxyURL = proxyOverride
 	}
+	proxyURL = requestProxyURL(ctx, proxyURL)
 	if baseURL == "" || apiKey == "" {
 		return nil, ErrNoAvailableAccount()
 	}
@@ -879,8 +900,12 @@ func ExecuteOpenAIResponsesRequest(ctx context.Context, account *auth.Account, r
 	if openAIResponsesRelayUsesUpstreamWebsocket(account, requestBody) {
 		return executeOpenAIResponsesWebsocket(ctx, account, requestBody, proxyURL, headers, baseURL, apiKey)
 	}
+	// stream_id belongs to the WebSocket envelope, including when an ingress
+	// lane falls back to HTTP. Keep nested tool/input IDs untouched.
+	requestBody = jsonbody.DeletePath(requestBody, "type")
+	requestBody = jsonbody.DeletePath(requestBody, "stream_id")
 
-	client := getPooledClient(account, proxyURL)
+	client := getRequestClient(ctx, account, proxyURL)
 	send := func(body []byte) (*http.Response, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if err != nil {
@@ -895,7 +920,7 @@ func ExecuteOpenAIResponsesRequest(ctx context.Context, account *auth.Account, r
 		resp, err := doTracedUpstreamRequest(client, req, account, proxyURL)
 		if err != nil {
 			if shouldRecyclePooledClient(err) {
-				recyclePooledClient(account, proxyURL)
+				recycleRequestClient(ctx, account, proxyURL)
 			}
 			return nil, ErrUpstream(0, "请求 OpenAI Responses API 失败", err)
 		}
@@ -1031,23 +1056,27 @@ func isCodexAccessRestrictedResponse(resp *http.Response) bool {
 	if resp == nil || resp.StatusCode != http.StatusForbidden || resp.Body == nil {
 		return false
 	}
-	body, err := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
-	resp.Body = io.NopCloser(bytes.NewReader(body))
-	resp.ContentLength = int64(len(body))
+	// 只读取用于识别的前缀，再把前缀和剩余流拼回去，避免把巨大的错误体
+	// 整体读进内存（上游可能由第三方中转控制）。
+	const peekLimit = 64 << 10
+	peek, err := io.ReadAll(io.LimitReader(resp.Body, peekLimit))
+	resp.Body = struct {
+		io.Reader
+		io.Closer
+	}{io.MultiReader(bytes.NewReader(peek), resp.Body), resp.Body}
 	if err != nil {
 		return false
 	}
-	if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, "error.code").String()), "codex_access_restricted") {
+	if strings.EqualFold(strings.TrimSpace(gjson.GetBytes(peek, "error.code").String()), "codex_access_restricted") {
 		return true
 	}
 	// 部分中转（sub2api 的 codex_cli_only、zzzcoding 等第三方网关）用
 	// {"error":{"message":"This account only allows Codex official clients",
 	// "type":"forbidden_error"}} 表达同样的官方客户端限制。
-	if !strings.EqualFold(strings.TrimSpace(gjson.GetBytes(body, "error.type").String()), "forbidden_error") {
+	if !strings.EqualFold(strings.TrimSpace(gjson.GetBytes(peek, "error.type").String()), "forbidden_error") {
 		return false
 	}
-	msg := strings.ToLower(strings.TrimSpace(gjson.GetBytes(body, "error.message").String()))
+	msg := strings.ToLower(strings.TrimSpace(gjson.GetBytes(peek, "error.message").String()))
 	return strings.Contains(msg, "official clients") ||
 		strings.Contains(msg, "codex client") ||
 		strings.Contains(msg, "codex 客户端")
@@ -1081,6 +1110,8 @@ func ExecuteOpenAIResponsesCompactRequest(ctx context.Context, account *auth.Acc
 	}
 
 	endpoint := auth.OpenAIResponsesEndpoint(baseURL, "/v1/responses/compact")
+	requestBody = jsonbody.DeletePath(requestBody, "type")
+	requestBody = jsonbody.DeletePath(requestBody, "stream_id")
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(requestBody))
 	if err != nil {
 		return nil, ErrInternalError("创建请求失败", err)
@@ -1138,13 +1169,14 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 	if !gjson.GetBytes(requestBody, "instructions").Exists() {
 		requestBody, _ = sjson.SetBytes(requestBody, "instructions", "")
 	}
-	requestBody, _ = sjson.DeleteBytes(requestBody, "previous_response_id")
+	requestBody = jsonbody.DeletePath(requestBody, "previous_response_id")
 	// compact 端点同样走 HTTP，不接受 prompt_cache_retention，必须删除。
-	requestBody, _ = sjson.DeleteBytes(requestBody, "prompt_cache_retention")
-	requestBody, _ = sjson.DeleteBytes(requestBody, "safety_identifier")
-	requestBody, _ = sjson.DeleteBytes(requestBody, "disable_response_storage")
+	requestBody = jsonbody.DeletePath(requestBody, "prompt_cache_retention")
+	requestBody = jsonbody.DeletePath(requestBody, "safety_identifier")
+	requestBody = jsonbody.DeletePath(requestBody, "disable_response_storage")
 	// 顶层 type 是 WS 事件信封字段，compact HTTP 端点同样不接受，兜底删除(issue #548)。
-	requestBody, _ = sjson.DeleteBytes(requestBody, "type")
+	requestBody = jsonbody.DeletePath(requestBody, "type")
+	requestBody = jsonbody.DeletePath(requestBody, "stream_id")
 	requestBody, headers = prepareCodexResponsesLiteTransport(requestBody, headers, false, responsesLite)
 	// 指纹收敛：与 ExecuteRequest 同样在请求体定稿后、构造出站请求前改写
 	// client_metadata。漏掉这一步会让 compact 路径只收敛请求头、请求体仍带客户端
@@ -1159,7 +1191,7 @@ func ExecuteCompactRequest(ctx context.Context, account *auth.Account, requestBo
 	cacheKey := existingCacheKey
 	if sessionID != "" {
 		cacheKey = sessionID
-		requestBody, _ = sjson.SetBytes(requestBody, "prompt_cache_key", cacheKey)
+		requestBody = jsonbody.SetString(requestBody, "prompt_cache_key", cacheKey)
 	}
 
 	// compact 端点

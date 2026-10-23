@@ -77,8 +77,8 @@ func TestSQLitePromptFilterColumnDefaultsRemainUpgradeCompatible(t *testing.T) {
 	if strings.TrimSpace(settings.PromptFilterAdvancedConfig) != "{}" {
 		t.Fatalf("compatibility advanced config = %q, want {}", settings.PromptFilterAdvancedConfig)
 	}
-	if settings.CodexMinCLIVersion != "0.153.3" {
-		t.Fatalf("fresh SQLite minimum Codex CLI version = %q, want 0.153.3", settings.CodexMinCLIVersion)
+	if settings.CodexMinCLIVersion != "0.160.0" {
+		t.Fatalf("fresh SQLite minimum Codex CLI version = %q, want 0.160.0", settings.CodexMinCLIVersion)
 	}
 	if settings.SessionSlotBufferEnabled || settings.SessionSlotBufferSeconds != 10 {
 		t.Fatalf("session slot buffer defaults = enabled:%t seconds:%d, want false/10", settings.SessionSlotBufferEnabled, settings.SessionSlotBufferSeconds)
@@ -2720,6 +2720,10 @@ func TestUsageStatsBreakdownsRespectExplicitRange(t *testing.T) {
 	oldCreatedAt := rangeStart.Add(-24 * time.Hour)
 	if _, err := db.conn.ExecContext(ctx, `UPDATE usage_logs SET created_at = $1 WHERE model = $2`, sqliteTimeParam(oldCreatedAt), "old-model"); err != nil {
 		t.Fatalf("更新旧日志时间失败: %v", err)
+	}
+	// 直接改写已落库日志的时间,小时汇总需要按明细重建。
+	if err := db.RebuildUsageHourlyRollup(ctx); err != nil {
+		t.Fatalf("重建用量小时汇总失败: %v", err)
 	}
 
 	stats, err := db.GetUsageStats(ctx, rangeStart, rangeEnd, "")

@@ -50,6 +50,15 @@ func GetRequestMemorySnapshot() RequestMemorySnapshot {
 	return processRequestMemory.RequestMemorySnapshot
 }
 
+func (b *requestMemoryBudget) snapshot() RequestMemorySnapshot {
+	if b == nil {
+		return RequestMemorySnapshot{}
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.RequestMemorySnapshot
+}
+
 // RequestMemoryReservation may be shared by queue message copies. Release is
 // idempotent; a released reservation cannot be grown again.
 type RequestMemoryReservation struct {
@@ -166,7 +175,32 @@ func readRequestMemoryBounded(reader io.Reader, maxSize int64, reservation *Requ
 	if reservation != nil {
 		reader = &requestMemoryReader{reader: reader, reservation: reservation, prepaid: prepaid}
 	}
-	return io.ReadAll(io.LimitReader(reader, maxSize+1))
+	reader = io.LimitReader(reader, maxSize+1)
+	if prepaid <= 0 || prepaid > maxSize {
+		return io.ReadAll(reader)
+	}
+	return readAllSized(reader, prepaid)
+}
+
+// readAllSized reads into a single buffer sized from a Content-Length that
+// admission has already charged. io.ReadAll gathers chunks totalling about the
+// body size and then copies them into a second, final buffer.
+func readAllSized(reader io.Reader, size int64) ([]byte, error) {
+	// The extra byte lets the final EOF read happen without growing the buffer.
+	buf := make([]byte, 0, size+1)
+	for {
+		if len(buf) == cap(buf) {
+			buf = append(buf, 0)[:len(buf)]
+		}
+		n, err := reader.Read(buf[len(buf):cap(buf)])
+		buf = buf[:len(buf)+n]
+		if err != nil {
+			if err == io.EOF {
+				err = nil
+			}
+			return buf, err
+		}
+	}
 }
 
 // ReadRequestMemory charges fragmented/unknown-length WS input as it arrives.

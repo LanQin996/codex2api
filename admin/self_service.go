@@ -185,6 +185,11 @@ func (h *Handler) SubmitAccountPortalCode(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "state 不匹配，请重新发起授权")
 		return
 	}
+	if !sess.claimExchange(req.Code, req.State) {
+		writeError(c, http.StatusBadRequest, "该授权会话已处理或正在处理，请重新发起授权")
+		return
+	}
+	defer sess.completeExchange(&oauthExchangeResult{Error: "请重新发起授权"})
 
 	proxyURL := strings.TrimSpace(sess.ProxyURL)
 	if proxyURL == "" {
@@ -193,7 +198,7 @@ func (h *Handler) SubmitAccountPortalCode(c *gin.Context) {
 
 	tokenResp, accountInfo, err := doOAuthCodeExchange(c.Request.Context(), req.Code, sess.CodeVerifier, sess.RedirectURI, proxyURL, "oauth-"+req.SessionID)
 	if err != nil {
-		writeError(c, http.StatusBadGateway, "授权码兑换失败，请确认复制的授权码完整无误")
+		writeError(c, http.StatusBadGateway, "授权码兑换失败，请重新发起授权并获取新的授权码")
 		return
 	}
 	globalOAuthStore.delete(req.SessionID)
@@ -253,19 +258,9 @@ func (h *Handler) upsertSelfServiceAccount(ctx context.Context, name, proxyURL s
 		}
 	}
 
-	id, err := h.db.InsertAccountWithCredentials(ctx, name, h.newCodexAccountCredentials(seed), proxyURL)
-	if err != nil {
-		return 0, err
-	}
-	// 待审核：禁用 + 备注 + 打标；不调用 Store.AddAccount，故不进调度池。
-	if err := h.db.SetAccountEnabled(ctx, id, false); err != nil {
-		return 0, err
-	}
 	note := "自助提交联系人: " + contactEmail
-	if err := h.db.UpdateAccountNote(ctx, id, note); err != nil {
-		return 0, err
-	}
-	if err := h.db.SetAccountTags(ctx, id, []string{selfServiceTag}); err != nil {
+	id, err := h.db.InsertPendingAccountWithCredentials(ctx, name, h.newCodexAccountCredentials(seed), proxyURL, note, []string{selfServiceTag})
+	if err != nil {
 		return 0, err
 	}
 	h.db.InsertAccountEventAsync(id, "added", selfServiceSource)

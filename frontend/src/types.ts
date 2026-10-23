@@ -409,6 +409,7 @@ export interface AccountRow {
   grok_rate_limit?: GrokRateLimitSnapshot
   grok_free_quota?: GrokFreeQuotaSnapshot
   antigravity_project_id?: string
+  antigravity_user_project_id?: string
   antigravity_avatar_url?: string
   antigravity_verified_email?: boolean
   project_id?: string
@@ -637,6 +638,26 @@ export interface AccountLiveStateResponse {
     // 调度器当前实际执行的并发上限与配置值；旧后端不返回时保留列表里的值。
     dynamic_concurrency_limit?: number
     base_concurrency_effective?: number
+    // 运行时用量投影：旧后端缺 key 时保留列表值；显式 null 表示窗口已失效。
+    status?: AccountStatus
+    using_credits?: boolean
+    plan_type?: string
+    credits_valid?: boolean
+    credits_balance?: string | null
+    credits_has_credits?: boolean | null
+    credits_unlimited?: boolean | null
+    credits_overage_limit_reached?: boolean | null
+    credits_spend_control_reached?: boolean | null
+    credits_rate_limit_reached_type?: string | null
+    usage_percent_5h?: number | null
+    reset_5h_at?: ISODateString | null
+    codex_5h_usage_updated_at?: ISODateString | null
+    usage_percent_7d?: number | null
+    reset_7d_at?: ISODateString | null
+    codex_usage_updated_at?: ISODateString | null
+    // 最近一次被应用的 WS 配额帧；旧后端不返回，仅用于观测帧摄入。
+    codex_usage_frame_at?: ISODateString
+    codex_usage_frame_kind?: string
   }>
   session_slot_buffer_enabled: boolean
 }
@@ -1120,7 +1141,7 @@ export interface AntigravityModelQuota {
   model?: string
   model_id?: string
   name?: string
-  remaining_fraction: number
+  remaining_fraction?: number
   remaining_percent?: number
   reset_time?: string
   display_name?: string
@@ -1150,6 +1171,7 @@ export interface AntigravityQuotaGroup {
 
 export interface AntigravityQuotaSnapshot {
   models: Record<string, AntigravityModelQuota> | AntigravityModelQuota[]
+  catalog_model_ids?: string[]
   quota_groups?: AntigravityQuotaGroup[]
   groups?: AntigravityQuotaGroup[]
   subscription_tier?: string
@@ -1250,10 +1272,14 @@ export interface UpdateAntigravityAccountRequest {
   model_mapping?: string
   proxy_url?: string
   group_ids?: number[]
+  /** Caller-owned GCP project for Workspace / enterprise OAuth accounts; "" clears it. */
+  user_project_id?: string
 }
 
 export interface AntigravityImportRequest {
   files: string[]
+  /** 每项一个 Google refresh token;与 files 一起交给后端解析器。 */
+  refresh_tokens?: string[]
   proxy_url?: string
   /** 把文件内携带的代理注册进代理池（该渠道一直会采用文件内代理，开关只控制是否入表）。 */
   import_proxy?: boolean
@@ -2184,6 +2210,7 @@ export interface SystemSettings {
   codex_ws_busy_overflow_enabled: boolean
   codex_ws_busy_patience_sec: number
   codex_ws_stateless_slots: number
+  codex_ws_downstream_keepalive_slots: number
   // GitHub 访问（issue #522）：token 只写不读，响应仅回 configured
   github_token?: string
   github_token_configured?: boolean
@@ -2263,6 +2290,7 @@ export interface SystemSettings {
   oauth_model_cooldown_mode: ModelCooldownMode
   oauth_model_cooldown_seconds: number
   oauth_model_cooldown_backoff_enabled: boolean
+  oauth_unsupported_model_cooldown_seconds: number
   expired_cleaned?: number
   model_mapping: string
   codex_model_mapping: string

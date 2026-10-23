@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net/http"
@@ -22,6 +23,7 @@ import (
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/codex2api/proxy"
+	"github.com/codex2api/security"
 	"github.com/gin-gonic/gin"
 )
 
@@ -39,6 +41,8 @@ const (
 // ==================== 内存 Session 存储 ====================
 
 type oauthSession struct {
+	mu sync.Mutex // protects callback progress; authorization fields are immutable
+
 	State        string
 	CodeVerifier string
 	RedirectURI  string
@@ -52,6 +56,34 @@ type oauthSession struct {
 	CallbackState  string    // 回调收到的 state
 	CallbackAt     time.Time // 回调时间
 	ExchangeResult *oauthExchangeResult
+}
+
+// claimExchange consumes a session before network I/O. Failed exchanges require
+// a new authorization session because the upstream may already have used the code.
+func (s *oauthSession) claimExchange(code, state string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.CallbackAt.IsZero() || s.ExchangeResult != nil {
+		return false
+	}
+	s.CallbackCode, s.CallbackState, s.CallbackAt = code, state, time.Now()
+	return true
+}
+
+func (s *oauthSession) completeExchange(result *oauthExchangeResult) {
+	s.mu.Lock()
+	s.ExchangeResult = result
+	s.mu.Unlock()
+}
+
+func (s *oauthSession) callbackSnapshot() (*oauthExchangeResult, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ExchangeResult != nil {
+		result := *s.ExchangeResult
+		return &result, true
+	}
+	return nil, !s.CallbackAt.IsZero()
 }
 
 // oauthExchangeResult 自动回调完成后的兑换结果
@@ -97,16 +129,26 @@ func (s *oauthSessionStore) delete(id string) {
 	s.mu.Unlock()
 }
 
-// findByState 通过 state 查找 session（回调端点使用，返回 sessionID + session）
+// findByState 通过 state 查找 session（回调端点使用，返回 sessionID + session）。
+// 遍历全部条目并使用常量时间比较，避免按匹配位置提前返回。
 func (s *oauthSessionStore) findByState(state string) (string, *oauthSession, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	var foundID string
+	var foundSess *oauthSession
 	for id, sess := range s.sessions {
-		if sess.State == state && time.Since(sess.CreatedAt) <= oauthSessionTTL {
-			return id, sess, true
+		if !security.SecureCompare(sess.State, state) {
+			continue
 		}
+		if time.Since(sess.CreatedAt) > oauthSessionTTL {
+			continue
+		}
+		foundID, foundSess = id, sess
 	}
-	return "", nil, false
+	if foundSess == nil {
+		return "", nil, false
+	}
+	return foundID, foundSess, true
 }
 
 func (s *oauthSessionStore) cleanupLoop() {
@@ -229,6 +271,11 @@ func (h *Handler) ExchangeOAuthCode(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "state 不匹配，请重新发起授权")
 		return
 	}
+	if !sess.claimExchange(req.Code, req.State) {
+		writeError(c, http.StatusBadRequest, "该授权会话已处理或正在处理，请重新发起授权")
+		return
+	}
+	defer sess.completeExchange(&oauthExchangeResult{Error: "请重新发起授权"})
 
 	proxyURL := sess.ProxyURL
 	if trimmed := strings.TrimSpace(req.ProxyURL); trimmed != "" {
@@ -569,6 +616,11 @@ func (h *Handler) UpdateOAuthAccountCode(c *gin.Context) {
 		writeError(c, http.StatusBadRequest, "state 不匹配，请重新发起授权")
 		return
 	}
+	if !sess.claimExchange(req.Code, req.State) {
+		writeError(c, http.StatusBadRequest, "该授权会话已处理或正在处理，请重新发起授权")
+		return
+	}
+	defer sess.completeExchange(&oauthExchangeResult{Error: "请重新发起授权"})
 
 	proxyURL := sess.ProxyURL
 	if req.ProxyURL != "" {
@@ -740,11 +792,12 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 		c.String(http.StatusBadRequest, oauthCallbackPage("授权失败", "OAuth 会话不存在或已过期，请重新发起授权", false))
 		return
 	}
-
-	// 记录回调信息
-	sess.CallbackCode = code
-	sess.CallbackState = state
-	sess.CallbackAt = time.Now()
+	if !sess.claimExchange(code, state) {
+		c.String(http.StatusBadRequest, oauthCallbackPage("授权失败", "该授权回调已处理，请重新发起授权", false))
+		return
+	}
+	result := &oauthExchangeResult{Error: "授权失败，请重新发起授权"}
+	defer func() { sess.completeExchange(result) }()
 
 	// 执行 code exchange（Resin 临时身份）
 	proxyURL := sess.ProxyURL
@@ -754,16 +807,17 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 	resinTempID := "oauth-" + sessionID
 	tokenResp, accountInfo, err := doOAuthCodeExchange(c.Request.Context(), code, sess.CodeVerifier, sess.RedirectURI, proxyURL, resinTempID)
 	if err != nil {
-		sess.ExchangeResult = &oauthExchangeResult{
+		log.Printf("OAuth callback token exchange failed: %s", security.SanitizeLog(err.Error()))
+		result = &oauthExchangeResult{
 			Success: false,
-			Error:   err.Error(),
+			Error:   "兑换 token 失败，请重新发起授权",
 		}
-		c.String(http.StatusOK, oauthCallbackPage("授权失败", "兑换 token 失败: "+err.Error(), false))
+		c.String(http.StatusOK, oauthCallbackPage("授权失败", result.Error, false))
 		return
 	}
 
 	if tokenResp.RefreshToken == "" {
-		sess.ExchangeResult = &oauthExchangeResult{
+		result = &oauthExchangeResult{
 			Success: false,
 			Error:   "授权服务器未返回 refresh_token",
 		}
@@ -776,6 +830,49 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 		idToken:      tokenResp.IDToken,
 		expiresIn:    tokenResp.ExpiresIn,
 	})
+
+	// 公开自助门户发起的会话必须走「待审核」入库，不能因为 state 被带到公开
+	// /auth/callback 就绕过 SubmitAccountPortalCode 的 enabled=false 分支。
+	if sess.SelfService {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+		defer cancel()
+		name := seed.email
+		if name == "" {
+			name = "self-service-account"
+		}
+		id, err := h.upsertSelfServiceAccount(ctx, name, proxyURL, seed, sess.ContactEmail)
+		if err == errDuplicateOAuthIdentity {
+			result = &oauthExchangeResult{
+				Success: true,
+				Message: "该账号已在系统中，无需重复提交",
+			}
+			c.String(http.StatusOK, oauthCallbackPage("提交成功", "该账号已在系统中，无需重复提交。", true))
+			return
+		}
+		if err != nil {
+			log.Printf("OAuth callback account write failed: %s", security.SanitizeLog(err.Error()))
+			result = &oauthExchangeResult{
+				Success: false,
+				Error:   "账号保存失败，请联系管理员并重新发起授权",
+			}
+			c.String(http.StatusOK, oauthCallbackPage("授权失败", result.Error, false))
+			return
+		}
+		email := seed.email
+		if accountInfo != nil && accountInfo.Email != "" {
+			email = accountInfo.Email
+		}
+		security.SecurityAuditLog("ACCOUNT_PORTAL_SUBMITTED", "ip="+security.SanitizeLog(c.ClientIP())+" contact="+security.SanitizeLog(sess.ContactEmail)+" account="+security.SanitizeLog(email))
+		result = &oauthExchangeResult{
+			Success: true,
+			Message: "账号已提交，等待管理员审核",
+			ID:      id,
+			Email:   email,
+		}
+		log.Printf("自助门户回调新增待审核账号: id=%d email=%s", id, email)
+		c.String(http.StatusOK, oauthCallbackPage("提交成功", "已提交，等待管理员审核后生效。感谢你的贡献！", true))
+		return
+	}
 
 	// 自动添加账号
 	name := ""
@@ -791,11 +888,12 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 
 	id, updated, err := h.upsertOAuthIdentityAccount(ctx, name, proxyURL, seed, "oauth_callback")
 	if err != nil {
-		sess.ExchangeResult = &oauthExchangeResult{
+		log.Printf("OAuth callback account write failed: %s", security.SanitizeLog(err.Error()))
+		result = &oauthExchangeResult{
 			Success: false,
-			Error:   "账号写入数据库失败: " + err.Error(),
+			Error:   "账号保存失败，请联系管理员并重新发起授权",
 		}
-		c.String(http.StatusOK, oauthCallbackPage("授权失败", "写入数据库失败: "+err.Error(), false))
+		c.String(http.StatusOK, oauthCallbackPage("授权失败", result.Error, false))
 		return
 	}
 
@@ -822,7 +920,7 @@ func (h *Handler) OAuthCallback(c *gin.Context) {
 		message = fmt.Sprintf("账号已存在，已更新账号 %d", id)
 		pageMessage = fmt.Sprintf("账号已存在，已更新账号 %d，可以关闭此页面。", id)
 	}
-	sess.ExchangeResult = &oauthExchangeResult{
+	result = &oauthExchangeResult{
 		Success:  true,
 		Message:  message,
 		ID:       id,
@@ -849,17 +947,18 @@ func (h *Handler) PollOAuthCallback(c *gin.Context) {
 		return
 	}
 
-	if sess.ExchangeResult != nil {
+	result, processing := sess.callbackSnapshot()
+	if result != nil {
 		// 回调已完成，返回结果并清理 session
 		c.JSON(http.StatusOK, gin.H{
 			"status": "completed",
-			"result": sess.ExchangeResult,
+			"result": result,
 		})
 		globalOAuthStore.delete(sessionID)
 		return
 	}
 
-	if sess.CallbackCode != "" {
+	if processing {
 		// 收到回调但尚未完成兑换（罕见竞态）
 		c.JSON(http.StatusOK, gin.H{
 			"status": "processing",
@@ -873,7 +972,8 @@ func (h *Handler) PollOAuthCallback(c *gin.Context) {
 	})
 }
 
-// oauthCallbackPage 生成简单的 HTML 回调结果页面
+// oauthCallbackPage 生成简单的 HTML 回调结果页面。
+// title/message 可能来自数据库错误或 token claims，必须转义后再插入。
 func oauthCallbackPage(title, message string, success bool) string {
 	color := "#e53e3e"
 	icon := "&#10060;"
@@ -881,6 +981,8 @@ func oauthCallbackPage(title, message string, success bool) string {
 		color = "#38a169"
 		icon = "&#10004;"
 	}
+	title = html.EscapeString(title)
+	message = html.EscapeString(message)
 	return fmt.Sprintf(`<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>%s</title>
 <style>

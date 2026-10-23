@@ -78,6 +78,7 @@ func executeClaudeAPIKeyMessages(ctx context.Context, account *auth.Account, bod
 	if proxyOverride != "" {
 		proxyURL = proxyOverride
 	}
+	proxyURL = requestProxyURL(ctx, proxyURL)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, ErrInternalError("创建 Claude 请求失败", err)
@@ -86,12 +87,12 @@ func executeClaudeAPIKeyMessages(ctx context.Context, account *auth.Account, bod
 	if err := ConsumeAPIKeyModelRequestQuota(ctx, strings.TrimSpace(gjson.GetBytes(body, "model").String())); err != nil {
 		return nil, err
 	}
-	client := *getPooledClient(account, proxyURL)
+	client := *getRequestClient(ctx, account, proxyURL)
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := doTracedUpstreamRequest(&client, req, account, proxyURL)
 	if err != nil {
 		if shouldRecyclePooledClient(err) {
-			recyclePooledClient(account, proxyURL)
+			recycleRequestClient(ctx, account, proxyURL)
 		}
 		return nil, ErrUpstream(0, "请求 Anthropic Messages API 失败", err)
 	}

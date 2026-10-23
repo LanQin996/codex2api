@@ -17,6 +17,7 @@ type userAgentAudit struct {
 	mu                sync.RWMutex
 	upstreamUserAgent string
 	upstreamKnown     bool
+	attempts          int
 }
 
 func withUserAgentAudit(ctx context.Context) context.Context {
@@ -94,4 +95,27 @@ func normalizeUsageLogUserAgent(userAgent string) string {
 		return userAgent
 	}
 	return strings.ToValidUTF8(userAgent[:maxUsageLogUserAgentLength], "")
+}
+
+// WithUpstreamIdentityAudit lets internal probes record the actual outbound UA
+// without exposing authorization headers or borrowing a downstream identity.
+func WithUpstreamIdentityAudit(ctx context.Context) context.Context { return withUserAgentAudit(ctx) }
+
+func UpstreamIdentityAudit(ctx context.Context) (string, bool) { return upstreamUserAgentAudit(ctx) }
+
+// UpstreamAttemptCount includes transport retries made by a shared executor.
+func UpstreamAttemptCount(ctx context.Context) int {
+	if audit := userAgentAuditFromContext(ctx); audit != nil {
+		audit.mu.RLock()
+		defer audit.mu.RUnlock()
+		return audit.attempts
+	}
+	return 0
+}
+func recordUpstreamAttempt(ctx context.Context) {
+	if audit := userAgentAuditFromContext(ctx); audit != nil {
+		audit.mu.Lock()
+		audit.attempts++
+		audit.mu.Unlock()
+	}
 }

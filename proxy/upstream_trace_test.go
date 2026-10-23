@@ -65,3 +65,16 @@ func TestUpstreamTraceHTTPFailureAndReset(t *testing.T) {
 	}
 	beginUpstreamTrace(context.Background(), &auth.Account{}, "", false)(resp)
 }
+
+func TestUpstreamTraceAccountBoundRouteSnapshot(t *testing.T) {
+	c, _ := gin.CreateTestContext(httptest.NewRecorder())
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/responses", nil)
+	attachUpstreamTrace(c, nil)
+	c.Request = c.Request.WithContext(WithAccountBoundEgress(c.Request.Context(), ""))
+	beginUpstreamTrace(c.Request.Context(), &auth.Account{DBID: 3}, "http://changed.invalid:1080", true)
+	input := &database.UsageLogInput{AccountID: 3}
+	populateUpstreamTrace(c, input)
+	if input.UpstreamProxyName != "direct/no_proxy" {
+		t.Fatalf("direct snapshot mislabeled: %s", input.UpstreamProxyName)
+	}
+}

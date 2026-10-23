@@ -15,6 +15,8 @@ const (
 	DefaultRelayModelCooldownSeconds = 2
 	DefaultOAuthModelCooldownSeconds = 300
 	MaxModelCooldownSeconds          = 1800
+
+	DefaultOAuthUnsupportedModelCooldownSeconds = 1800
 )
 
 // ModelCooldownSettings separates transient API/relay throttling from OAuth
@@ -30,6 +32,12 @@ type ModelCooldownSettings struct {
 	OAuthMode           string
 	OAuthSeconds        int
 	OAuthBackoffEnabled bool
+	// The plan-gated "model is not supported when using Codex" 400 has its own
+	// cooldown. Zero values mean enabled with the default duration, so partially
+	// populated settings never silently disable it. Stored as one column where
+	// 0 means disabled.
+	OAuthUnsupportedDisabled bool
+	OAuthUnsupportedSeconds  int
 }
 
 type ModelCooldownSettingsUpdate struct {
@@ -41,6 +49,23 @@ type ModelCooldownSettingsUpdate struct {
 	OAuthMode           *string
 	OAuthSeconds        *int
 	OAuthBackoffEnabled *bool
+	// OAuthUnsupportedSeconds uses the stored semantics: 0 disables.
+	OAuthUnsupportedSeconds *int
+}
+
+// UnsupportedCooldownSeconds returns the user-facing value: 0 when disabled.
+func (s ModelCooldownSettings) UnsupportedCooldownSeconds() int {
+	if s.OAuthUnsupportedDisabled {
+		return 0
+	}
+	return s.OAuthUnsupportedSeconds
+}
+
+func (s *ModelCooldownSettings) setUnsupportedCooldownSeconds(value int) {
+	s.OAuthUnsupportedDisabled = value == 0
+	if value > 0 {
+		s.OAuthUnsupportedSeconds = value
+	}
 }
 
 func DefaultModelCooldownSettings() ModelCooldownSettings {
@@ -52,6 +77,8 @@ func DefaultModelCooldownSettings() ModelCooldownSettings {
 		OAuthMode:           ModelCooldownModeAdaptive,
 		OAuthSeconds:        DefaultOAuthModelCooldownSeconds,
 		OAuthBackoffEnabled: true,
+
+		OAuthUnsupportedSeconds: DefaultOAuthUnsupportedModelCooldownSeconds,
 	}
 }
 
@@ -115,12 +142,17 @@ func NormalizeModelCooldownSettings(value ModelCooldownSettings) ModelCooldownSe
 		value.OAuthSeconds = defaults.OAuthSeconds
 	}
 	value.OAuthSeconds = NormalizeModelCooldownSeconds(value.OAuthSeconds, defaults.OAuthSeconds)
+	if value.OAuthUnsupportedSeconds <= 0 {
+		value.OAuthUnsupportedSeconds = defaults.OAuthUnsupportedSeconds
+	}
+	value.OAuthUnsupportedSeconds = NormalizeModelCooldownSeconds(value.OAuthUnsupportedSeconds, defaults.OAuthUnsupportedSeconds)
 	return value
 }
 
 func (db *DB) GetModelCooldownSettings(ctx context.Context) (ModelCooldownSettings, error) {
 	defaults := DefaultModelCooldownSettings()
 	value := defaults
+	unsupportedSeconds := defaults.OAuthUnsupportedSeconds
 	err := db.conn.QueryRowContext(ctx, `
 		SELECT
 			COALESCE(NULLIF(TRIM(relay_model_cooldown_mode), ''), $1),
@@ -128,18 +160,23 @@ func (db *DB) GetModelCooldownSettings(ctx context.Context) (ModelCooldownSettin
 			COALESCE(relay_model_cooldown_backoff_enabled, $3),
 			COALESCE(NULLIF(TRIM(oauth_model_cooldown_mode), ''), $4),
 			COALESCE(oauth_model_cooldown_seconds, $5),
-			COALESCE(oauth_model_cooldown_backoff_enabled, $6), responses_cooldown_mode, responses_cooldown_seconds
+			COALESCE(oauth_model_cooldown_backoff_enabled, $6), responses_cooldown_mode, responses_cooldown_seconds,
+			COALESCE(oauth_unsupported_model_cooldown_seconds, $7)
 		FROM system_settings
 		WHERE id = 1
 	`, defaults.RelayMode, defaults.RelaySeconds, defaults.RelayBackoffEnabled,
 		defaults.OAuthMode, defaults.OAuthSeconds, defaults.OAuthBackoffEnabled,
+		defaults.OAuthUnsupportedSeconds,
 	).Scan(
 		&value.RelayMode,
 		&value.RelaySeconds,
 		&value.RelayBackoffEnabled,
 		&value.OAuthMode,
 		&value.OAuthSeconds,
-		&value.OAuthBackoffEnabled, &value.ResponsesMode, &value.ResponsesSeconds,
+		&value.OAuthBackoffEnabled,
+		&value.ResponsesMode,
+		&value.ResponsesSeconds,
+		&unsupportedSeconds,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -147,6 +184,7 @@ func (db *DB) GetModelCooldownSettings(ctx context.Context) (ModelCooldownSettin
 		}
 		return defaults, fmt.Errorf("读取模型冷却设置失败: %w", err)
 	}
+	value.setUnsupportedCooldownSeconds(unsupportedSeconds)
 	return NormalizeModelCooldownSettings(value), nil
 }
 
@@ -179,6 +217,9 @@ func (db *DB) UpdateModelCooldownSettings(ctx context.Context, update ModelCoold
 	if update.ResponsesSeconds != nil {
 		current.ResponsesSeconds = *update.ResponsesSeconds
 	}
+	if update.OAuthUnsupportedSeconds != nil && *update.OAuthUnsupportedSeconds >= 0 {
+		current.setUnsupportedCooldownSeconds(NormalizeModelCooldownSeconds(*update.OAuthUnsupportedSeconds, current.OAuthUnsupportedSeconds))
+	}
 	current = NormalizeModelCooldownSettings(current)
 
 	if _, err := db.conn.ExecContext(ctx, `INSERT INTO system_settings (id) VALUES (1) ON CONFLICT(id) DO NOTHING`); err != nil {
@@ -191,10 +232,15 @@ func (db *DB) UpdateModelCooldownSettings(ctx context.Context, update ModelCoold
 			relay_model_cooldown_backoff_enabled = $3,
 			oauth_model_cooldown_mode = $4,
 			oauth_model_cooldown_seconds = $5,
-			oauth_model_cooldown_backoff_enabled = $6, responses_cooldown_mode = $7, responses_cooldown_seconds = $8
+			oauth_model_cooldown_backoff_enabled = $6,
+			responses_cooldown_mode = $7,
+			responses_cooldown_seconds = $8,
+			oauth_unsupported_model_cooldown_seconds = $9
 		WHERE id = 1
 	`, current.RelayMode, current.RelaySeconds, current.RelayBackoffEnabled,
-		current.OAuthMode, current.OAuthSeconds, current.OAuthBackoffEnabled, current.ResponsesMode, current.ResponsesSeconds,
+		current.OAuthMode, current.OAuthSeconds, current.OAuthBackoffEnabled,
+		current.ResponsesMode, current.ResponsesSeconds,
+		current.UnsupportedCooldownSeconds(),
 	)
 	if err != nil {
 		return ModelCooldownSettings{}, fmt.Errorf("保存模型冷却设置失败: %w", err)

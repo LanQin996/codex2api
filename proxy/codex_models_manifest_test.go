@@ -8,11 +8,13 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/codex2api/api"
 	"github.com/codex2api/auth"
 	"github.com/codex2api/database"
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 // TestListModelsOrManifest_DispatchesByClientVersion 验证 /models 分发:
@@ -119,6 +121,55 @@ func TestMergeCodexManifestModelsAppendsMissingRelaySlugs(t *testing.T) {
 	}
 	if !payload.Future || len(payload.Models) != 2 || payload.Models[0].Slug != "gpt-5.4" || payload.Models[1].Slug != "gemini-2.5-flash" {
 		t.Fatalf("merged = %s", merged)
+	}
+}
+
+func TestMergedCodexManifestUsesScopedCapabilitiesAndGatewayETag(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db := newTestModelRegistryDB(t)
+	ctx := context.Background()
+	id, err := db.InsertAccount(ctx, "manifest-caps", "test-refresh", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	row, err := db.GetAccountByID(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := auth.NewStore(nil, nil, nil)
+	store.AddAccount(&auth.Account{DBID: id, CredentialGeneration: row.CredentialGeneration, AccessToken: "test-only", PlanType: "plus"})
+	h := NewHandler(store, db, nil, nil)
+	source := []byte(`{"models":[{"slug":"gpt-6-astra","use_responses_lite":true,"experimental_supported_tools":["function"],"base_instructions":"keep source instructions"}],"future":{"keep":true}}`)
+	router := gin.New()
+	router.GET("/models", func(c *gin.Context) {
+		c.Set(contextAPIKeyRow, &database.APIKeyRow{ID: 1})
+		h.writeMergedCodexManifest(c, source, `W/"upstream-validator"`, nil)
+	})
+	request := func(etag string) *httptest.ResponseRecorder {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodGet, "/models", nil)
+		req.Header.Set("If-None-Match", etag)
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+	first := request(`W/"upstream-validator"`)
+	if first.Code != http.StatusOK || first.Header().Get("ETag") == `W/"upstream-validator"` || first.Header().Get("ETag") == "" {
+		t.Fatalf("source ETag bypassed gateway representation: status=%d etag=%q", first.Code, first.Header().Get("ETag"))
+	}
+	if gjson.GetBytes(first.Body.Bytes(), "models.0.use_responses_lite").Bool() || gjson.GetBytes(first.Body.Bytes(), "models.0.experimental_supported_tools").Raw != "[]" || gjson.GetBytes(first.Body.Bytes(), "models.0.base_instructions").String() != "keep source instructions" || !gjson.GetBytes(first.Body.Bytes(), "future.keep").Bool() {
+		t.Fatalf("unknown capabilities or source fields mishandled: %s", first.Body.String())
+	}
+	if cached := request(first.Header().Get("ETag")); cached.Code != http.StatusNotModified || cached.Body.Len() != 0 {
+		t.Fatalf("unchanged gateway manifest did not cache: status=%d body=%s", cached.Code, cached.Body.String())
+	}
+	models := parseCodexModelCapabilities(source)
+	if err := db.SaveModelCapabilities(ctx, database.ModelCapabilitySnapshot{AccountID: id, CredentialGeneration: row.CredentialGeneration, ObservedAt: time.Now().UnixNano(), Models: models}); err != nil {
+		t.Fatal(err)
+	}
+	updated := request(first.Header().Get("ETag"))
+	if updated.Code != http.StatusOK || updated.Header().Get("ETag") == first.Header().Get("ETag") || !gjson.GetBytes(updated.Body.Bytes(), "models.0.use_responses_lite").Bool() || gjson.GetBytes(updated.Body.Bytes(), "models.0.experimental_supported_tools").Raw != `["function"]` {
+		t.Fatalf("new scoped capabilities hidden behind stale ETag: status=%d body=%s", updated.Code, updated.Body.String())
 	}
 }
 

@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/codex2api/security"
 )
 
 // Version represents an API version
@@ -181,6 +183,12 @@ func randInt() int {
 // BodyCacheMiddleware caches the request body for multiple reads
 func BodyCacheMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// 大批量导入端点由 handler 自己流式解析 multipart（>32MB 落临时文件）。
+		// 这里不能预先 io.ReadAll：鉴权还没发生，200MB 的未认证请求会直接常驻内存。
+		if security.IsLargeImportUploadPath(c.Request.URL.Path) {
+			c.Next()
+			return
+		}
 		if body := GetRawBody(c); body != nil {
 			c.Request.Body = io.NopCloser(bytes.NewReader(body))
 			c.Next()

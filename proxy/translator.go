@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"container/list"
 	"crypto/sha256"
 	"encoding/json"
@@ -14,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/codex2api/proxy/internal/jsonbody"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -187,7 +189,12 @@ type openAIErrorResponse struct {
 
 // ==================== LRU 请求解析缓存 ====================
 
-const requestCacheSize = 256
+const (
+	requestCacheSize          = 256
+	requestCacheMaxBytes      = 64 << 20
+	requestCacheMaxEntryBytes = 1 << 20
+	requestCacheTTL           = 10 * time.Minute
+)
 
 // maxTools 上游 Codex API 允许的最大工具数量
 const maxTools = 128
@@ -213,19 +220,28 @@ var responsesImageGenerationUnsupportedOptionFields = []string{
 }
 
 type requestCacheEntry struct {
-	key [32]byte
-	req openAIRequest
+	key       [32]byte
+	req       openAIRequest
+	size      int
+	expiresAt time.Time
 }
 
 type requestCache struct {
-	mu    sync.Mutex
-	order *list.List
-	items map[[32]byte]*list.Element
+	mu            sync.Mutex
+	order         *list.List
+	items         map[[32]byte]*list.Element
+	bytes         int
+	maxBytes      int
+	maxEntryBytes int
+	ttl           time.Duration
 }
 
 var globalRequestCache = &requestCache{
-	order: list.New(),
-	items: make(map[[32]byte]*list.Element, requestCacheSize),
+	order:         list.New(),
+	items:         make(map[[32]byte]*list.Element, requestCacheSize),
+	maxBytes:      requestCacheMaxBytes,
+	maxEntryBytes: requestCacheMaxEntryBytes,
+	ttl:           requestCacheTTL,
 }
 
 func firstNonEmptyAnyString(raw any) string {
@@ -462,7 +478,7 @@ func moveTopLevelResponsesImageOptions(body map[string]any) bool {
 	modified := false
 	for _, key := range responsesImageGenerationOptionFields {
 		value, exists := body[key]
-		if !exists || value == nil {
+		if !exists || !isResponsesImageGenerationOption(key, value) {
 			continue
 		}
 		_, toolHas := toolMap[key]
@@ -692,11 +708,25 @@ func hasTopLevelResponsesImageOptions(body map[string]any) bool {
 		return false
 	}
 	for _, key := range responsesImageGenerationOptionFields {
-		if value, exists := body[key]; exists && value != nil {
+		if value, exists := body[key]; exists && isResponsesImageGenerationOption(key, value) {
 			return true
 		}
 	}
 	return false
+}
+
+func isResponsesImageGenerationOption(key string, value any) bool {
+	if value == nil {
+		return false
+	}
+	if key == "background" {
+		// Responses uses a boolean for asynchronous execution; image generation
+		// uses a string (auto/opaque/transparent). Never move that boolean into
+		// an image tool or use it to infer an image-generation request.
+		_, imageBackground := value.(string)
+		return imageBackground
+	}
+	return true
 }
 
 func isStructuredResponsesFormatType(formatType string) bool {
@@ -751,6 +781,10 @@ func shouldAutoInjectResponsesImageGenerationTool(body map[string]any) bool {
 	}
 	if hasTopLevelResponsesImageOptions(body) {
 		return true
+	}
+	// An implicit image tool must not evict an explicitly supplied tool at capacity.
+	if tools, ok := body["tools"].([]any); ok && len(tools) >= maxTools {
+		return false
 	}
 	return !hasStructuredResponsesFormat(body)
 }
@@ -1680,6 +1714,46 @@ func truncateToolsPreservingImageGeneration(tools []any) []any {
 	return truncated
 }
 
+func (c *requestCache) ttlValue() time.Duration {
+	if c.ttl > 0 {
+		return c.ttl
+	}
+	return requestCacheTTL
+}
+
+func (c *requestCache) maxBytesValue() int {
+	if c.maxBytes > 0 {
+		return c.maxBytes
+	}
+	return requestCacheMaxBytes
+}
+
+func (c *requestCache) maxEntryBytesValue() int {
+	if c.maxEntryBytes > 0 {
+		return c.maxEntryBytes
+	}
+	return requestCacheMaxEntryBytes
+}
+
+func (c *requestCache) removeElementLocked(elem *list.Element) {
+	entry := elem.Value.(*requestCacheEntry)
+	c.order.Remove(elem)
+	delete(c.items, entry.key)
+	c.bytes -= entry.size
+	if c.bytes < 0 {
+		c.bytes = 0
+	}
+}
+
+func (c *requestCache) pruneExpiredLocked(now time.Time) {
+	for _, elem := range c.items {
+		entry := elem.Value.(*requestCacheEntry)
+		if !entry.expiresAt.IsZero() && now.After(entry.expiresAt) {
+			c.removeElementLocked(elem)
+		}
+	}
+}
+
 func (c *requestCache) get(key [32]byte) (openAIRequest, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1687,29 +1761,66 @@ func (c *requestCache) get(key [32]byte) (openAIRequest, bool) {
 	if !ok {
 		return openAIRequest{}, false
 	}
+	entry := elem.Value.(*requestCacheEntry)
+	if !entry.expiresAt.IsZero() && time.Now().After(entry.expiresAt) {
+		c.removeElementLocked(elem)
+		return openAIRequest{}, false
+	}
 	c.order.MoveToFront(elem)
-	return elem.Value.(*requestCacheEntry).req, true
+	return entry.req, true
 }
 
-func (c *requestCache) put(key [32]byte, req openAIRequest) {
+func (c *requestCache) put(key [32]byte, req openAIRequest, size int) {
+	if size <= 0 || size > c.maxEntryBytesValue() {
+		return
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	now := time.Now()
+	c.pruneExpiredLocked(now)
+	expiresAt := now.Add(c.ttlValue())
 	if elem, ok := c.items[key]; ok {
+		entry := elem.Value.(*requestCacheEntry)
+		c.bytes -= entry.size
+		entry.req = req
+		entry.size = size
+		entry.expiresAt = expiresAt
+		c.bytes += size
 		c.order.MoveToFront(elem)
-		elem.Value.(*requestCacheEntry).req = req
-		return
+	} else {
+		elem := c.order.PushFront(&requestCacheEntry{key: key, req: req, size: size, expiresAt: expiresAt})
+		c.items[key] = elem
+		c.bytes += size
 	}
-	elem := c.order.PushFront(&requestCacheEntry{key: key, req: req})
-	c.items[key] = elem
-	if c.order.Len() <= requestCacheSize {
-		return
+	for c.order.Len() > requestCacheSize || c.bytes > c.maxBytesValue() {
+		tail := c.order.Back()
+		if tail == nil {
+			break
+		}
+		c.removeElementLocked(tail)
 	}
-	tail := c.order.Back()
-	if tail == nil {
-		return
+}
+
+// 解析后常驻堆的开销估算：除原始 JSON 外，还需计入切片本身。
+// 20000 条短消息的 JSON 只有约 60KB，但 []openAIMessage 的后备数组就占 ~1.5MB。
+const (
+	parsedRequestSizeCeiling = requestCacheMaxEntryBytes + 1
+	parsedMessageOverhead    = 128 // openAIMessage 结构体 + 切片增长余量
+	parsedToolCallOverhead   = 128 // openAIToolCall 结构体 + 切片增长余量
+	parsedRawJSONOverhead    = 32  // json.RawMessage 头部
+)
+
+func estimateParsedRequestSize(rawJSON []byte, req *openAIRequest) int {
+	size := int64(len(rawJSON)) * 3
+	size += int64(cap(req.Messages)) * parsedMessageOverhead
+	for i := range req.Messages {
+		size += int64(cap(req.Messages[i].ToolCalls)) * parsedToolCallOverhead
 	}
-	c.order.Remove(tail)
-	delete(c.items, tail.Value.(*requestCacheEntry).key)
+	size += int64(cap(req.Tools)) * parsedRawJSONOverhead
+	if size > parsedRequestSizeCeiling {
+		return parsedRequestSizeCeiling
+	}
+	return int(size)
 }
 
 // cachedOrParse 从缓存获取或解析请求，返回结构体（Unmarshal 至多一次）
@@ -1723,7 +1834,11 @@ func cachedOrParse(rawJSON []byte) openAIRequest {
 	}
 	var req openAIRequest
 	_ = json.Unmarshal(rawJSON, &req)
-	globalRequestCache.put(key, req)
+	// The parsed request retains more than the raw JSON (message slices,
+	// RawMessage copies, tool structs). Charge a conservative multiplier plus
+	// per-slice overhead so the byte budget bounds retained heap, not just wire
+	// bytes.
+	globalRequestCache.put(key, req, estimateParsedRequestSize(rawJSON, &req))
 	return req
 }
 
@@ -2092,7 +2207,7 @@ func ValidateResponsesFunctionNames(rawBody []byte) error {
 	// 无效 JSON 时 gjson 查询返回空结果、校验直接通过（与旧版 Unmarshal 失败即
 	// 放行一致），无需先做一次全量 ValidBytes 扫描。
 	var funcErr error
-	gjson.GetBytes(rawBody, "input").ForEach(func(idx, item gjson.Result) bool {
+	jsonbody.GetView(rawBody, "input").ForEach(func(idx, item gjson.Result) bool {
 		if strings.TrimSpace(item.Get("type").String()) != "function_call" {
 			return true
 		}
@@ -2292,25 +2407,35 @@ type responsesBodyPreparation struct {
 	CacheLookup          responseCacheLookupResult
 	RequiresLocalContext bool
 	Bypassed             bool
+	InputReplayConflict  bool
 }
 
 func prepareResponsesBodyForOwnerDetailed(rawBody []byte, owner string) responsesBodyPreparation {
 	prevID := gjson.GetBytes(rawBody, "previous_response_id").String()
 	preparation := responsesBodyPreparation{PreviousResponseID: prevID}
 	if prevID != "" {
-		currentInput := gjson.GetBytes(rawBody, "input")
-		if currentInput.IsArray() && inputHasToolCallContext(currentInput) {
-			preparation.Bypassed = true
-		} else {
-			preparation.RequiresLocalContext = currentInput.IsArray() && inputHasFunctionCallOutput(currentInput)
-			preparation.CacheLookup = getResponseCacheForReplay(owner, prevID)
+		// Codex HTTP removes previous_response_id before sending upstream. Every
+		// reference therefore needs an owner-scoped snapshot, even when the new
+		// input is plain text or also contains complete tool call/result pairs.
+		// Otherwise a cache miss silently turns a continuation into a new turn.
+		preparation.RequiresLocalContext = true
+		preparation.CacheLookup = getResponseCacheForReplay(owner, prevID)
+		if preparation.CacheLookup.Kind == responseCacheLookupHit {
+			// A new tool pair is not a replay of the parent. Skip expansion only
+			// when overlapping call IDs prove an exact, complete parent prefix.
+			preparation.Bypassed, preparation.InputReplayConflict = responsesHTTPClientReplaysParent(
+				preparation.CacheLookup.Items, gjson.GetBytes(rawBody, "input"))
 		}
+	}
+	cachedItems := preparation.CacheLookup.Items
+	if preparation.Bypassed {
+		cachedItems = nil
 	}
 	preparedBody, expandedInputRaw := prepareResponsesBodyWithOptions(rawBody, responsesBodyPrepareOptions{
 		forceStoreFalse:        true,
 		expandPreviousResponse: false,
 		cacheOwner:             owner,
-		cachedResponseItems:    preparation.CacheLookup.Items,
+		cachedResponseItems:    cachedItems,
 	})
 	preparation.Body = preparedBody
 	preparation.ExpandedInputRaw = expandedInputRaw
@@ -2385,6 +2510,11 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 	var body map[string]any
 	if err := json.Unmarshal(rawBody, &body); err != nil {
 		return rawBody, ""
+	}
+	if background, present := body["background"]; present && (background == nil || background == false) {
+		// Codex executes synchronously; these nullable/default values request
+		// the same behavior and need no unsupported background parameter.
+		delete(body, "background")
 	}
 	if opts.naturalImageIntent != nil {
 		// Inspect the original prompt before compatibility rewrites or automatic
@@ -2564,7 +2694,11 @@ func prepareResponsesBodyWithOptions(rawBody []byte, opts responsesBodyPrepareOp
 // without applying Codex-specific fields such as store/include/tool injection.
 func PrepareOpenAIResponsesBody(rawBody []byte) []byte {
 	var body map[string]any
-	if err := json.Unmarshal(rawBody, &body); err != nil {
+	// Native schema constraints and future provider fields can contain integers
+	// beyond float64's exact range. Shape-only compatibility must preserve them.
+	decoder := json.NewDecoder(bytes.NewReader(rawBody))
+	decoder.UseNumber()
+	if !json.Valid(rawBody) || decoder.Decode(&body) != nil {
 		return rawBody
 	}
 
@@ -2579,19 +2713,20 @@ func PrepareOpenAIResponsesBody(rawBody []byte) []byte {
 				reasoning["effort"] = normalized
 				body["reasoning"] = reasoning
 			}
-		}
-	}
-	if reasoning, ok := body["reasoning"].(map[string]any); ok {
-		if effort, ok := reasoning["effort"].(string); ok {
-			if normalized := normalizeReasoningEffortForModel(effort, effortModel); normalized != "" {
-				reasoning["effort"] = normalized
-			} else {
-				delete(reasoning, "effort")
-			}
+			delete(body, "reasoning_effort")
 		}
 	}
 
-	normalizeResponsesStructuredOutputFormat(body)
+	// Codex's structured-output sanitizer is deliberately confined to a
+	// translated legacy alias. A native Responses text.format is authoritative:
+	// retain its constraints and let its provider validate JSON-mode prompting.
+	if legacy, ok := body["response_format"].(map[string]any); ok && responsesTextFormatFromResponseFormat(legacy) != nil {
+		text, _ := body["text"].(map[string]any)
+		if _, nativeFormat := text["format"]; !nativeFormat {
+			normalizeResponsesStructuredOutputFormat(body)
+		}
+		delete(body, "response_format")
+	}
 	normalizeResponsesFunctionTools(body)
 	normalizeResponsesToolChoice(body)
 	normalizeResponsesContentPartTypes(body)
@@ -3036,29 +3171,28 @@ func normalizeServiceTierField(body []byte) []byte {
 	if tier == "" {
 		return body
 	}
-	body, _ = sjson.SetBytes(body, "service_tier", tier)
-	body, _ = sjson.DeleteBytes(body, "serviceTier")
+	body = jsonbody.SetString(body, "service_tier", tier)
+	body = jsonbody.DeletePath(body, "serviceTier")
 	return body
 }
 
 func sanitizeServiceTierForUpstream(body []byte) []byte {
 	tier := strings.TrimSpace(gjson.GetBytes(body, "service_tier").String())
 	if tier == "" {
-		body, _ = sjson.DeleteBytes(body, "serviceTier")
-		return body
+		return jsonbody.DeletePath(body, "serviceTier")
 	}
 	switch tier {
 	case "auto", "default", "flex", "priority", "scale", "fast", "ultrafast":
-		body, _ = sjson.DeleteBytes(body, "serviceTier")
+		body = jsonbody.DeletePath(body, "serviceTier")
 		if upstreamTier, ok := upstreamServiceTier(tier); ok {
-			body, _ = sjson.SetBytes(body, "service_tier", upstreamTier)
+			body = jsonbody.SetString(body, "service_tier", upstreamTier)
 		} else {
-			body, _ = sjson.DeleteBytes(body, "service_tier")
+			body = jsonbody.DeletePath(body, "service_tier")
 		}
 		return body
 	default:
-		body, _ = sjson.DeleteBytes(body, "service_tier")
-		body, _ = sjson.DeleteBytes(body, "serviceTier")
+		body = jsonbody.DeletePath(body, "service_tier")
+		body = jsonbody.DeletePath(body, "serviceTier")
 		return body
 	}
 }
@@ -3503,9 +3637,13 @@ func normalizeResponsesToolSchema(rawTool any, descDefaults map[string]string) {
 	if !ok || isReservedCodexTool(toolMap) {
 		return
 	}
-	if toolType, _ := toolMap["type"].(string); toolType != "" {
-		if defaultDesc, ok := descDefaults[toolType]; ok {
-			if desc, _ := toolMap["description"].(string); desc == "" {
+	// Defaults describe user-defined tools by name. Builtin tool types have
+	// their own wire schemas (server-executed tool_search forbids description).
+	// Explicit fields, including empty or invalid values, belong to the client.
+	toolType, _ := toolMap["type"].(string)
+	if toolType == "function" || toolType == "custom" {
+		if _, exists := toolMap["description"]; !exists {
+			if defaultDesc, ok := descDefaults[strings.TrimSpace(firstNonEmptyAnyString(toolMap["name"]))]; ok {
 				toolMap["description"] = defaultDesc
 			}
 		}

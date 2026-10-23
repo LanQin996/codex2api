@@ -972,6 +972,89 @@ func TestAntigravityManualRefreshUsesPersistedGroupProxy(t *testing.T) {
 	}
 }
 
+func TestAntigravityUpdateUserProjectPersistsAndResyncs(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var onboardBodies []map[string]any
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/userinfo":
+			_, _ = io.WriteString(w, `{"id":"enterprise-subject","email":"dev@corp.example","verified_email":true,"name":"Dev"}`)
+		case "/load":
+			_, _ = io.WriteString(w, `{"allowedTiers":[{"id":"standard-tier","isDefault":true,"userDefinedCloudaicompanionProject":true}]}`)
+		case "/onboard":
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			onboardBodies = append(onboardBodies, body)
+			_, _ = io.WriteString(w, `{"done":true,"response":{}}`)
+		case "/quota":
+			_, _ = io.WriteString(w, `{"models":{"gemini-3.8-flash-tiered":{"quotaInfo":{"remainingFraction":1}}}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer upstream.Close()
+
+	previousEndpoints := auth.DefaultAntigravityEndpoints
+	auth.DefaultAntigravityEndpoints = auth.AntigravityEndpoints{
+		UserInfoURL: upstream.URL + "/userinfo",
+		LoadProject: []string{upstream.URL + "/load"},
+		OnboardUser: []string{upstream.URL + "/onboard"},
+		Quota:       []string{upstream.URL + "/quota"},
+	}
+	defer func() { auth.DefaultAntigravityEndpoints = previousEndpoints }()
+
+	ctx := context.Background()
+	db := newTestAdminDB(t)
+	accountID, err := db.InsertAccountWithUpstream(ctx, "enterprise", "google", auth.UpstreamAntigravity, map[string]interface{}{
+		"upstream_type": auth.UpstreamAntigravity, "access_token": "enterprise-access", "refresh_token": "enterprise-refresh",
+		"expires_at": time.Now().Add(time.Hour).UTC().Format(time.RFC3339),
+	}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := auth.NewStore(db, nil, &database.SystemSettings{MaxConcurrency: 4})
+	t.Cleanup(store.Stop)
+	handler := &Handler{db: db, store: store}
+
+	patch := func(body string) *httptest.ResponseRecorder {
+		recorder := httptest.NewRecorder()
+		ginContext, _ := gin.CreateTestContext(recorder)
+		ginContext.Params = gin.Params{{Key: "id", Value: itoa(accountID)}}
+		ginContext.Request = httptest.NewRequest(http.MethodPatch, "/api/admin/accounts/"+itoa(accountID)+"/antigravity", strings.NewReader(body))
+		ginContext.Request.Header.Set("Content-Type", "application/json")
+		handler.UpdateAntigravityAccount(ginContext)
+		return recorder
+	}
+
+	if invalid := patch(`{"user_project_id":"bad project!"}`); invalid.Code != http.StatusBadRequest {
+		t.Fatalf("invalid project id: %d %s", invalid.Code, invalid.Body.String())
+	}
+
+	response := patch(`{"user_project_id":"  Corp-GCA-Project "}`)
+	if response.Code != http.StatusOK {
+		t.Fatalf("update: %d %s", response.Code, response.Body.String())
+	}
+	row, err := db.GetAccountByID(ctx, accountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := row.GetCredential(auth.AntigravityUserProjectIDCredentialKey); got != "corp-gca-project" {
+		t.Fatalf("stored user project = %q", got)
+	}
+	if got := row.GetCredential("project_id"); got != "corp-gca-project" {
+		t.Fatalf("project_id after resync = %q, want the user project; body %s", got, response.Body.String())
+	}
+	if len(onboardBodies) == 0 || onboardBodies[len(onboardBodies)-1]["cloudaicompanionProject"] != "corp-gca-project" {
+		t.Fatalf("onboard bodies = %#v, want the user project", onboardBodies)
+	}
+	if account := store.FindByID(accountID); account == nil {
+		t.Fatal("account missing from runtime after resync")
+	} else if projectID, _ := account.AntigravityCredentials(); projectID != "corp-gca-project" {
+		t.Fatalf("runtime project = %q", projectID)
+	}
+}
+
 func TestAntigravityControlPlaneFailsClosedOnlyForUpstreamCalls(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	ctx := context.Background()

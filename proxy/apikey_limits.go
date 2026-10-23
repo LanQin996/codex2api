@@ -77,42 +77,40 @@ func (h *Handler) payloadRuleIdentity(c *gin.Context) *PayloadRuleIdentity {
 
 // EnforceAPIKeyLimits checks API key scoped model and rate/cost limits.
 func (h *Handler) EnforceAPIKeyLimits(c *gin.Context, model string) (int, string) {
-	return h.enforceAPIKeyLimits(c, model)
+	return h.enforceAPIKeyLimitsChecks(c, model, true)
 }
 
 // EnforceAPIKeyLimitsForRequests performs the normal API-key checks and also
 // verifies that a batched request cannot cross the RPM/RPD boundary by issuing
-// multiple upstream calls after a single admission check. Each upstream call
-// still runs the normal handler checks and records its own usage entry.
+// multiple upstream calls after a single admission check.
+//
+// It deliberately does not reserve the batch here: every generated image is an
+// upstream request that re-enters the standard Images handler and reserves one
+// RPM/RPD slot there. Reserving the batch here as well would charge 2N.
 func (h *Handler) EnforceAPIKeyLimitsForRequests(c *gin.Context, model string, requests int) (int, string) {
-	if status, msg := h.enforceAPIKeyLimits(c, model); status != 0 {
-		return status, msg
-	}
-	if requests <= 1 {
-		return 0, ""
+	if requests < 1 {
+		requests = 1
 	}
 	row := apiKeyRowFromContext(c)
-	if row == nil || row.ID <= 0 {
-		return 0, ""
-	}
-
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
-	defer cancel()
-	if row.Limits.RPM > 0 {
-		count, err := h.apiKeyWindowRequests(ctx, row.ID, "rpm", apiKeyRPMWindow)
-		if err == nil && apiKeyBatchWouldExceed(count, row.Limits.RPM, requests) {
-			return http.StatusTooManyRequests,
-				fmt.Sprintf("API key rate limit exceeded: batch of %d would exceed %d requests per minute", requests, row.Limits.RPM)
+	if row != nil && row.ID > 0 && requests > 1 {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 2*time.Second)
+		defer cancel()
+		if row.Limits.RPM > 0 {
+			count, err := h.apiKeyWindowRequests(ctx, row.ID, "rpm", apiKeyRPMWindow)
+			if err == nil && apiKeyBatchWouldExceed(count, row.Limits.RPM, requests) {
+				return http.StatusTooManyRequests,
+					fmt.Sprintf("API key rate limit exceeded: batch of %d would exceed %d requests per minute", requests, row.Limits.RPM)
+			}
+		}
+		if row.Limits.RPD > 0 {
+			count, err := h.apiKeyWindowRequests(ctx, row.ID, "rpd", apiKeyRPDWindow)
+			if err == nil && apiKeyBatchWouldExceed(count, row.Limits.RPD, requests) {
+				return http.StatusTooManyRequests,
+					fmt.Sprintf("API key rate limit exceeded: batch of %d would exceed %d requests per day", requests, row.Limits.RPD)
+			}
 		}
 	}
-	if row.Limits.RPD > 0 {
-		count, err := h.apiKeyWindowRequests(ctx, row.ID, "rpd", apiKeyRPDWindow)
-		if err == nil && apiKeyBatchWouldExceed(count, row.Limits.RPD, requests) {
-			return http.StatusTooManyRequests,
-				fmt.Sprintf("API key rate limit exceeded: batch of %d would exceed %d requests per day", requests, row.Limits.RPD)
-		}
-	}
-	return 0, ""
+	return h.enforceAPIKeyLimitsChecks(c, model, false)
 }
 
 func apiKeyBatchWouldExceed(current int64, limit, requests int) bool {
@@ -129,6 +127,12 @@ func apiKeyBatchWouldExceed(current int64, limit, requests int) bool {
 //   - http.StatusForbidden (403): 模型不在白名单 / 在黑名单
 //   - http.StatusTooManyRequests (429): rpm/rpd/cost/token 任一窗口超额
 func (h *Handler) enforceAPIKeyLimits(c *gin.Context, model string) (int, string) {
+	return h.enforceAPIKeyLimitsChecks(c, model, true)
+}
+
+// enforceAPIKeyLimitsChecks 执行全部限额检查；reserve 为 false 时跳过进程内
+// RPM/RPD 计数，供批量入队复用（实际执行时由每个上游调用另行预留）。
+func (h *Handler) enforceAPIKeyLimitsChecks(c *gin.Context, model string, reserve bool) (int, string) {
 	var daybreakStatus int
 	var daybreakMessage string
 	model, daybreakStatus, daybreakMessage = h.checkDaybreakRequest(c, model)
@@ -264,6 +268,22 @@ func (h *Handler) enforceAPIKeyLimits(c *gin.Context, model string) (int, string
 		}
 	}
 
+	// 7. 进程内准入计数。数据库聚合 + 60s 缓存读到的是同一份旧值，无法约束
+	// 缓存窗口内的并发突发；这里按实际请求数原子递增后再放行。
+	if reserve {
+		if allowed, reason := h.admissionLimiter().allow(row.ID, limits.RPM, limits.RPD, 1, time.Now()); !allowed {
+			if reason == "capacity" {
+				return http.StatusServiceUnavailable, "API key admission capacity exhausted; retry later"
+			}
+			if reason == "rpd" {
+				return http.StatusTooManyRequests,
+					fmt.Sprintf("API key rate limit exceeded: %d requests per day", limits.RPD)
+			}
+			return http.StatusTooManyRequests,
+				fmt.Sprintf("API key rate limit exceeded: %d requests per minute", limits.RPM)
+		}
+	}
+
 	return 0, ""
 }
 
@@ -331,6 +351,9 @@ func SendAPIKeyLimitError(c *gin.Context, status int, msg string) {
 	}
 	if status == http.StatusBadRequest {
 		errType, errCode = api.ErrorTypeInvalidRequest, api.ErrCodeInvalidParameter
+	}
+	if status == http.StatusServiceUnavailable {
+		errType, errCode = api.ErrorTypeServer, api.ErrCodeServiceUnavailable
 	}
 	api.SendErrorWithStatus(c, api.NewAPIError(errCode, msg, errType), status)
 }

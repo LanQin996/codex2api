@@ -455,6 +455,19 @@ CREATE TABLE usage_logs (
     created_at TIMESTAMP DEFAULT NOW()
 );
 
+-- 用量小时汇总：按 UTC 整点小时 + API Key/渠道/模型/端点/状态码/流式/内部请求聚合 usage_logs。
+-- 写日志的事务里同步累加，清空日志时一并清空；升级前的历史在后台按 id 分块回填。
+-- 用量页、自助用量页的长区间统计读整点小时的汇总，只有首尾零头扫明细。
+CREATE TABLE usage_log_hourly (
+    bucket TIMESTAMPTZ NOT NULL,
+    api_key_id BIGINT, api_key_name TEXT, api_key_masked TEXT, channel TEXT,
+    model TEXT, effective_model TEXT, inbound_endpoint TEXT, endpoint TEXT,
+    status_code INTEGER, stream BOOLEAN, internal INTEGER,
+    requests BIGINT, total_tokens BIGINT, user_billed DOUBLE PRECISION, ...,
+    PRIMARY KEY (bucket, api_key_id, api_key_name, api_key_masked, channel, model,
+                 effective_model, inbound_endpoint, endpoint, status_code, stream, internal)
+);
+
 -- 系统设置表
 CREATE TABLE system_settings (
     id INTEGER PRIMARY KEY DEFAULT 1,
@@ -528,14 +541,14 @@ L1 受 4,096 条、16 MiB 逻辑 JSON 字节和单条 64 KiB 预算限制；大�
 
 #### Responses 上下文缓存
 
-`previous_response_id` 连续请求使用一层每进程独立的有界 L1。完成响应时先按完整 call/output 组保留尾部最多 200 个 raw item，再写入 L1；默认总量 64 MiB、单条准入 8 MiB、最多 2,000 条、绝对 TTL 10 分钟。LRU 同时受条数和逻辑字节预算约束，命中不会延长绝对 TTL。
+`previous_response_id` 连续请求使用一层每进程独立的有界 L1。完成响应时先按完整 call/output 组保留尾部最多 200 个 raw item，再写入 L1；默认总量 64 MiB、单条准入 8 MiB、最多 2,000 条、绝对 TTL 45 分钟。LRU 同时受条数和逻辑字节预算约束，命中不会延长绝对 TTL。
 
 ```text
 完成响应
    │
    ├─ pair-safe 尾部裁剪（最多 200 items）
    │
-   ├─ 本进程 L1（64 MiB total / 8 MiB entry / 2,000 entries / 10m）
+   ├─ 本进程 L1（64 MiB total / 8 MiB entry / 2,000 entries / 45m）
    │
    └─ Redis 共享 response context（仅 Redis 模式）
 
@@ -554,7 +567,7 @@ previous_response_id 连续请求
 
 Memory 模式只有 L1。已知超限/淘汰，或依赖的必需上下文缺失/过期且没有 relay 后备时，Responses/Compact 连续请求可返回 HTTP `409 response_context_unavailable`。Redis 值损坏或超过重建上限且没有 relay 后备时同样返回 409；共享后端传输故障且请求确实依赖该上下文时可返回 HTTP `503`。Redis 中未超过重建上限的上下文不会仅因超过 L1 准入预算而失败。
 
-客户端原生 Responses WebSocket 入口不执行本地 response-cache 查找，保留 `previous_response_id` 交给上游。上述预算和 409/503 语义适用于本地重建的 HTTP Responses/Compact 路径。
+客户端原生 Responses WebSocket 在健康连接上保留 `previous_response_id`，向上游发送当轮增量；原连接丢失后的恢复仍依赖完整的本地或共享快照，受上述预算、完整性和 409/503 错误语义约束。HTTP Responses/Compact 的原生 Codex 路径必须在当前归属内重建父引用；原生 OpenAI Responses relay 可保留父 ID 交给自己的上游恢复。
 
 `GET /api/admin/ops/overview` 的 `response_cache` 从一个锁内快照返回 effective/applied generation、当前/上限/高水位/最大观测条目的逻辑字节，以及本地/远程命中与未命中、过期、条数/字节淘汰、超限旁路、Memory 超限拒绝和最终 409 计数。这里的字节是保留 JSON payload 长度之和，不包含 Go 对象、LRU、allocator 或容器开销，不是 RSS 硬上限。进程内存需要结合 Linux/Docker RSS、Go `HeapAlloc` / `HeapInuse` / `HeapReleased` 和 `NumGC` 判断。
 
@@ -611,6 +624,8 @@ func SanitizeLog(msg string) string {
 | 层级 | 机制 | 说明 |
 |------|------|------|
 | 全局 | RPM 限流 | 基于令牌桶算法 |
+| API Key | RPM/RPD/费用/Token 窗口 | 数据库聚合 + 60 秒统计缓存；RPM/RPD 另有进程内准入计数 |
+| 下游 WS | 连接数 | 每 Key 64 条、全局 4096 条、匿名每 IP 16 条 |
 | 账号 | 并发限制 | 动态调整 |
 | IP | 连接限制 | 防止单 IP 过多连接 |
 | 应用 | 请求大小 | 限制请求体大小 |

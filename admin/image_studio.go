@@ -707,12 +707,23 @@ func (h *Handler) serveImageAssetFile(c *gin.Context, asset *database.ImageAsset
 	if opts.download {
 		disposition = "attachment"
 	}
+	contentType, inlineSafe := safeInlineImageMimeType(asset.MimeType)
+	if !inlineSafe {
+		// 上游或客户端回显的 MIME 不可信；非白名单类型强制下载，避免 text/html、
+		// SVG 等在同源页面里执行脚本。
+		disposition = "attachment"
+	}
 	filename := sanitizeDownloadFilename(asset.Filename)
 	if opts.thumbKB > 0 && !opts.download {
-		data, contentType, err := cachedImageThumbnail(c.Request.Context(), asset, backend, opts.thumbKB)
+		data, thumbType, err := cachedImageThumbnail(c.Request.Context(), asset, backend, opts.thumbKB)
 		if err == nil {
-			c.Header("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, thumbnailFilename(filename)))
-			c.Data(http.StatusOK, contentType, data)
+			thumbDisposition := "inline"
+			thumbContentType, thumbSafe := safeInlineImageMimeType(thumbType)
+			if !thumbSafe {
+				thumbDisposition = "attachment"
+			}
+			c.Header("Content-Disposition", fmt.Sprintf(`%s; filename="%s"`, thumbDisposition, thumbnailFilename(filename)))
+			c.Data(http.StatusOK, thumbContentType, data)
 			return
 		}
 		// Preserve the original endpoint's full-image fallback for formats that
@@ -722,9 +733,7 @@ func (h *Handler) serveImageAssetFile(c *gin.Context, asset *database.ImageAsset
 		}
 	}
 
-	if strings.TrimSpace(asset.MimeType) != "" {
-		c.Header("Content-Type", asset.MimeType)
-	}
+	c.Header("Content-Type", contentType)
 	c.Header("Content-Disposition", fmt.Sprintf(`%s; filename="%s"`, disposition, filename))
 
 	rc, size, err := backend.Open(c.Request.Context(), asset.StoragePath)
@@ -733,10 +742,6 @@ func (h *Handler) serveImageAssetFile(c *gin.Context, asset *database.ImageAsset
 		return
 	}
 	defer rc.Close()
-	contentType := strings.TrimSpace(asset.MimeType)
-	if contentType == "" {
-		contentType = "application/octet-stream"
-	}
 	if size < 0 {
 		// S3 偶尔不带 Content-Length，退化为 chunked。
 		c.Status(http.StatusOK)
@@ -745,6 +750,17 @@ func (h *Handler) serveImageAssetFile(c *gin.Context, asset *database.ImageAsset
 		return
 	}
 	c.DataFromReader(http.StatusOK, size, contentType, rc, nil)
+}
+
+// safeInlineImageMimeType 只放行浏览器按图片渲染的常见类型。
+// 其他值（包括 text/html、image/svg+xml 和空值）返回 application/octet-stream。
+func safeInlineImageMimeType(value string) (string, bool) {
+	mediaType := strings.ToLower(strings.TrimSpace(strings.SplitN(value, ";", 2)[0]))
+	switch mediaType {
+	case "image/png", "image/jpeg", "image/webp", "image/gif":
+		return mediaType, true
+	}
+	return "application/octet-stream", false
 }
 
 func imageAssetPathAllowed(storagePath string) bool {
@@ -1638,6 +1654,13 @@ func normalizeImageStudioModel(model string) string {
 }
 
 func normalizeImageJobUpscale(model, size, upscale string) (string, error) {
+	// Validate explicit physical targets before any network or queue work.
+	// An oversized target must not silently disable the strict-size promise.
+	if strings.Contains(strings.ToLower(size), "x") {
+		if _, _, ok := imageupscale.ParseSize(size); !ok {
+			return "", fmt.Errorf("size must be positive WIDTHxHEIGHT, at most 16384 per side and 40000000 pixels")
+		}
+	}
 	rawUpscale := strings.ToLower(strings.TrimSpace(upscale))
 	// An absent value means "decide from the model and size"; "none" is the
 	// explicit opt-out that suppresses that inference, so a caller can take the
@@ -1713,6 +1736,9 @@ func paginationParams(c *gin.Context, defaultPageSize int) (int, int) {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
 			page = parsed
 		}
+	}
+	if page > maxAdminPage {
+		page = maxAdminPage
 	}
 	pageSize := defaultPageSize
 	if raw := c.Query("page_size"); raw != "" {

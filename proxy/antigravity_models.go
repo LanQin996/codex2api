@@ -53,6 +53,11 @@ var antigravityPublicModelCatalog = []antigravityPublicModelDefinition{
 	{id: "gemini-3.8-flash-low", wireModel: "gemini-3.8-flash-tiered", variants: []antigravityReasoningVariant{{level: "low", wireModel: "gemini-3.8-flash-tiered"}}},
 	{id: "gemini-3.8-flash-medium", wireModel: "gemini-3.8-flash-tiered", variants: []antigravityReasoningVariant{{level: "medium", wireModel: "gemini-3.8-flash-tiered"}}},
 	{id: "gemini-3.8-flash-high", wireModel: "gemini-3.8-flash-tiered", variants: []antigravityReasoningVariant{{level: "high", wireModel: "gemini-3.8-flash-tiered"}}},
+	// Argon exposes named thinking levels on one discovered upstream backing.
+	// The low/medium IDs are gateway choices, not additional upstream models.
+	{id: "gemini-4-argon-low", wireModel: "gemini-4-argon-high", variants: []antigravityReasoningVariant{{level: "low", wireModel: "gemini-4-argon-high"}}},
+	{id: "gemini-4-argon-medium", wireModel: "gemini-4-argon-high", variants: []antigravityReasoningVariant{{level: "medium", wireModel: "gemini-4-argon-high"}}},
+	{id: "gemini-4-argon-high", wireModel: "gemini-4-argon-high", variants: []antigravityReasoningVariant{{level: "high", wireModel: "gemini-4-argon-high"}}},
 	{id: "gemini-3.1-pro-low", wireModel: "gemini-3.1-pro-low", variants: []antigravityReasoningVariant{{level: "low", wireModel: "gemini-3.1-pro-low", thinkingBudget: 1001}}},
 	{id: "gemini-3.1-pro-high", wireModel: "gemini-pro-agent", variants: []antigravityReasoningVariant{{level: "high", wireModel: "gemini-pro-agent", thinkingBudget: 10001}}},
 	// Claude 5.5 encodes effort in the model ID; each tier is its own backing and
@@ -85,6 +90,11 @@ var antigravityLogicalCompatibilityCatalog = []antigravityPublicModelDefinition{
 		{level: "low", wireModel: "gemini-3.8-flash-tiered"},
 		{level: "medium", wireModel: "gemini-3.8-flash-tiered"},
 		{level: "high", wireModel: "gemini-3.8-flash-tiered"},
+	}},
+	{id: "gemini-4-argon", defaultReasoningLevel: "high", variants: []antigravityReasoningVariant{
+		{level: "low", wireModel: "gemini-4-argon-high"},
+		{level: "medium", wireModel: "gemini-4-argon-high"},
+		{level: "high", wireModel: "gemini-4-argon-high"},
 	}},
 	{id: "gemini-3.1-pro", defaultReasoningLevel: "high", variants: []antigravityReasoningVariant{
 		{level: "low", wireModel: "gemini-3.1-pro-low", thinkingBudget: 1001},
@@ -224,6 +234,27 @@ func AntigravityWireModelIDs(model string) []string {
 // fixed-tier downstream model IDs. Multiple public tiers may intentionally use
 // one wire model with different thinking budgets (Gemini 3.7).
 func AntigravityPublishedModelIDs(rawModels []string) []string {
+	return antigravityProjectedModelIDs(rawModels, false)
+}
+
+// AntigravityAdminModelIDs retains disabled catalog placeholders for management
+// display and explicit connection tests without advertising them for dispatch.
+func AntigravityAdminModelIDs(rawModels []string) []string {
+	return antigravityProjectedModelIDs(rawModels, true)
+}
+
+// AntigravityDisabledModel derives availability from the latest provider ID,
+// rather than storing a disabled flag that could outlive a catalog refresh.
+func AntigravityDisabledModel(model string) bool {
+	for _, segment := range strings.FieldsFunc(strings.ToLower(strings.TrimSpace(model)), func(r rune) bool { return r == '-' || r == '_' }) {
+		if segment == "disabled" {
+			return true
+		}
+	}
+	return false
+}
+
+func antigravityProjectedModelIDs(rawModels []string, includeDisabled bool) []string {
 	available := make(map[string]struct{}, len(rawModels))
 	for _, model := range rawModels {
 		name := strings.ToLower(strings.TrimSpace(model))
@@ -255,6 +286,11 @@ func AntigravityPublishedModelIDs(rawModels []string) []string {
 	for _, rawModel := range rawModels {
 		model := strings.TrimSpace(rawModel)
 		name := strings.ToLower(model)
+		// The Argon logical name cannot substitute for its verified backing or
+		// create a duplicate alongside the fixed tiers projected above.
+		if name == "gemini-4-argon" {
+			continue
+		}
 		// Provider-internal chat placeholders, IDE tab completions, and an
 		// alternate physical backing of a known base are not extra chat models.
 		if name == "chat_20706" || name == "chat_23310" || strings.HasPrefix(name, "tab_") || antigravityRetiredModel(name) {
@@ -271,7 +307,9 @@ func AntigravityPublishedModelIDs(rawModels []string) []string {
 		if _, hasLite := available["gemini-3.1-flash-lite"]; hasLite && (name == "gemini-2.5-flash" || name == "gemini-2.5-flash-lite" || name == "gemini-2.5-flash-thinking") {
 			continue
 		}
-		if !antigravityKnownWireModel(model) && antigravityResponsesTextModel(model) {
+		disabledPlaceholder := includeDisabled && AntigravityDisabledModel(model) &&
+			len(model) <= 200 && !strings.ContainsAny(model, "\r\n\t ") && antigravityTextCompatibleModel(model)
+		if !antigravityKnownWireModel(model) && (antigravityResponsesTextModel(model) || disabledPlaceholder) {
 			if _, known := antigravityPublicModel(model); !known && !seenDiscovered[model] {
 				discovered = append(discovered, model)
 				seenDiscovered[model] = true
@@ -339,6 +377,10 @@ func antigravityResolvePublicModelForAccount(account *auth.Account, model string
 // antigravityResponsesTextModel is a transport compatibility guard, not an
 // advertising source. Raw backing IDs remain callable internally.
 func antigravityResponsesTextModel(model string) bool {
+	return !AntigravityDisabledModel(model) && antigravityTextCompatibleModel(model)
+}
+
+func antigravityTextCompatibleModel(model string) bool {
 	name := strings.ToLower(strings.TrimSpace(model))
 	if name == "" {
 		return false

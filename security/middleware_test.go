@@ -231,3 +231,15 @@ func TestGenerateSecureToken(t *testing.T) {
 		t.Errorf("GenerateSecureToken(16) length = %d, expected 32", len(token))
 	}
 }
+
+func TestSanitizeLogKeepsOneEventPerLine(t *testing.T) {
+	got := SanitizeLog("path=/v1/x%0aADMIN_ACCESS ip=203.0.113.9\r\nsource=env")
+	for _, bad := range []string{"\n", "\r"} {
+		if strings.Contains(got, bad) {
+			t.Fatalf("SanitizeLog left %q in %q", bad, got)
+		}
+	}
+	if !strings.Contains(got, "ADMIN_ACCESS") {
+		t.Fatalf("SanitizeLog dropped payload text: %q", got)
+	}
+}

@@ -20,9 +20,12 @@ const ALLOWLIST = new Map([
 
 const BLOCKING_SEVERITIES = new Set(["high", "critical"]);
 
-const result = spawnSync("npm", ["audit", "--omit=dev", "--json"], {
+const npmCommand = process.platform === "win32" ? "npm.cmd" : "npm";
+const result = spawnSync(npmCommand, ["audit", "--omit=dev", "--json"], {
   encoding: "utf8",
   maxBuffer: 32 * 1024 * 1024,
+  // Windows 上 npm 是 .cmd，需要经 cmd.exe 启动。
+  shell: process.platform === "win32",
 });
 
 // npm audit 检出漏洞时退出码非 0,这属正常输出而非执行失败,只有拿不到 stdout 才是真失败。

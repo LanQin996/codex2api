@@ -125,13 +125,33 @@ func RequestBodyDecompressor(maxSize int64) gin.HandlerFunc {
 		if cached, exists := c.Get("raw_body"); exists {
 			body, _ = cached.([]byte)
 		}
+		mem := requestMemoryFromContext(c)
 		if body == nil {
 			if c.Request.Body == nil || c.Request.Body == http.NoBody {
 				c.Next()
 				return
 			}
-			data, err := io.ReadAll(io.LimitReader(c.Request.Body, maxSize+1))
+			var data []byte
+			var err error
+			if IsLargeImportUploadPath(c.Request.URL.Path) {
+				// 导入端点在鉴权前不缓存 body；解压时也必须计入请求内存预算，
+				// 不能让未认证请求用压缩体绕过 BodyCache 的修复。
+				reservation, admitted := TryAcquireRequestMemory(0)
+				if !admitted {
+					rejectRequestMemory(c)
+					return
+				}
+				defer reservation.Release()
+				mem = reservation
+				data, err = readRequestMemoryBounded(c.Request.Body, maxSize, reservation, 0)
+			} else {
+				data, err = io.ReadAll(io.LimitReader(c.Request.Body, maxSize+1))
+			}
 			if err != nil {
+				if errors.Is(err, ErrRequestMemoryBudget) {
+					rejectRequestMemory(c)
+					return
+				}
 				c.JSON(http.StatusBadRequest, gin.H{
 					"error": gin.H{
 						"message": "读取请求体失败",
@@ -152,7 +172,7 @@ func RequestBodyDecompressor(maxSize int64) gin.HandlerFunc {
 		// 多个编码按施加顺序列出，解码逆序进行。
 		for i := len(encodings) - 1; i >= 0; i-- {
 			var err error
-			decoded, err = decodeContentEncodingWithMemory(decoded, encodings[i], maxSize, requestMemoryFromContext(c))
+			decoded, err = decodeContentEncodingWithMemory(decoded, encodings[i], maxSize, mem)
 			if err != nil {
 				if errors.Is(err, ErrRequestMemoryBudget) {
 					rejectRequestMemory(c)

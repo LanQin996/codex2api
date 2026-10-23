@@ -57,6 +57,10 @@ jobs:
         working-directory: frontend
         run: npm run test:svg
 
+      - name: Test intelligence checks in the browser
+        working-directory: frontend
+        run: npm run test:intelligence
+
       - name: Build frontend
         working-directory: frontend
         env:
@@ -122,10 +126,10 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - name: Test PostgreSQL trace, indexes, capabilities and legacy daily usage
+      - name: Test PostgreSQL compatibility and pending-account transactions
         env:
           CODEX2API_TEST_POSTGRES_DSN: postgres://codex2api_test:test-only@localhost:5432/codex2api_test?sslmode=disable
-        run: go test -race -count=1 ./database -run '^TestPostgresTraceAndCapabilities$'
+        run: go test -race -count=1 ./database -run '^(TestPostgresTraceAndCapabilities|TestIntelligenceCheckPostgres|TestPendingAccountTransaction)$'
 
   test-race:
     name: test-race (${{ matrix.name }})

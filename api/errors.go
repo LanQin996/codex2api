@@ -26,6 +26,9 @@ const (
 	ErrCodeMissingField               ErrorCode = "missing_field"
 	ErrCodeInvalidFieldType           ErrorCode = "invalid_field_type"
 	ErrCodeInvalidFieldFormat         ErrorCode = "invalid_field_format"
+	ErrCodeUnsupportedFeature         ErrorCode = "unsupported_feature"
+	ErrCodeInvalidStreamID            ErrorCode = "invalid_stream_id"
+	ErrCodeWebsocketStreamLimit       ErrorCode = "websocket_stream_limit_reached"
 	ErrCodeContextLengthExceeded      ErrorCode = "context_length_exceeded"
 	ErrCodeResponseContextUnavailable ErrorCode = "response_context_unavailable"
 	ErrCodeUnsupportedModel           ErrorCode = "unsupported_model"
@@ -130,7 +133,8 @@ func HTTPStatusCode(code ErrorCode) int {
 	case ErrCodeResponseContextUnavailable:
 		return http.StatusConflict
 	case ErrCodeInvalidRequest, ErrCodeInvalidParameter, ErrCodeMissingField, ErrCodeInvalidFieldType,
-		ErrCodeInvalidFieldFormat, ErrCodeContextLengthExceeded, ErrCodeUnsupportedModel:
+		ErrCodeInvalidFieldFormat, ErrCodeUnsupportedFeature, ErrCodeContextLengthExceeded, ErrCodeUnsupportedModel,
+		ErrCodeInvalidStreamID, ErrCodeWebsocketStreamLimit:
 		return http.StatusBadRequest
 	case ErrCodeServiceUnavailable:
 		return http.StatusServiceUnavailable

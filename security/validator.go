@@ -71,11 +71,16 @@ var (
 		regexp.MustCompile(`(?i)(refresh[_-]?token["']?\s*[:=]\s*["']?)([^"'\s&]+)`),
 		regexp.MustCompile(`(?i)(access[_-]?token["']?\s*[:=]\s*["']?)([^"'\s&]+)`),
 		regexp.MustCompile(`(?i)(id[_-]?token["']?\s*[:=]\s*["']?)([^"'\s&]+)`),
+		regexp.MustCompile(`(?i)(session[_-]?token["']?\s*[:=]\s*["']?)([^"'\s&]+)`),
 		regexp.MustCompile(`(?i)(bearer\s+)([^\s&]+)`),
 		regexp.MustCompile(`(?i)(["']?api[_-]?key["']?\s*[:=]\s*["']?)([^"'\s&]+)`),
+		regexp.MustCompile(`(?i)(["']?client[_-]?secret["']?\s*[:=]\s*["']?)([^"'\s&]+)`),
 		regexp.MustCompile(`(?i)(["']?secret["']?\s*[:=]\s*["']?)([^"'\s&]+)`),
 		regexp.MustCompile(`(?i)(["']?password["']?\s*[:=]\s*["']?)([^"'\s&]+)`),
-		regexp.MustCompile(`(?i)(sk-)([a-zA-Z0-9]{20,})`), // sk- 前缀单独作为组1
+		regexp.MustCompile(`(?i)(["']?agent[_-]?private[_-]?key["']?\s*[:=]\s*["']?)([^"'\s&]+)`),
+		regexp.MustCompile(`(?i)(sk-)([a-zA-Z0-9]{20,})`),                                    // sk- 前缀单独作为组1
+		regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b`), // 裸 JWT
+		regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----`),
 	}
 
 	// UUID pattern for token masking
@@ -196,7 +201,9 @@ func MaskSensitiveData(input string) string {
 	return result
 }
 
-var embeddedURLCredentials = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://)[^\s/@]+@`)
+// On malformed URLs prefer over-redaction: a slash can be part of the intended
+// userinfo, and cannot be treated as a trustworthy authority boundary.
+var embeddedURLCredentials = regexp.MustCompile(`(?i)([a-z][a-z0-9+.-]*://)[^\s]*@`)
 
 // MaskURLCredentials masks userinfo in URLs, including URLs embedded in labels.
 func MaskURLCredentials(input string) string {
@@ -204,12 +211,10 @@ func MaskURLCredentials(input string) string {
 	if err != nil || parsed.Scheme == "" || parsed.Host == "" || parsed.User == nil {
 		return embeddedURLCredentials.ReplaceAllString(input, "${1}redacted@")
 	}
-	username := parsed.User.Username()
-	if _, hasPassword := parsed.User.Password(); hasPassword {
-		parsed.User = url.UserPassword(username, "redacted")
-	} else {
-		parsed.User = url.User(username)
-	}
+	// Redact both username and password: username-only proxy credentials and
+	// malformed userinfo (which may contain further '@' characters) must not
+	// leak either half.
+	parsed.User = url.User("redacted")
 	return parsed.String()
 }
 

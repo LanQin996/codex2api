@@ -292,6 +292,54 @@ func antigravityAccountModelRateLimited(account *auth.Account, model, wireModel 
 	return false
 }
 
+// antigravitySharedWireCooldownKey 报告「把冷却写到公开档位名 model 上」这一动作是否
+// 兼任共享 wire 冷却键的写入。命中时这次写入必须遵守 deadline 单调性（AtLeast 变体），
+// 不能被最后写入者胜出地改短。
+//
+// 两种情形：
+//  1. 账号解析出的 wire 与请求的公开档位同名（wireModel == model）。典型就是 Argon：
+//     gemini-4-argon-low/medium/high 三个公开档位的 backing 都是 gemini-4-argon-high，
+//     而 high 这一档的公开名与 wire 名完全相同，于是「写 public 冷却」与「写共享 wire
+//     冷却」是同一次写入——public 键在这里就是共享键本身。
+//  2. 目录里另有别的公开档位 / 逻辑档位把 model 解析成自己的上游 backing（请求直接
+//     带原始 backing id，或原始 id 与某个公开档位同名）。
+//
+// 两种情形下，一个 5s 的裸 RESOURCE_EXHAUSTED 都可能把兄弟档位刚写入的 290s 共享冷却
+// 改短：短 deadline 一过，同 backing 的兄弟档位又会选中刚被限流的凭据，继续收集 429。
+func antigravitySharedWireCooldownKey(model, wireModel string) bool {
+	trimmed := strings.ToLower(strings.TrimSpace(model))
+	if trimmed == "" {
+		return false
+	}
+	if wireModel != "" && strings.EqualFold(strings.TrimSpace(wireModel), trimmed) {
+		return true
+	}
+	return antigravityModelSharedBySiblings(trimmed)
+}
+
+// antigravityModelSharedBySiblings 报告固定档位目录或逻辑档位目录中是否存在「其它」公开
+// 档位，把 model 解析成自己的上游 backing。model 自身的定义不算：公开档位解析到自己的
+// backing 是常态，只有别的档位也骑上来才构成共享键（公开名与自己同名的情形由调用方的
+// wireModel == model 分支单独覆盖）。
+func antigravityModelSharedBySiblings(model string) bool {
+	for _, catalog := range [][]antigravityPublicModelDefinition{
+		antigravityPublicModelCatalog,
+		antigravityLogicalCompatibilityCatalog,
+	} {
+		for _, definition := range catalog {
+			if strings.EqualFold(definition.id, model) {
+				continue
+			}
+			for _, wire := range AntigravityWireModelIDs(definition.id) {
+				if strings.EqualFold(wire, model) {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // antigravityNonPenalizingUpstreamFailure reports failures that say nothing
 // about the account's health: a model-wide capacity shortage is Google's
 // problem, not this credential's, so ReportRequestFailure must not count it.
@@ -308,11 +356,113 @@ func antigravityNonPenalizingUpstreamFailure(account *auth.Account, statusCode i
 // fall back to the generic relay-style cooldown policy, and a recognised body
 // that carries no hint at all is backed off briefly instead of being charged
 // the full default bench.
+//
+// Live dispatch also feeds the scheduling penalty accumulator through here (see
+// auth.RecordAntigravityRateLimitEvent); admin connectivity probes reuse the
+// same cooldown mapping without that accounting via ApplyAntigravityCooldown.
 func applyAntigravityCooldown(store *auth.Store, account *auth.Account, statusCode int, body []byte, resp *http.Response, model string) codex429Decision {
+	return applyAntigravityCooldownWithPenalty(store, account, statusCode, body, resp, model, true)
+}
+
+// antigravityRateLimitEvent normalises one 429/503 observation into the event
+// shape the fresh-selection penalty understands. parsed is false when the body
+// carried no recognisable google.rpc signal at all.
+func antigravityRateLimitEvent(statusCode int, model, wireModel string, quota antigravityQuotaError, parsed bool, resetAt time.Time) auth.AntigravityRateLimitEvent {
+	event := auth.AntigravityRateLimitEvent{
+		StatusCode:  statusCode,
+		PublicModel: strings.TrimSpace(model),
+		WireModel:   strings.TrimSpace(wireModel),
+		ResetAt:     resetAt,
+		ObservedAt:  time.Now(),
+	}
+	if antigravityIsGeminiModel(event.PublicModel) || antigravityIsGeminiModel(event.WireModel) {
+		event.Family = antigravityGeminiFamilyCooldownKey
+	}
+	if !parsed {
+		// A 429 with no google.rpc detail says nothing about this credential,
+		// so it is charged half a penalty instead of a full one.
+		event.Kind = "unstructured_rate_limit"
+		event.Scope = auth.AGScopeUnknown
+		event.Weight = auth.AntigravityPenaltyWeightUnclassifiedRateLimit
+		return event
+	}
+	event.Kind = string(quota.Kind)
+	switch quota.Kind {
+	case antigravityQuotaKindModelCapacity:
+		// A model-wide shortage is Google's problem; switching accounts cannot
+		// help, so the scheduler must not steer away from this credential.
+		event.Scope = auth.AGScopeSharedCapacity
+		event.Weight = auth.AntigravityPenaltyWeightNone
+	case antigravityQuotaKindQuotaExhausted:
+		// Already covered by the long per-model cooldown plus the Gemini
+		// family cooldown; a short-term penalty would only double-count it.
+		event.Scope = auth.AGScopeAccountQuota
+		event.Weight = auth.AntigravityPenaltyWeightNone
+	default:
+		event.Scope = auth.AGScopeModelRateLimit
+		if quota.Reason != "" || quota.HasRetryDelay {
+			event.Weight = auth.AntigravityPenaltyWeightExplicitRateLimit
+		} else {
+			event.Weight = auth.AntigravityPenaltyWeightUnclassifiedRateLimit
+		}
+	}
+	return event
+}
+
+// applyAntigravityCooldownWithPenalty 是 Antigravity 429/503 冷却落地的共同实现：解析
+// 结构化 google.rpc 信号定出冷却时长（优先尊重 RetryInfo 与 Retry-After 头，无明确提示
+// 时按 Kind 分类默认值处理，裸限流退到短回退；完全解析失败的非结构化 429 走通用 429 策略），
+// 写入公开模型键。对于共享的 wire 键统一只延长、不改短；Gemini family 冷却键仅在
+// QUOTA_EXHAUSTED 且归属 Gemini 模型时写入且同样只延长不改短。recordPenalty 为 false
+// 时只落冷却、不进进程内避险惩罚累加器（admin 连接性探测走这一档）。
+func applyAntigravityCooldownWithPenalty(store *auth.Store, account *auth.Account, statusCode int, body []byte, resp *http.Response, model string, recordPenalty bool) codex429Decision {
 	quota, ok := parseAntigravityQuotaError(statusCode, body)
 	if !ok {
 		if statusCode == http.StatusTooManyRequests {
-			return Apply429Cooldown(store, account, body, resp, model)
+			// wire 解析要在通用 429 策略之前完成：它既决定下面的共享键判定，也决定
+			// 兄弟档位的 wire 补写。
+			wireModel := ""
+			if account != nil {
+				if wire, resolved := antigravityResolvePublicModelForAccount(account, model); resolved {
+					wireModel = strings.TrimSpace(wire)
+				}
+			}
+			// 公开档位名本身就是共享 wire 键时（gemini-4-argon-high），先记住既有 deadline：
+			// 通用 429 策略按「最后写入者胜出」覆盖 public 冷却，会把同账号兄弟档位刚写入的
+			// 长冷却改短。
+			sharedWireKey := store != nil && account != nil && antigravitySharedWireCooldownKey(model, wireModel)
+			var previous auth.ModelCooldown
+			if sharedWireKey {
+				previous, _ = account.ModelCooldownFor(model)
+			}
+			decision := Apply429Cooldown(store, account, body, resp, model)
+			// 非结构化 429（Cloud Code 负载抑制时只回 {"code":429,"status":
+			// "RESOURCE_EXHAUSTED"}）走通用 429 策略，而通用策略只按 public id 落冷却。
+			// 多个公开档位共用一个 wire 模型时，同 wire 的兄弟档位仍会被选中，账号带着
+			// 刚被限流的凭据再次上游。这里补写 wire 冷却；解析不到 wire（非目录模型 /
+			// 账号不具备该 wire）时跳过。wire 是共享冷却键，用 AtLeast 变体写入，避免本次
+			// 更短的 deadline 把同账号上更长的 wire 冷却改短。
+			//
+			// public 兼任共享 wire 键时（wireModel == decision.Model）没有单独的 wire 键可
+			// 补写：通用策略那次覆盖写就是共享键写入，因此这里把被改短的长冷却写回。
+			// 只处理 model 作用域且本次确实写了冷却的情况，账号作用域由账号冷却负责，
+			// 不应在这里被模型冷却复活。
+			if !previous.ResetAt.IsZero() && decision.Scope == rateLimitScopeModel && !decision.ResetAt.IsZero() &&
+				previous.ResetAt.After(decision.ResetAt) && strings.EqualFold(strings.TrimSpace(decision.Model), strings.TrimSpace(model)) {
+				if restored := store.MarkModelCooldownUntilAtLeast(account, decision.Model, previous.Reason, previous.ResetAt); !restored.ResetAt.IsZero() {
+					decision.ResetAt = restored.ResetAt
+					decision.Cooldown = time.Until(restored.ResetAt)
+				}
+			}
+			if store != nil && account != nil && decision.Model != "" && !decision.ResetAt.IsZero() {
+				if wireModel != "" && !strings.EqualFold(wireModel, decision.Model) {
+					store.MarkModelCooldownUntilAtLeast(account, wireModel, decision.Reason, decision.ResetAt)
+				}
+			}
+			if recordPenalty {
+				auth.RecordAntigravityRateLimitEvent(account, antigravityRateLimitEvent(statusCode, decision.Model, wireModel, antigravityQuotaError{}, false, decision.ResetAt))
+			}
+			return decision
 		}
 		return codex429Decision{}
 	}
@@ -362,13 +512,46 @@ func applyAntigravityCooldown(store *auth.Store, account *auth.Account, statusCo
 	if store == nil || account == nil || decision.Model == "" {
 		return decision
 	}
-	marked := store.MarkModelCooldownUntil(account, decision.Model, decision.Reason, resetAt)
+	// wire 解析必须在 public 冷却写入之前完成：公开档位名与 wire 同名时，下面这次
+	// public 写入就是共享 wire 键的唯一一次写入，写入变体要据此选择。
+	wireModel := ""
+	if wire, resolved := antigravityResolvePublicModelForAccount(account, decision.Model); resolved {
+		wireModel = strings.TrimSpace(wire)
+	}
+	// public 冷却默认保持「最后写入者胜出」的既有覆盖语义。唯一例外是 public 名本身
+	// 兼任共享 wire 冷却键（gemini-4-argon-high 既是公开档位，也是 low/medium 的上游
+	// backing）：此时覆盖写会把兄弟档位刚写入的 290s 共享冷却改成 5s，短窗口一过
+	// low/medium 又选中刚被限流的凭据。这类键与 wire、family 一样属于同账号上的共享
+	// 冷却键，必须用 AtLeast 变体，只延长、不改短。
+	sharedWireKey := antigravitySharedWireCooldownKey(decision.Model, wireModel)
+	var marked auth.ModelCooldown
+	if sharedWireKey {
+		marked = store.MarkModelCooldownUntilAtLeast(account, decision.Model, decision.Reason, resetAt)
+	} else {
+		marked = store.MarkModelCooldownUntil(account, decision.Model, decision.Reason, resetAt)
+	}
 	if !marked.ResetAt.IsZero() {
 		decision.ResetAt = marked.ResetAt
 		decision.Cooldown = time.Until(marked.ResetAt)
 	}
+	// Public tiers may share one upstream backing (gemini-3.8-flash-low/medium/
+	// high all ride gemini-3.8-flash-tiered). Cooling only the public id leaves
+	// the sibling tiers selectable on the very account the upstream just
+	// throttled, so the wire id is cooled with the same deadline.
+	//
+	// wire 与 family 都是同账号上的共享冷却键，会被多个公开档位的事件并发写入，因此
+	// 用 AtLeast 变体：high 的 290s RATE_LIMIT_EXCEEDED 之后，同账号 low 的 5s 裸
+	// RESOURCE_EXHAUSTED 只能延长、不能把共享 deadline 改短，否则短窗口一过兄弟档位
+	// 又会选中刚被限流的凭据。public 与 wire 同名时没有第二个键可写，单调性由上面的
+	// sharedWireKey 分支保证。
+	if wireModel != "" && !strings.EqualFold(wireModel, decision.Model) {
+		store.MarkModelCooldownUntilAtLeast(account, wireModel, decision.Reason, decision.ResetAt)
+	}
 	if quota.Kind == antigravityQuotaKindQuotaExhausted && (antigravityIsGeminiModel(decision.Model) || antigravityIsGeminiModel(quota.Model)) {
-		store.MarkModelCooldownUntil(account, antigravityGeminiFamilyCooldownKey, decision.Reason, resetAt)
+		store.MarkModelCooldownUntilAtLeast(account, antigravityGeminiFamilyCooldownKey, decision.Reason, decision.ResetAt)
+	}
+	if recordPenalty {
+		auth.RecordAntigravityRateLimitEvent(account, antigravityRateLimitEvent(statusCode, decision.Model, wireModel, quota, true, decision.ResetAt))
 	}
 	return decision
 }
@@ -378,10 +561,15 @@ func applyAntigravityCooldown(store *auth.Store, account *auth.Account, statusCo
 // sized from Google's structured retry hint, with the generic 429 policy as
 // fallback. It reports whether a cooldown was actually recorded so callers can
 // classify the failure as rate limiting instead of a broken account.
+//
+// A connectivity probe is not user traffic: it keeps the cooldown write but
+// stays out of the live scheduling penalty accumulator, otherwise one manual
+// test button would bias fresh selection away from an otherwise healthy
+// account.
 func ApplyAntigravityCooldown(store *auth.Store, account *auth.Account, statusCode int, body []byte, resp *http.Response, model string) bool {
 	if statusCode != http.StatusTooManyRequests && statusCode != http.StatusServiceUnavailable {
 		return false
 	}
-	decision := applyAntigravityCooldown(store, account, statusCode, body, resp, model)
+	decision := applyAntigravityCooldownWithPenalty(store, account, statusCode, body, resp, model, false)
 	return !decision.ResetAt.IsZero()
 }

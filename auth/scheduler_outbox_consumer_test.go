@@ -206,14 +206,14 @@ func TestApplyPersistentAccountSnapshotPreservesRuntimeState(t *testing.T) {
 	store := newIndexedRoutingTestStore(nil)
 	dst := newFastSchedulerTestAccount(1, HealthTierWarm, 100, 1)
 	dst.usageObservedAt = time.Now()
-	atomic.StoreInt64(&dst.ActiveRequests, 3)
+	dst.ActiveRequests.Store(3)
 	dst.SuccessStreak = 5
 	src := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 1)
 	src.CredentialGeneration = dst.CredentialGeneration
 
 	store.applyPersistentAccountSnapshot(dst, src, true)
-	if atomic.LoadInt64(&dst.ActiveRequests) != 3 || dst.SuccessStreak != 5 {
-		t.Fatalf("runtime state clobbered: active=%d streak=%d", atomic.LoadInt64(&dst.ActiveRequests), dst.SuccessStreak)
+	if dst.ActiveRequests.Load() != 3 || dst.SuccessStreak != 5 {
+		t.Fatalf("runtime state clobbered: active=%d streak=%d", dst.ActiveRequests.Load(), dst.SuccessStreak)
 	}
 	if dst.usageObservedAt.IsZero() {
 		t.Fatal("persistent snapshot should not erase a newer runtime observation timestamp")
@@ -225,6 +225,52 @@ func TestApplyPersistentAccountSnapshotPreservesRuntimeState(t *testing.T) {
 	store.applyPersistentAccountSnapshot(dst, rotated, true)
 	if dst.SuccessStreak != 0 {
 		t.Fatalf("identity change should reset streaks, got %d", dst.SuccessStreak)
+	}
+}
+
+func TestApplyPersistentAccountSnapshotKeepsNewerRuntimeUsage(t *testing.T) {
+	store := newIndexedRoutingTestStore(nil)
+	now := time.Now().Add(-time.Minute)
+	dst := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 1)
+	dst.UsagePercent5h = 90
+	dst.UsagePercent5hValid = true
+	dst.Reset5hAt = now.Add(time.Hour)
+	dst.UsageUpdatedAt5h = now
+	dst.UsagePercent7d = 80
+	dst.UsagePercent7dValid = true
+	dst.Reset7dAt = now.Add(24 * time.Hour)
+	dst.UsageUpdatedAt = now
+
+	older := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 1)
+	older.CredentialGeneration = dst.CredentialGeneration
+	older.UsagePercent5h = 10
+	older.UsagePercent5hValid = true
+	older.Reset5hAt = now.Add(-time.Hour)
+	older.UsageUpdatedAt5h = now.Add(-time.Minute)
+	older.UsagePercent7d = 20
+	older.UsagePercent7dValid = true
+	older.Reset7dAt = now.Add(-time.Hour)
+	older.UsageUpdatedAt = now.Add(-time.Minute)
+
+	store.applyPersistentAccountSnapshot(dst, older, true)
+	if dst.UsagePercent5h != 90 || dst.UsagePercent7d != 80 {
+		t.Fatalf("older outbox row rolled usage back: 5h=%v 7d=%v", dst.UsagePercent5h, dst.UsagePercent7d)
+	}
+
+	newer := newFastSchedulerTestAccount(1, HealthTierHealthy, 100, 1)
+	newer.CredentialGeneration = dst.CredentialGeneration
+	newer.UsagePercent5h = 95
+	newer.UsagePercent5hValid = true
+	newer.Reset5hAt = now.Add(2 * time.Hour)
+	newer.UsageUpdatedAt5h = now.Add(time.Minute)
+	newer.UsagePercent7d = 85
+	newer.UsagePercent7dValid = true
+	newer.Reset7dAt = now.Add(48 * time.Hour)
+	newer.UsageUpdatedAt = now.Add(time.Minute)
+
+	store.applyPersistentAccountSnapshot(dst, newer, true)
+	if dst.UsagePercent5h != 95 || dst.UsagePercent7d != 85 {
+		t.Fatalf("newer outbox row was ignored: 5h=%v 7d=%v", dst.UsagePercent5h, dst.UsagePercent7d)
 	}
 }
 

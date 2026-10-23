@@ -200,6 +200,7 @@ func ExecuteClaudeMessagesRequestWithPolicy(ctx context.Context, account *auth.A
 	if proxyOverride != "" {
 		proxyURL = proxyOverride
 	}
+	proxyURL = requestProxyURL(ctx, proxyURL)
 	if accessToken == "" {
 		return nil, ErrNoAvailableAccount()
 	}
@@ -241,7 +242,7 @@ func ExecuteClaudeMessagesRequestWithPolicy(ctx context.Context, account *auth.A
 	}
 	stream := gjson.GetBytes(body, "stream").Bool()
 
-	client := getPooledClient(account, proxyURL)
+	client := getRequestClient(ctx, account, proxyURL)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, claudeMessagesEndpoint, bytes.NewReader(body))
 	if err != nil {
 		return nil, ErrInternalError("创建 Claude 请求失败", err)
@@ -267,7 +268,7 @@ func ExecuteClaudeMessagesRequestWithPolicy(ctx context.Context, account *auth.A
 	resp, err := doTracedUpstreamRequest(client, req, account, proxyURL)
 	if err != nil {
 		if shouldRecyclePooledClient(err) {
-			recyclePooledClient(account, proxyURL)
+			recycleRequestClient(ctx, account, proxyURL)
 		}
 		return nil, ErrUpstream(0, "请求 Anthropic Messages API 失败", err)
 	}
@@ -313,7 +314,7 @@ func claudeUpstreamSessionID(raw string) string {
 	return DeriveStableSessionUUIDv7("codex2api:claude-session:" + raw)
 }
 
-// resolveClaudeRequestSessionIdentity 仅在 Claude 原生路径识别 CLI 身份：
+// resolveClaudeRequestSessionIdentity 在 Claude 原生与 Messages 映射路径识别 CLI 身份：
 // 专用会话头 > 结构化 user_id.session_id > 既有通用会话来源。
 // 仍交给既有解析器处理本地 affinity，并由 handler 按 API Key 隔离上游身份。
 func resolveClaudeRequestSessionIdentity(headers http.Header, body []byte) requestSessionIdentity {

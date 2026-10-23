@@ -7,6 +7,7 @@ import (
 	"io"
 	"strings"
 
+	"github.com/codex2api/proxy/internal/jsonbody"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -43,7 +44,7 @@ func appendCompactionTriggerToResponsesBody(body []byte) []byte {
 // it repairs the order only when the client already supplied a trigger.
 func normalizeCompactionTriggerFinal(body []byte, addIfMissing bool) []byte {
 	trigger := json.RawMessage(`{"type":"compaction_trigger"}`)
-	input := gjson.GetBytes(body, "input")
+	input := jsonbody.GetView(body, "input")
 	switch {
 	case input.IsArray():
 		items := input.Array()

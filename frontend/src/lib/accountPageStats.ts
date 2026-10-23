@@ -25,5 +25,9 @@ export function mergeAccountPageStats<T extends AccountPageStatsItem>(
   if (stats.official_usage_synced != null) {
     merged.official_usage_synced = stats.official_usage_synced
   }
-  return merged
+  // Live usage polling must keep unchanged row identities for memoized rows.
+  const keys = Object.keys(merged) as (keyof T)[]
+  return keys.every((key) => (merged[key] ?? undefined) === (account[key] ?? undefined))
+    ? account
+    : merged
 }

@@ -114,7 +114,7 @@ func (a *Account) DaybreakAliases() []string {
 
 // Daybreak 目录只检查持久禁用状态，暂时无额度仍保留模型名称。
 func (a *Account) DaybreakCatalogEligible() bool {
-	if a == nil || atomic.LoadInt32(&a.Disabled) != 0 || atomic.LoadInt32(&a.DispatchPaused) != 0 {
+	if a == nil || atomic.LoadInt32(&a.Disabled) != 0 || (atomic.LoadInt32(&a.DispatchPaused) != 0 || atomic.LoadInt32(&a.IntelligencePaused) != 0) {
 		return false
 	}
 	if len(a.DaybreakAliases()) == 0 {

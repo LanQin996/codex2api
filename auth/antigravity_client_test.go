@@ -804,6 +804,151 @@ func TestAntigravityClientKeepsPreservedProjectWithoutOnboarding(t *testing.T) {
 	}
 }
 
+// enterpriseOnboardServer emulates a Workspace / Gemini Code Assist Standard
+// account: standard-tier is the default, Google never provisions a project,
+// and onboardUser finishes without one.
+func enterpriseOnboardServer(t *testing.T, loadBody string, loadRequests, onboardRequests *[]map[string]any) *httptest.Server {
+	t.Helper()
+	var mu sync.Mutex
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		switch r.URL.Path {
+		case "/userinfo":
+			_, _ = io.WriteString(w, `{"id":"google-subject","email":"dev@corp.example","verified_email":true}`)
+		case "/load":
+			mu.Lock()
+			*loadRequests = append(*loadRequests, body)
+			mu.Unlock()
+			_, _ = io.WriteString(w, loadBody)
+		case "/onboard":
+			mu.Lock()
+			*onboardRequests = append(*onboardRequests, body)
+			mu.Unlock()
+			_, _ = io.WriteString(w, `{"name":"operations/1","done":true,"response":{}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+}
+
+const enterpriseLoadBody = `{"allowedTiers":[{"id":"standard-tier","name":"Gemini Code Assist Standard","isDefault":true,"userDefinedCloudaicompanionProject":true}]}`
+
+func newEnterpriseTestClient(server *httptest.Server) *AntigravityClient {
+	client := newAntigravityClient(server.Client(), AntigravityEndpoints{
+		UserInfoURL: server.URL + "/userinfo",
+		LoadProject: []string{server.URL + "/load"},
+		OnboardUser: []string{server.URL + "/onboard"},
+	})
+	client.sleep = func(context.Context, time.Duration) error { return nil }
+	return client
+}
+
+func TestAntigravityClientEnterpriseOnboardWithoutUserProjectExplainsFix(t *testing.T) {
+	var loads, onboards []map[string]any
+	server := enterpriseOnboardServer(t, enterpriseLoadBody, &loads, &onboards)
+	defer server.Close()
+
+	credential := AntigravityCredential{AccessToken: "access-token"}
+	_, entitlements, entitlementErr, err := newEnterpriseTestClient(server).fetchIdentityContext(context.Background(), &credential, false)
+	if err != nil {
+		t.Fatalf("fetchIdentityContext() error: %v", err)
+	}
+	if entitlementErr == nil || !strings.Contains(entitlementErr.Error(), `tier "standard-tier" requires a caller-owned Google Cloud project`) ||
+		!strings.Contains(entitlementErr.Error(), "GCP project ID") {
+		t.Fatalf("entitlement error = %v, want an actionable GCP project hint", entitlementErr)
+	}
+	if entitlements.ProjectID != "" {
+		t.Fatalf("project = %q, want empty", entitlements.ProjectID)
+	}
+	if len(onboards) == 0 {
+		t.Fatal("onboardUser was not attempted")
+	}
+	if _, ok := onboards[0]["cloudaicompanionProject"]; ok {
+		t.Fatalf("onboard body = %#v, must not invent a project", onboards[0])
+	}
+}
+
+func TestAntigravityClientEnterpriseOnboardUsesUserProject(t *testing.T) {
+	var loads, onboards []map[string]any
+	server := enterpriseOnboardServer(t, enterpriseLoadBody, &loads, &onboards)
+	defer server.Close()
+
+	credential := AntigravityCredential{AccessToken: "access-token", UserProjectID: "corp-gca-project"}
+	_, entitlements, entitlementErr, err := newEnterpriseTestClient(server).fetchIdentityContext(context.Background(), &credential, false)
+	if err != nil || entitlementErr != nil {
+		t.Fatalf("errors: %v / %v", err, entitlementErr)
+	}
+	if entitlements.ProjectID != "corp-gca-project" || credential.ProjectID != "corp-gca-project" {
+		t.Fatalf("project = %q / %q, want the user project", entitlements.ProjectID, credential.ProjectID)
+	}
+	if len(loads) != 1 || loads[0]["cloudaicompanionProject"] != "corp-gca-project" {
+		t.Fatalf("loadCodeAssist body = %#v, want the user project", loads)
+	}
+	if metadata, _ := loads[0]["metadata"].(map[string]any); metadata["duetProject"] != "corp-gca-project" {
+		t.Fatalf("loadCodeAssist metadata = %#v, want duetProject", loads[0]["metadata"])
+	}
+	if len(onboards) != 1 || onboards[0]["tierId"] != "standard-tier" || onboards[0]["cloudaicompanionProject"] != "corp-gca-project" {
+		t.Fatalf("onboard body = %#v, want standard-tier with the user project", onboards)
+	}
+	if !entitlements.AllowedTiers[0].UserDefinedProject {
+		t.Fatalf("userDefinedCloudaicompanionProject was not parsed: %+v", entitlements.AllowedTiers)
+	}
+}
+
+func TestAntigravityClientOnboardedEnterpriseSkipsOnboardWithUserProject(t *testing.T) {
+	var loads, onboards []map[string]any
+	server := enterpriseOnboardServer(t, `{"currentTier":{"id":"standard-tier","userDefinedCloudaicompanionProject":true}}`, &loads, &onboards)
+	defer server.Close()
+
+	credential := AntigravityCredential{AccessToken: "access-token", UserProjectID: "corp-gca-project"}
+	_, entitlements, entitlementErr, err := newEnterpriseTestClient(server).fetchIdentityContext(context.Background(), &credential, false)
+	if err != nil || entitlementErr != nil {
+		t.Fatalf("errors: %v / %v", err, entitlementErr)
+	}
+	if entitlements.ProjectID != "corp-gca-project" || len(onboards) != 0 {
+		t.Fatalf("project = %q, onboard calls = %d; an onboarded tier must use the user project directly", entitlements.ProjectID, len(onboards))
+	}
+}
+
+func TestAntigravityClientFreeTierOnboardNeverSendsUserProject(t *testing.T) {
+	var loads, onboards []map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		switch r.URL.Path {
+		case "/userinfo":
+			_, _ = io.WriteString(w, `{"id":"google-subject","email":"fresh@example.com","verified_email":true}`)
+		case "/load":
+			loads = append(loads, body)
+			_, _ = io.WriteString(w, `{"allowedTiers":[{"id":"free-tier","isDefault":true}]}`)
+		case "/onboard":
+			onboards = append(onboards, body)
+			_, _ = io.WriteString(w, `{"done":true,"response":{"cloudaicompanionProject":{"id":"managed-project"}}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	credential := AntigravityCredential{AccessToken: "access-token", UserProjectID: "my-project"}
+	_, entitlements, entitlementErr, err := newEnterpriseTestClient(server).fetchIdentityContext(context.Background(), &credential, false)
+	if err != nil || entitlementErr != nil {
+		t.Fatalf("errors: %v / %v", err, entitlementErr)
+	}
+	if entitlements.ProjectID != "managed-project" {
+		t.Fatalf("project = %q, want the Google-managed project", entitlements.ProjectID)
+	}
+	if len(onboards) != 1 {
+		t.Fatalf("onboard calls = %d, want 1", len(onboards))
+	}
+	if _, ok := onboards[0]["cloudaicompanionProject"]; ok {
+		t.Fatalf("free-tier onboard body = %#v; naming a project fails with FAILED_PRECONDITION", onboards[0])
+	}
+}
+
 func TestAntigravityAICreditsMissingAmountIsZeroBalance(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, `{"paidTier":{"id":"g1-pro-tier","availableCredits":[{"creditType":"GOOGLE_ONE_AI","minimumCreditAmountForUsage":"50"}]}}`)

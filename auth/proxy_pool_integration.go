@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/codex2api/database"
+	"github.com/codex2api/security"
 )
 
 // EnhancedProxyPool 增强的代理池管理器
@@ -54,16 +55,16 @@ func (e *EnhancedProxyPool) Init(ctx context.Context) error {
 
 	// 设置回调
 	e.pool.SetOnIsolation(func(entry *ProxyEntry) {
-		log.Printf("[ProxyPool] 代理被隔离: %s (连续失败 %d 次)", entry.URL, entry.ConsecutiveFailures)
+		log.Printf("[ProxyPool] 代理被隔离: %s (连续失败 %d 次)", security.MaskURLCredentials(entry.URL), entry.ConsecutiveFailures)
 	})
 
 	e.pool.SetOnRecovery(func(entry *ProxyEntry) {
-		log.Printf("[ProxyPool] 代理已恢复: %s", entry.URL)
+		log.Printf("[ProxyPool] 代理已恢复: %s", security.MaskURLCredentials(entry.URL))
 	})
 
 	e.pool.SetOnHealthCheck(func(result *HealthCheckResult) {
 		if !result.Healthy && result.Error != nil {
-			log.Printf("[ProxyPool] 代理健康检查失败: %s, error: %v", result.URL, result.Error)
+			log.Printf("[ProxyPool] 代理健康检查失败: %s, error: %v", security.MaskURLCredentials(result.URL), result.Error)
 		}
 	})
 
@@ -169,7 +170,7 @@ func (e *EnhancedProxyPool) ReloadFromDB(ctx context.Context) error {
 				}
 			}
 			e.pool.AddProxy(p.URL, weight)
-			log.Printf("[ProxyPool] 新增代理: %s", p.URL)
+			log.Printf("[ProxyPool] 新增代理: %s", security.MaskURLCredentials(p.URL))
 		}
 	}
 
@@ -181,7 +182,7 @@ func (e *EnhancedProxyPool) ReloadFromDB(ctx context.Context) error {
 	for _, url := range currentProxies {
 		if !newMap[url] {
 			e.pool.RemoveProxy(url)
-			log.Printf("[ProxyPool] 移除代理: %s", url)
+			log.Printf("[ProxyPool] 移除代理: %s", security.MaskURLCredentials(url))
 		}
 	}
 

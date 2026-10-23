@@ -16,7 +16,8 @@ test('fresh costs and usage replace populated row snapshots, including zero', ()
   assert.deepEqual(mergeAccountPageStats(account, stats), { ...account, ...stats })
   assert.equal(account.billed_7d, 7.11, 'do not mutate the stored list/detail row')
   assert.equal(mergeAccountPageStats(account), account)
-  assert.deepEqual(mergeAccountPageStats(account, {}), account, 'missing fields are not zeroes')
+  assert.equal(mergeAccountPageStats(account, {}), account, 'missing fields preserve row identity')
+  assert.equal(mergeAccountPageStats(account, { billed_5h: 7.11, usage_5h_detail: oldUsage }), account, 'unchanged snapshots preserve row identity')
 })
 
 test('gateway polling preserves official settlement semantics', () => {

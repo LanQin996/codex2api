@@ -2,6 +2,8 @@ package admin
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -177,6 +179,31 @@ func TestUpsertSelfServiceAccountPendingAndNotScheduled(t *testing.T) {
 	// 重复提交 → errDuplicateOAuthIdentity
 	if _, err := handler.upsertSelfServiceAccount(ctx, "provider@example.com", "", seed, "contact2@x.com"); err != errDuplicateOAuthIdentity {
 		t.Fatalf("重复提交应返回 errDuplicateOAuthIdentity, got %v", err)
+	}
+}
+
+func TestSelfServiceFailedInsertAllowsRetry(t *testing.T) {
+	handler, db := newSelfServiceHandler(t, true)
+	ctx := context.Background()
+	seed := tokenCredentialSeed{
+		refreshToken: "rt-rb",
+		accessToken:  "at-rb",
+		email:        "rollback@example.com",
+		accountID:    "acct-rb",
+		workspaceID:  "workspace-rb",
+	}
+
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if id, err := handler.upsertSelfServiceAccount(canceled, "rollback@example.com", "", seed, "c@x.com"); err == nil || id != 0 {
+		t.Fatalf("canceled submission = (%d, %v), want no inserted account", id, err)
+	}
+	if id, err := db.FindActiveAccountByOAuthIdentity(ctx, seed.email, seed.workspaceID); !errors.Is(err, sql.ErrNoRows) || id != 0 {
+		t.Fatalf("failed submission left a duplicate identity: id=%d err=%v", id, err)
+	}
+
+	if _, err := handler.upsertSelfServiceAccount(ctx, "rollback@example.com", "", seed, "c@x.com"); err != nil {
+		t.Fatalf("回滚后同一身份应可重新提交, got %v", err)
 	}
 }
 

@@ -127,9 +127,10 @@ type antigravityTierPayload struct {
 	Slug      string `json:"slug"`
 	// Cloud Code emits camelCase (isDefault); the snake_case alias is kept so
 	// stored snapshots and any proto-JSON variant still parse.
-	IsDefault        bool `json:"isDefault"`
-	IsDefaultSnake   bool `json:"is_default"`
-	AvailableCredits []struct {
+	IsDefault                          bool `json:"isDefault"`
+	IsDefaultSnake                     bool `json:"is_default"`
+	UserDefinedCloudaicompanionProject bool `json:"userDefinedCloudaicompanionProject"`
+	AvailableCredits                   []struct {
 		CreditAmount any `json:"creditAmount"`
 	} `json:"availableCredits"`
 }
@@ -647,7 +648,13 @@ func (c *AntigravityClient) fetchIdentityContext(ctx context.Context, credential
 	if preserveProject {
 		projectID = strings.TrimSpace(credential.ProjectID)
 	}
-	entitlements, entitlementErr := c.fetchEntitlements(ctx, credential.AccessToken)
+	userProjectID := strings.TrimSpace(credential.UserProjectID)
+	entitlements, entitlementErr := c.fetchEntitlements(ctx, credential.AccessToken, userProjectID)
+	if entitlementErr == nil && entitlements.ProjectID == "" && entitlements.CurrentTier != nil && userProjectID != "" {
+		// Already onboarded to a tier that runs against a caller-owned project:
+		// loadCodeAssist never echoes that project back.
+		entitlements.ProjectID = userProjectID
+	}
 	if entitlements.ProjectID == "" {
 		entitlements.ProjectID = projectID
 	}
@@ -655,7 +662,7 @@ func (c *AntigravityClient) fetchIdentityContext(ctx context.Context, credential
 		// loadCodeAssist succeeded but the account has no companion project
 		// yet. Provision one the way the native client does; otherwise the
 		// account is stored healthy but is never dispatchable.
-		onboarded, onboardErr := c.onboardProject(ctx, credential.AccessToken, entitlements)
+		onboarded, onboardErr := c.onboardProject(ctx, credential.AccessToken, entitlements, userProjectID)
 		if onboardErr != nil {
 			entitlementErr = fmt.Errorf("Antigravity project provisioning (onboardUser) failed: %w", onboardErr)
 		} else {
@@ -680,19 +687,43 @@ func antigravityOnboardTierID(entitlements AntigravityEntitlements) string {
 	return antigravityOnboardDefaultTier
 }
 
+// antigravityProjectRequiredError explains why onboardUser finished without a
+// project: only the free/consumer tiers get a Google-managed project.
+func antigravityProjectRequiredError(tierID string, entitlements AntigravityEntitlements) error {
+	userDefined := false
+	for _, tier := range entitlements.AllowedTiers {
+		if tier.ID == tierID && tier.UserDefinedProject {
+			userDefined = true
+		}
+	}
+	if entitlements.CurrentTier != nil && entitlements.CurrentTier.UserDefinedProject {
+		userDefined = true
+	}
+	reason := "onboardUser completed without a project id"
+	if userDefined {
+		reason = fmt.Sprintf("tier %q requires a caller-owned Google Cloud project", tierID)
+	}
+	return fmt.Errorf("%s; Workspace / enterprise accounts (Gemini Code Assist Standard or Enterprise) are not given a managed project, set the GCP project ID on this account and sync again", reason)
+}
+
 // onboardProject calls v1internal:onboardUser and polls the returned
 // long-running operation until it reports done with a project id.
-func (c *AntigravityClient) onboardProject(ctx context.Context, accessToken string, entitlements AntigravityEntitlements) (string, error) {
+func (c *AntigravityClient) onboardProject(ctx context.Context, accessToken string, entitlements AntigravityEntitlements, userProjectID string) (string, error) {
 	if len(c.endpoints.OnboardUser) == 0 {
 		return "", errors.New("no onboardUser endpoint configured")
 	}
-	payload := map[string]any{
-		"tierId": antigravityOnboardTierID(entitlements),
-		"metadata": map[string]any{
-			"ideType":    "ANTIGRAVITY",
-			"platform":   "PLATFORM_UNSPECIFIED",
-			"pluginType": "GEMINI",
-		},
+	tierID := antigravityOnboardTierID(entitlements)
+	metadata := map[string]any{
+		"ideType":    "ANTIGRAVITY",
+		"platform":   "PLATFORM_UNSPECIFIED",
+		"pluginType": "GEMINI",
+	}
+	payload := map[string]any{"tierId": tierID, "metadata": metadata}
+	// The free tier runs on a Google-managed project; naming a project there
+	// makes onboardUser fail with FAILED_PRECONDITION.
+	if userProjectID != "" && tierID != antigravityOnboardDefaultTier {
+		payload["cloudaicompanionProject"] = userProjectID
+		metadata["duetProject"] = userProjectID
 	}
 	var lastErr error
 	for _, endpoint := range c.endpoints.OnboardUser {
@@ -722,7 +753,10 @@ func (c *AntigravityClient) onboardProject(ctx context.Context, accessToken stri
 				lastErr = errors.New("onboardUser operation is still pending")
 				continue
 			}
-			lastErr = errors.New("onboardUser completed without a project id")
+			if userProjectID != "" {
+				return userProjectID, nil
+			}
+			lastErr = antigravityProjectRequiredError(tierID, entitlements)
 			break
 		}
 	}
@@ -874,11 +908,17 @@ func (c *AntigravityClient) fetchProfile(ctx context.Context, accessToken string
 	return profile, nil
 }
 
-func (c *AntigravityClient) fetchEntitlements(ctx context.Context, accessToken string) (AntigravityEntitlements, error) {
+func (c *AntigravityClient) fetchEntitlements(ctx context.Context, accessToken, userProjectID string) (AntigravityEntitlements, error) {
+	metadata := map[string]any{"ideType": "ANTIGRAVITY"}
+	request := map[string]any{"metadata": metadata}
+	if userProjectID != "" {
+		request["cloudaicompanionProject"] = userProjectID
+		metadata["duetProject"] = userProjectID
+	}
 	var lastErr error
 	for _, endpoint := range c.endpoints.LoadProject {
 		var payload antigravityLoadProjectResponse
-		status, err := c.postJSON(ctx, endpoint, accessToken, map[string]any{"metadata": map[string]any{"ideType": "ANTIGRAVITY"}}, &payload)
+		status, err := c.postJSON(ctx, endpoint, accessToken, request, &payload)
 		if err == nil {
 			return normalizeAntigravityEntitlements(payload, c.now()), nil
 		}
@@ -933,6 +973,7 @@ func convertAntigravityTier(tier *antigravityTierPayload) *AntigravityTier {
 	return &AntigravityTier{
 		ID: strings.TrimSpace(tier.ID), Name: strings.TrimSpace(tier.Name),
 		QuotaTier: strings.TrimSpace(tier.QuotaTier), Slug: strings.TrimSpace(tier.Slug), IsDefault: tier.isDefaultTier(),
+		UserDefinedProject: tier.UserDefinedCloudaicompanionProject,
 	}
 }
 

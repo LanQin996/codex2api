@@ -28,7 +28,17 @@ func newReadPumpTestConnection(t *testing.T, serve func(*websocket.Conn)) (*Mana
 	return newReadPumpTestConnectionWithUpgrader(t, websocket.Upgrader{}, serve)
 }
 
+func newReadPumpTestConnectionWithAccount(t *testing.T, serve func(*websocket.Conn), account *auth.Account) (*Manager, *WsConnection) {
+	t.Helper()
+	return newReadPumpTestConnectionWithUpgraderAndAccount(t, websocket.Upgrader{}, serve, account)
+}
+
 func newReadPumpTestConnectionWithUpgrader(t *testing.T, upgrader websocket.Upgrader, serve func(*websocket.Conn)) (*Manager, *WsConnection) {
+	t.Helper()
+	return newReadPumpTestConnectionWithUpgraderAndAccount(t, upgrader, serve, nil)
+}
+
+func newReadPumpTestConnectionWithUpgraderAndAccount(t *testing.T, upgrader websocket.Upgrader, serve func(*websocket.Conn), account *auth.Account) (*Manager, *WsConnection) {
 	t.Helper()
 
 	ready := make(chan struct{})
@@ -56,6 +66,7 @@ func newReadPumpTestConnectionWithUpgrader(t *testing.T, upgrader websocket.Upgr
 	session := NewSession(1, manager)
 	session.SetConnected(true)
 	wc := NewWsConnection(conn, session, wsURL)
+	wc.account = account
 	wc.PoolKey = key
 	wc.onReadFailure = manager.DiscardConnection
 	wc.installControlHandlers()
@@ -1362,6 +1373,51 @@ func TestReadPumpDropsIdleMetadataFrame(t *testing.T) {
 				t.Fatalf("BeginReadLease after idle metadata frame: %v", err)
 			}
 		})
+	}
+}
+
+func TestReadPumpNotifiesIdleMetadataObserver(t *testing.T) {
+	got := make(chan struct {
+		accountID int64
+		eventType string
+		payload   string
+	}, 1)
+	SetIdleMetadataObserver(func(account *auth.Account, eventType string, payload []byte) {
+		var accountID int64
+		if account != nil {
+			accountID = account.DBID
+		}
+		got <- struct {
+			accountID int64
+			eventType string
+			payload   string
+		}{accountID: accountID, eventType: eventType, payload: string(payload)}
+	})
+	t.Cleanup(func() { SetIdleMetadataObserver(nil) })
+
+	holdOpen := make(chan struct{})
+	t.Cleanup(func() { close(holdOpen) })
+	newReadPumpTestConnectionWithAccount(t, func(conn *websocket.Conn) {
+		if err := conn.WriteMessage(websocket.TextMessage, []byte(`{"type":"codex.rate_limits","rate_limits":{"primary":{"used_percent":42}}}`)); err != nil {
+			t.Errorf("write idle metadata frame: %v", err)
+			return
+		}
+		<-holdOpen
+	}, &auth.Account{DBID: 42})
+
+	select {
+	case event := <-got:
+		if event.accountID != 42 {
+			t.Fatalf("observer account = %d, want 42", event.accountID)
+		}
+		if event.eventType != "codex.rate_limits" {
+			t.Fatalf("observer event type = %q", event.eventType)
+		}
+		if !strings.Contains(event.payload, `"used_percent":42`) {
+			t.Fatalf("observer payload = %q", event.payload)
+		}
+	case <-time.After(readPumpTestTimeout):
+		t.Fatal("idle metadata observer was not notified")
 	}
 }
 

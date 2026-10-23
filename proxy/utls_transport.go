@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"fmt"
 	"log"
@@ -104,7 +105,7 @@ func NewUTLSTransport(proxyURL string) http.RoundTripper {
 	if proxyURL != "" {
 		d, err := buildProxyDialer(proxyURL)
 		if err != nil {
-			log.Printf("[UTLS] 代理配置失败，回退直连: proxy=%s err=%v", proxyURL, err)
+			log.Printf("[UTLS] 代理配置失败，回退直连: proxy=%s err_type=%T", security.MaskURLCredentials(proxyURL), err)
 			dialer = xproxy.Direct
 		} else {
 			dialer = d
@@ -145,8 +146,10 @@ func buildProxyDialer(proxyURL string) (xproxy.Dialer, error) {
 
 // httpConnectDialer 通过 HTTP CONNECT 方法建立隧道的拨号器
 type httpConnectDialer struct {
-	proxyAddr  string // 代理服务器地址（host:port）
-	authHeader string // Proxy-Authorization 头（可选）
+	proxyAddr       string // 代理服务器地址（host:port）
+	proxyServerName string // https 代理 TLS SNI/证书校验名
+	useTLS          bool   // https:// 代理需要先与代理建立 TLS
+	authHeader      string // Proxy-Authorization 头（可选）
 }
 
 // Dial 通过 HTTP CONNECT 隧道连接到目标地址
@@ -155,6 +158,22 @@ func (d *httpConnectDialer) Dial(network, addr string) (net.Conn, error) {
 	conn, err := net.DialTimeout("tcp", d.proxyAddr, 10*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("连接代理服务器失败: %w", err)
+	}
+
+	// https:// 代理必须先与代理完成 TLS 握手，否则 Proxy-Authorization
+	// 会以明文经过网络；证书校验保持开启。
+	if d.useTLS {
+		tlsConn := tls.Client(conn, &tls.Config{
+			ServerName: d.proxyServerName,
+			MinVersion: tls.VersionTLS12,
+		})
+		_ = tlsConn.SetDeadline(time.Now().Add(10 * time.Second))
+		if err := tlsConn.Handshake(); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("代理 TLS 握手失败: %w", err)
+		}
+		_ = tlsConn.SetDeadline(time.Time{})
+		conn = tlsConn
 	}
 
 	// 2. 发送 CONNECT 请求建立隧道
@@ -211,7 +230,11 @@ func buildHTTPProxyDialer(u *url.URL) (xproxy.Dialer, error) {
 		}
 	}
 
-	d := &httpConnectDialer{proxyAddr: addr}
+	d := &httpConnectDialer{
+		proxyAddr:       addr,
+		proxyServerName: u.Hostname(),
+		useTLS:          strings.EqualFold(u.Scheme, "https"),
+	}
 
 	// 处理代理认证
 	if u.User != nil {

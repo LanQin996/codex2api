@@ -999,8 +999,15 @@ func TestExternalImageJobRouteNormalizesEditPayload(t *testing.T) {
 	if created.Job == nil || created.Job.APIKeyID != keyID {
 		t.Fatalf("created job = %#v, want api key id %d", created.Job, keyID)
 	}
+	if created.Job.ParamsJSON != "" {
+		t.Fatal("202 receipt must not echo params_json/input images")
+	}
+	storedJob, err := db.GetImageGenerationJob(context.Background(), created.Job.ID)
+	if err != nil {
+		t.Fatalf("load stored job: %v", err)
+	}
 	var params imageGenerationJobPayload
-	if err := json.Unmarshal([]byte(created.Job.ParamsJSON), &params); err != nil {
+	if err := json.Unmarshal([]byte(storedJob.ParamsJSON), &params); err != nil {
 		t.Fatalf("decode params_json: %v", err)
 	}
 	if params.Prompt != "edit this" || params.Model != "gpt-image-2" || params.OutputFormat != "png" {
@@ -1092,8 +1099,15 @@ func TestExternalImageJobRouteFetchesPublicInputImageAsDataURL(t *testing.T) {
 	if created.Job == nil {
 		t.Fatalf("created job is nil")
 	}
+	if created.Job.ParamsJSON != "" {
+		t.Fatal("202 receipt must not echo params_json/input images")
+	}
+	storedJob, err := db.GetImageGenerationJob(context.Background(), created.Job.ID)
+	if err != nil {
+		t.Fatalf("load stored job: %v", err)
+	}
 	var params imageGenerationJobPayload
-	if err := json.Unmarshal([]byte(created.Job.ParamsJSON), &params); err != nil {
+	if err := json.Unmarshal([]byte(storedJob.ParamsJSON), &params); err != nil {
 		t.Fatalf("decode params_json: %v", err)
 	}
 	want := "data:image/png;base64," + base64.StdEncoding.EncodeToString(tiny)

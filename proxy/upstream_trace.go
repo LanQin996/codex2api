@@ -103,15 +103,20 @@ func resetUpstreamAttemptTrace(ctx context.Context) {
 }
 
 func beginUpstreamTrace(ctx context.Context, account *auth.Account, proxyURL string, ws bool) func(*http.Response) {
+	recordUpstreamAttempt(ctx)
 	a := upstreamTraceFromContext(ctx)
 	if a == nil || account == nil {
 		return func(*http.Response) {}
 	}
+	boundProxy, accountBound := AccountBoundEgress(ctx)
+	if accountBound {
+		proxyURL = boundProxy
+	}
 	label := a.store.ProxyAuditForURL(proxyURL)
-	if ws && proxyURL == "" {
+	if !accountBound && ws && proxyURL == "" {
 		label = auth.ProxyAuditLabel{Name: "unknown"}
 	}
-	if resinCarriesEgress(account) {
+	if !accountBound && resinCarriesEgress(account) {
 		label = auth.ProxyAuditLabel{Name: "resin"}
 	}
 	label.Name = security.MaskSensitiveData(label.Name)

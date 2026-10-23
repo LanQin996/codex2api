@@ -13,15 +13,43 @@ Two credential shapes are supported:
 | Google OAuth | `cloudcode-pa.googleapis.com/v1internal:*` (with the configured fallback hosts) | `Authorization: Bearer ...` and `x-goog-user-project` | Integrated |
 | Google API Key | `generativelanguage.googleapis.com/v1beta/interactions` | `x-goog-api-key` | Experimental; dispatch disabled by default; real wire contract not yet verified |
 
-## Default models
+## Model discovery and defaults
 
-When an account has no explicit or synchronized model list, the channel exposes this conservative fallback catalog:
+OAuth model availability comes from each account's Google control-plane catalog. The gateway refreshes enabled OAuth accounts' model/quota catalogs every 30 minutes, and retains the last successful catalog when a refresh fails or returns an empty catalog. A model appearing in another account or in a reference project's static list does not grant access to it. Model discovery is not a successful generation test.
 
-- `gemini-3-pro-preview`
-- `gemini-2.5-pro`
-- `gemini-2.5-flash`
+When an account has no explicit or synchronized model list, its fallback catalog projects to these public gateway IDs:
 
-An API Key account can declare its own model list and optional model mapping. The management `models` endpoint returns the declared list or these defaults; it does not claim to have remotely verified the catalog.
+- `gemini-3.8-flash-low`, `gemini-3.8-flash-medium`, `gemini-3.8-flash-high`
+- `gemini-3.7-flash-low`, `gemini-3.7-flash-medium`, `gemini-3.7-flash-high`
+- `gemini-3.6-flash-low`, `gemini-3.6-flash-medium`, `gemini-3.6-flash-high`
+- `gemini-3.1-pro-low`, `gemini-3.1-pro-high`
+- `gpt-oss-120b-medium`
+
+These defaults are compatibility fallbacks, not a statement of current plan entitlements. Argon and Claude are intentionally absent from the fallback. Claude 5.5 Opus/Sonnet low, medium, and high tiers, and the older Claude 4.6 IDs, are published only when their backing models exist in the account catalog. Older Gemini mappings remain available for accounts whose catalogs still contain them; updating the static catalog in another project does not remove those mappings here.
+
+An API Key account can declare its own model list and optional model mapping. Its management `models` endpoint returns the declared list or these defaults without claiming remote verification. Frontend model selectors prefer the account-derived channel catalog over their static fallback.
+
+### Gemini 4 Argon
+
+An OAuth account must discover the backing model `gemini-4-argon-high` before the gateway publishes these fixed-tier IDs:
+
+| Public model ID | Upstream model ID | `thinkingLevel` |
+| --- | --- | --- |
+| `gemini-4-argon-low` | `gemini-4-argon-high` | `LOW` |
+| `gemini-4-argon-medium` | `gemini-4-argon-high` | `MEDIUM` |
+| `gemini-4-argon-high` | `gemini-4-argon-high` | `HIGH` |
+
+Low and medium are gateway tier names, not separately discovered upstream models. For Responses requests, the bare alias `gemini-4-argon` accepts `reasoning.effort` values `low`, `medium`, and `high`, defaulting to `high` when omitted. An administrator's model redirect can override the bare alias; a fixed-tier suffix takes precedence over a conflicting Responses effort. Chat Completions and Messages use the same conversion path. Native Gemini requests preserve an explicit `generationConfig.thinkingConfig`; only when absent does the gateway supply the requested tier's `thinkingLevel`.
+
+Disabled placeholders such as `gemini-4-argon-disabled` remain visible in the account's model list with a disabled overlay. Connection-test model selectors hide disabled placeholders, and automatic tests do not select them. Models without quota metadata show an unknown quota rather than an invented remaining percentage. Disabled state is derived from the current ID's `disabled` segment, not persisted separately: when a later catalog replaces the placeholder with a normal model ID, the overlay disappears and the new model appears as a normal test choice, even before quota metadata arrives. Placeholders are not advertised as callable models through the public inference API and cannot enter ordinary scheduling.
+
+The Codex model manifest folds available Argon tiers into one `gemini-4-argon` choice with separate reasoning controls and a 1,048,576-token context window. The named levels and context metadata follow [CPA v8.0.28's Argon registry entry](https://github.com/router-for-me/CLIProxyAPI/commit/866d84d086749c1c1e8b32dac93f46230a5d43a0). The manifest advertises text input to match the gateway's Responses adapter; this does not claim image-input support on that path.
+
+As of 2026-10-14, [Google's model availability documentation](https://antigravity.google/docs/models/) lists Argon for Google AI Ultra and Enterprise, and Claude 5.5 for non-trial Google AI Pro subscriptions, Ultra, and Enterprise. Actual routing still requires the account's discovered backing model. Argon generation against a real upstream has not yet been verified by this project; the available local validation accounts are Pro accounts whose refreshed catalogs contain the disabled placeholder rather than the callable Argon backing.
+
+### Model pricing
+
+There is no verified Argon-specific built-in tariff. A custom or synchronized pricing entry for the billed model ID can override the gateway's default; without one, Argon uses the generic fallback estimate. Do not interpret that estimate as Google's published Argon price. After discovery, the model appears in the model-pricing page where an operator can configure its price.
 
 ## Adding accounts
 
@@ -44,6 +72,12 @@ Open **Accounts → Antigravity → Google OAuth**, start authorization, and com
 
 OAuth accounts synchronize a Google subject, project, permissions, quota snapshots, and model metadata when the upstream supplies them. A 401 may trigger one OAuth token refresh/retry. This recovery is never used for API Key accounts.
 
+### Workspace / enterprise accounts
+
+Google provisions a managed Cloud Code project only for consumer tiers (free tier, Google One AI Pro/Ultra). Workspace accounts on Gemini Code Assist Standard or Enterprise (`standard-tier`, `userDefinedCloudaicompanionProject: true`) are never given one: `onboardUser` completes without a project, the account cannot be dispatched, and quota-summary calls fail with "You do not have a valid license of this product".
+
+For these accounts, open **Edit** on the account and set **GCP project ID** to a Google Cloud project that has Gemini for Google Cloud enabled and that the account can use. Saving stores it as `antigravity_user_project_id` and immediately resyncs. The project is sent to `loadCodeAssist` and (for non-free tiers) `onboardUser`, matching Gemini CLI's `GOOGLE_CLOUD_PROJECT` behavior; Google-returned projects still take precedence. The free tier never receives the user project because naming one there fails with `FAILED_PRECONDITION`. Clear the field to return to Google-managed projects.
+
 ### Imported OAuth credentials
 
 The Antigravity account dialog accepts a single credential JSON / refresh token or multiple JSON files. Imported credentials are synchronized before normal use when possible. Account-list responses never return access tokens, refresh tokens, client secrets, or API keys.
@@ -65,6 +99,18 @@ When creating or editing a Codex2API downstream API key, choose **Antigravity** 
 
 Account groups are channel-isolated: an Antigravity account can only join an Antigravity group.
 
+## Balanced affinity switch
+
+First binding and fresh session selection bias Antigravity candidates by concurrency occupancy, used quota, and the account's recent rate-limit penalty, so a credential Google just throttled sinks to the back of the queue while healthy ones keep serving new sessions.
+
+```
+ANTIGRAVITY_BALANCED_AFFINITY=false
+```
+
+The switch is on by default. `0`, `false`, `off`, `none`, and `no` (case-insensitive) turn the weighting off and restore plain round-robin; any other value keeps it on. It is read once when the process starts, so changing it requires a restart.
+
+Cooldown correctness is independent of this switch and always applies: the public and shared wire keys are cooled together (the Gemini-family key is added when the quota bucket is exhausted), a shared wire/family deadline is never shortened by a briefer event on the same account, and cooldowns written by another instance are honoured during selection. Entries whose candidate pool excludes Antigravity accounts (`/v1/responses/compact`, native remote compaction, the `/v1/responses` WebSocket upgrade path) never apply the weighting, even behind an Antigravity key.
+
 ## Supported gateway endpoints
 
 Antigravity inference is admitted through `/v1/responses`, `/v1/chat/completions`, and `/v1/messages`; its models are exposed through `/v1/models` and the Codex model manifest. Chat and Messages translate their inbound body into a Responses payload before dispatch, which is exactly what the `v1internal` adapter consumes, so all three transports share one admission gate and one adapter. `/v1/responses/compact` still excludes Antigravity accounts because no compaction adapter exists, and the official Codex executors reject Antigravity credentials before any network request as a provider-boundary safeguard.
@@ -85,12 +131,12 @@ Requirements and behavior:
 
 - **OAuth only.** API Key / Interactions accounts are rejected; bind a downstream key to the `antigravity` upstream channel (or use an `auto` key whose scoped catalog includes Antigravity models).
 - **Authentication.** Send the Codex2API downstream key as `Authorization: Bearer <key>`, `x-api-key: <key>`, or `x-goog-api-key: <key>`. The last form is what the `google-genai` SDK, ADK, and the Gemini channel of aggregator gateways send by default, so pointing their base URL at Codex2API works without a custom header. The `?key=` query-string form is not accepted (the key would land in URLs and access logs).
-- **Model IDs** match the published Antigravity catalog (`gemini-3.7-flash-high`, `gemini-3.8-flash-low`, Claude tiers exposed by the channel, and so on), not raw Google wire IDs.
+- **Model IDs** match the published Antigravity catalog (`gemini-3.7-flash-high`, `gemini-3.8-flash-low`, `gemini-4-argon-high`, Claude tiers exposed by the channel, and so on), not raw Google wire IDs.
 - **Tool schemas** are normalized before upstream dispatch: orphan `required` entries are dropped, `anyOf` / `oneOf` / `allOf` unions are flattened, invalid function names are sanitized with response-name restore, and schemas are sent as `parametersJsonSchema` (Cloud Code expectation).
 - **Multi-turn tools:** `functionResponse` turns are regrouped for the adapter; leading `inlineData` parts in the same user turn are attached under the matching `functionResponse.parts`.
 - **Thinking:** client-supplied `generationConfig.thinkingConfig` is preserved; when absent, the gateway applies the tier default for the requested public model.
 - **Usage accounting:** both generate methods record upstream token usage, including cached input and thinking. Logged output includes thinking tokens, with reasoning also shown as a subset; native response fields remain unchanged. Streaming usage is read through the final usage frame, even when it follows `finishReason`, and repeated cumulative snapshots are not added together. First-token latency measures the time from upstream dispatch to the first content part (text, thinking, tools, or media), excluding keepalives and usage-only frames. Missing upstream usage is not estimated; historical zero-token logs cannot be reconstructed from those logs alone.
-- **Thought signatures:** missing stubs are injected on outbound `functionCall` parts; stale signatures on inbound `functionResponse` parts are stripped to avoid replay failures.
+- **Thought signatures:** missing stubs are injected on outbound `functionCall` parts for every `gemini-*` backing, including models reached through raw catalog pass-through; stale signatures on inbound `functionResponse` parts are stripped to avoid replay failures.
 - **countTokens:** OAuth accounts call upstream `/v1internal:countTokens` with the same request normalization as generateContent (minus `project`, `model`, `sessionId`, `toolConfig`, and safety settings). When no account is available or upstream returns 404, the gateway falls back to a local token estimate.
 - **Tool schema cleanup:** MCP-style bare property maps, boolean `required` flags, local `$ref` / `$defs` JSON Pointer inline (including nested pointers, `anyOf` `$ref` branches, sibling overrides, and cycle fallback), orphan `required` entries, union flattening, missing array `items`, and unsupported enums are normalized before upstream dispatch.
 
@@ -117,7 +163,7 @@ Not yet implemented on this surface: batch/embed APIs, Imagen `predict`, and ful
 
 ## Function tools
 
-Responses function tools are bridged into Gemini `functionDeclarations`. Dropping them is not a safe degradation: the upstream still receives the system instruction describing those tools, answers with a call it was never allowed to declare, and terminates the turn as `MALFORMED_FUNCTION_CALL`. Built-in Codex tools (web search, image generation, computer use) have no `v1internal` equivalent and are still ignored. Operators can pin the bridge off for diagnostics, which makes a `tool_choice` that forces a function fail closed with a 400 instead:
+Responses function tools are bridged into Gemini `functionDeclarations`. Dropping them is not a safe degradation: the upstream still receives the system instruction describing those tools, answers with a call it was never allowed to declare, and terminates the turn as `MALFORMED_FUNCTION_CALL`. Built-in Codex tools (web search, image generation, computer use) are not translated by this adapter and are still ignored. Adding Argon or discovering a model with upstream search support does not enable Responses `web_search` in the gateway. Operators can pin the bridge off for diagnostics, which makes a `tool_choice` that forces a function fail closed with a 400 instead:
 
 ```bash
 ANTIGRAVITY_FUNCTION_TOOLS_ENABLED=false

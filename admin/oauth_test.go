@@ -870,3 +870,51 @@ func TestUpdateOAuthAccountCodeClearsErrorState(t *testing.T) {
 		t.Fatalf("status=%q error=%q, want active with empty error", row.Status, row.ErrorMessage)
 	}
 }
+
+func TestOAuthCallbackPageEscapesHTML(t *testing.T) {
+	page := oauthCallbackPage(`<script>alert(1)</script>`, `账号 <img src=x onerror=alert(1)>`, false)
+	if strings.Contains(page, "<script>") || strings.Contains(page, "<img") {
+		t.Fatalf("callback page contains unescaped HTML: %s", page)
+	}
+	if !strings.Contains(page, "&lt;script&gt;") {
+		t.Fatalf("callback page did not escape the title: %s", page)
+	}
+}
+
+func TestOAuthSessionStoreFindByState(t *testing.T) {
+	store := &oauthSessionStore{sessions: make(map[string]*oauthSession)}
+	store.set("id-1", &oauthSession{State: "state-1", CreatedAt: time.Now()})
+	store.set("id-2", &oauthSession{State: "state-2", CreatedAt: time.Now()})
+
+	id, sess, ok := store.findByState("state-2")
+	if !ok || id != "id-2" || sess.State != "state-2" {
+		t.Fatalf("findByState = (%q, %v, %v), want id-2/state-2", id, sess, ok)
+	}
+	if _, _, ok := store.findByState("missing"); ok {
+		t.Fatal("unknown state should not match")
+	}
+	store.set("expired", &oauthSession{State: "state-expired", CreatedAt: time.Now().Add(-2 * oauthSessionTTL)})
+	if _, _, ok := store.findByState("state-expired"); ok {
+		t.Fatal("expired session should not match")
+	}
+}
+
+func TestOAuthCallbackRejectsCompletedSession(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	const sessionID = "replay-test-session"
+	globalOAuthStore.set(sessionID, &oauthSession{
+		State:          "state-replay",
+		CreatedAt:      time.Now(),
+		ExchangeResult: &oauthExchangeResult{Success: true},
+	})
+	t.Cleanup(func() { globalOAuthStore.delete(sessionID) })
+
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/auth/callback?code=replayed&state=state-replay", nil)
+	(&Handler{}).OAuthCallback(c)
+
+	if recorder.Code != http.StatusBadRequest || !strings.Contains(recorder.Body.String(), "已处理") {
+		t.Fatalf("replayed callback = %d %s, want 400 with 已处理", recorder.Code, recorder.Body.String())
+	}
+}

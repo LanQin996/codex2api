@@ -32,6 +32,40 @@ Run it as a full **PostgreSQL + Redis** production stack or as a single-containe
 
 ---
 
+## Sponsors
+
+<p align="center">
+  <a href="https://proxylane.dev/?r=r4zpan9djwesjumv0vamthoz&amp;utm_source=codex2api&amp;utm_medium=partnership&amp;utm_campaign=codex2api_sponsor_202610&amp;utm_content=github_readme"><img src="assets/proxylane-banner.png" alt="ProxyLane 住宅代理：首单七折 CODEX2API30" width="100%"></a>
+</p>
+
+<p align="center">
+  <b><a href="https://proxylane.dev/?r=r4zpan9djwesjumv0vamthoz&amp;utm_source=codex2api&amp;utm_medium=partnership&amp;utm_campaign=codex2api_sponsor_202610&amp;utm_content=github_readme">ProxyLane</a></b> 提供住宅代理，支持 HTTP / HTTPS / SOCKS5，提供中文界面及 USDT 付款。<br>
+  免费 3GB 测试流量，限前 50 名，兑换码：<code>CODEX2API3GB</code>。<br>
+  首次购买使用优惠码 <code>CODEX2API30</code> 享七折优惠。
+</p>
+
+<p align="center">
+  <a href="https://www.rapidproxy.io/?ref=codex2api"><img src="assets/rapidproxy-banner.png" alt="RapidProxy 代理 IP：动态住宅 $0.55/GB 起，静态住宅 $5/IP/月" width="100%"></a>
+</p>
+
+<p align="center">
+  <b><a href="https://www.rapidproxy.io/?ref=codex2api">RapidProxy</a></b> 为开发者和企业提供高性能代理 IP 服务，覆盖全球 200+ 国家和地区的 9000 万+ 住宅 IP，支持智能轮换、精准地理定位、流量永不过期及高并发连接。<br>
+  广泛适用于网页采集、AI 数据获取、SEO 监控和电商分析，支持 HTTP / HTTPS / SOCKS5 协议。<br>
+  支持免费试用，九折优惠码：<code>RAPID10</code>
+</p>
+
+<p align="center">
+  <a href="https://www.ipwo.net/?ref=githubcodex2api"><img src="assets/ipwo-banner.webp" alt="IPWO 住宅代理" width="100%"></a>
+</p>
+
+<p align="center">
+  <b><a href="https://www.ipwo.net/?ref=githubcodex2api">IPWO</a></b> 提供覆盖 195+ 地区的住宅代理 IP 资源，支持动态、静态及不限量住宅代理方案。<br>
+  可用于区域化访问测试、网页数据采集和跨境业务等场景，支持 HTTP / HTTPS / SOCKS5 协议。<br>
+  支持免费测试，九折优惠码：<code>0203</code>
+</p>
+
+---
+
 ## Live Demo
 
 - Demo URL: [https://codex2api-latest-vu8j.onrender.com](https://codex2api-latest-vu8j.onrender.com)
@@ -70,12 +104,11 @@ Run it as a full **PostgreSQL + Redis** production stack or as a single-containe
 
 ---
 
-
 ## Contents
 
+- [Sponsors](#sponsors)
 - [Live Demo](#live-demo)
 - [Screenshots](#screenshots)
-- [Sponsors](#sponsors)
 - [Quick Start](#quick-start)
 - [Documentation](#documentation)
 - [Upgrade and Local Development](#upgrade-and-local-development)
@@ -287,6 +320,7 @@ Each successful budget change receives a read-only generation and is polled by e
 - Admin Secret priority:
   - If `ADMIN_SECRET` is set in `.env`, the environment variable wins.
   - Otherwise, the database `AdminSecret` value is used.
+  - If neither is set, `/admin` opens the first-run setup page. It requires the one-time bootstrap token printed in the service log (`docker compose logs codex2api | grep "bootstrap token"`); the token is per-process, regenerated on restart, and revoked once setup succeeds.
   - After login, the frontend sends `X-Admin-Key` when calling `/api/admin/*`.
 
 ---

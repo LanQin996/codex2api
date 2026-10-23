@@ -46,24 +46,27 @@ import (
 
 // Handler 管理后台 API 处理器
 type Handler struct {
-	credentialOpsOnce  sync.Once
-	credentialOps      *credentialOperationsService
-	imageQueue         *imageJobQueue
-	qualityTestContext context.Context
-	qualityTestWG      sync.WaitGroup
-	store              *auth.Store
-	modelRefreshFuncs  map[string]channelModelRefreshFunc // nil = 各渠道默认实现；测试注入用
-	proxyRiskJobsMu    sync.RWMutex
-	proxyRiskJobs      map[string]*proxyRiskScoringJob
-	cache              cache.TokenCache
-	authCacheProxy     *proxy.Handler
-	db                 *database.DB
-	cacheCfgStore      responseCacheSettingsStore
-	rateLimiter        *proxy.RateLimiter
-	systemUpdate       *systemUpdater
-	systemUpdateOnce   sync.Once
-	refreshAccount     func(context.Context, int64) error
-	probeUsage         func(context.Context, *auth.Account) error
+	credentialOpsOnce        sync.Once
+	credentialOps            *credentialOperationsService
+	intelligenceDeviceConfig *proxy.DeviceProfileConfig
+	intelligenceOnce         sync.Once
+	intelligenceWG           sync.WaitGroup
+	imageQueue               *imageJobQueue
+	qualityTestContext       context.Context
+	qualityTestWG            sync.WaitGroup
+	store                    *auth.Store
+	modelRefreshFuncs        map[string]channelModelRefreshFunc // nil = 各渠道默认实现；测试注入用
+	proxyRiskJobsMu          sync.RWMutex
+	proxyRiskJobs            map[string]*proxyRiskScoringJob
+	cache                    cache.TokenCache
+	authCacheProxy           *proxy.Handler
+	db                       *database.DB
+	cacheCfgStore            responseCacheSettingsStore
+	rateLimiter              *proxy.RateLimiter
+	systemUpdate             *systemUpdater
+	systemUpdateOnce         sync.Once
+	refreshAccount           func(context.Context, int64) error
+	probeUsage               func(context.Context, *auth.Account) error
 
 	codexUsageRefreshRunning atomic.Bool
 
@@ -109,6 +112,7 @@ type Handler struct {
 	cacheDriver                string
 	cacheLabel                 string
 	adminSecretEnv             string
+	adminAuthThrottle          *adminAuthThrottle
 	imageProxy                 *proxy.Handler
 	antigravitySyncAccount     func(context.Context, int64) antigravityRefreshItem
 	antigravityCapabilityProbe antigravityCapabilityExecutor
@@ -424,6 +428,9 @@ const (
 	importTierRecoveryDelay   = 5 * time.Second
 	importDBWaitBackoff       = 10 * time.Second
 )
+
+// maxAdminPage 限制分页页码，避免 (page-1)*page_size 溢出为负 OFFSET。
+const maxAdminPage = 100000
 
 type importRuntimeLoadSnapshot struct {
 	RPM         int64
@@ -1039,6 +1046,7 @@ func NewHandler(store *auth.Store, db *database.DB, tc cache.TokenCache, rl *pro
 		cacheDriver:          tc.Driver(),
 		cacheLabel:           tc.Label(),
 		adminSecretEnv:       adminSecretEnv,
+		adminAuthThrottle:    newAdminAuthThrottle(),
 		imageProxy:           proxy.NewHandler(store, db, nil, nil),
 		chartCacheData:       make(map[string]*chartCacheEntry),
 		accountListCache:     make(map[string]*accountListSnapshot),
@@ -1227,6 +1235,7 @@ func (h *Handler) RegisterRoutes(r *gin.Engine) {
 	api.DELETE("/modeltrace/bank", h.ResetModelTraceBank)
 	api.GET("/accounts/:id/quality-test/options", h.QualityTestOptions)
 	api.POST("/accounts/:id/quality-test", h.CreateQualityTestJob)
+	h.registerIntelligenceCheckRoutes(api)
 	api.GET("/quality-tests", h.ListQualityTests)
 	api.POST("/quality-test-batches/options", h.QualityTestBatchOptions)
 	api.POST("/quality-test-batches", h.CreateQualityTestBatch)
@@ -1443,19 +1452,43 @@ func (h *Handler) adminAuthMiddleware() gin.HandlerFunc {
 			}
 		}
 
+		clientIP := c.ClientIP()
+		// Check the block before comparing any candidate. Accepting a correct
+		// candidate during a block would leave an unlimited password oracle.
+		if retry := h.adminAuthThrottle.retryAfter(clientIP, time.Now()); retry > 0 {
+			c.Header("Retry-After", strconv.Itoa(int((retry+time.Second-1)/time.Second)))
+			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{
+				"error": "认证失败次数过多，请稍后再试",
+			})
+			return
+		}
+
 		// 清理输入
 		adminKey = security.SanitizeInput(adminKey)
 
 		// 使用安全比较防止时序攻击
 		if !security.SecureCompare(adminKey, adminSecret) {
 			// 记录安全审计日志
-			security.SecurityAuditLog("ADMIN_AUTH_FAILED", fmt.Sprintf("path=%s ip=%s source=%s", c.Request.URL.Path, c.ClientIP(), source))
+			security.SecurityAuditLog("ADMIN_AUTH_FAILED", fmt.Sprintf("path=%s ip=%s source=%s", c.Request.URL.Path, security.SanitizeLog(clientIP), source))
+			if blocked := h.adminAuthThrottle.recordFailure(clientIP, time.Now()); blocked > 0 {
+				c.Header("Retry-After", strconv.Itoa(int((blocked+time.Second-1)/time.Second)))
+				c.JSON(http.StatusTooManyRequests, gin.H{
+					"error": "认证失败次数过多，请稍后再试",
+				})
+				c.Abort()
+				return
+			}
 			c.JSON(http.StatusUnauthorized, gin.H{
 				"error": "管理密钥无效或缺失",
 			})
 			c.Abort()
 			return
 		}
+		h.adminAuthThrottle.reset(clientIP)
+
+		// 管理端响应包含 raw_key、auth.json、settings 等秘密，禁止中间缓存保存。
+		c.Header("Cache-Control", "no-store")
+		c.Header("Pragma", "no-cache")
 
 		// 成功认证，记录审计日志
 		if security.IsSensitiveEndpoint(c.Request.URL.Path) {
@@ -1714,6 +1747,7 @@ type accountResponse struct {
 	AvatarURL                     string                      `json:"avatar_url,omitempty"`
 	VerifiedEmail                 bool                        `json:"verified_email,omitempty"`
 	ProjectID                     string                      `json:"project_id,omitempty"`
+	AntigravityUserProjectID      string                      `json:"antigravity_user_project_id,omitempty"`
 	AntigravityQuota              json.RawMessage             `json:"antigravity_quota,omitempty"`
 	AntigravityPermissions        json.RawMessage             `json:"antigravity_permissions,omitempty"`
 	AntigravitySyncWarning        string                      `json:"antigravity_sync_warning,omitempty"`
@@ -7023,6 +7057,11 @@ func (h *Handler) BatchRefreshAccounts(c *gin.Context) {
 }
 
 func (h *Handler) refreshAccountByID(ctx context.Context, id int64) error {
+	// Antigravity 没有 Codex 式的 AT 刷新：单号/批量刷新统一走控制面同步，
+	// 同时刷新凭据、项目、权限与配额快照。
+	if h.isAntigravityAccountID(ctx, id) {
+		return h.syncAntigravityAccountByID(ctx, id)
+	}
 	return h.refreshAccountByIDWithProbe(ctx, id, true)
 }
 
@@ -8534,7 +8573,9 @@ func (h *Handler) ClearUsageLogs(c *gin.Context) {
 
 // ==================== API Keys ====================
 
-// ListAPIKeys 获取所有 API 密钥（脱敏版本）
+// ListAPIKeys 获取所有 API 密钥（脱敏版本）。
+// view=lite 只返回密钥行本身,跳过窗口费用与最近使用时间:这两项要聚合 usage_logs,
+// 而筛选下拉、横幅等场景用不到,慢盘 SQLite 上每次打开页面都白扫一遍。
 func (h *Handler) ListAPIKeys(c *gin.Context) {
 	ctx, cancel := context.WithTimeout(c.Request.Context(), 5*time.Second)
 	defer cancel()
@@ -8542,6 +8583,14 @@ func (h *Handler) ListAPIKeys(c *gin.Context) {
 	keys, err := h.db.ListAPIKeys(ctx)
 	if err != nil {
 		writeInternalError(c, err)
+		return
+	}
+	if strings.EqualFold(strings.TrimSpace(c.Query("view")), "lite") {
+		maskedKeys := make([]*MaskedAPIKeyRow, 0, len(keys))
+		for _, k := range keys {
+			maskedKeys = append(maskedKeys, NewMaskedAPIKeyRow(k))
+		}
+		c.JSON(http.StatusOK, apiKeysResponse{Keys: maskedKeys})
 		return
 	}
 
@@ -8624,10 +8673,12 @@ type createKeyReq struct {
 }
 
 // generateKey 生成随机 API Key
-func generateKey() string {
+func generateKey() (string, error) {
 	b := make([]byte, 24)
-	rand.Read(b)
-	return "sk-" + hex.EncodeToString(b)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generate api key: %w", err)
+	}
+	return "sk-" + hex.EncodeToString(b), nil
 }
 
 // CreateAPIKey 创建新 API 密钥（增强版，带输入验证）
@@ -8684,7 +8735,12 @@ func (h *Handler) CreateAPIKey(c *gin.Context) {
 
 	key := req.Key
 	if key == "" {
-		key = generateKey()
+		var err error
+		key, err = generateKey()
+		if err != nil {
+			writeInternalError(c, err)
+			return
+		}
 	} else {
 		// 验证用户提供的key格式
 		key = security.SanitizeInput(key)
@@ -9280,6 +9336,7 @@ type settingsResponse struct {
 	CodexWSBusyOverflowEnabled          bool   `json:"codex_ws_busy_overflow_enabled"`
 	CodexWSBusyPatienceSec              int    `json:"codex_ws_busy_patience_sec"`
 	CodexWSStatelessSlots               int    `json:"codex_ws_stateless_slots"`
+	CodexWSDownstreamKeepaliveSlots     int    `json:"codex_ws_downstream_keepalive_slots"`
 	GithubTokenConfigured               bool   `json:"github_token_configured"`
 	GithubProxyURL                      string `json:"github_proxy_url"`
 	CodexOverloadPauseEnabled           bool   `json:"codex_overload_pause_enabled"`
@@ -9421,6 +9478,7 @@ type settingsResponse struct {
 	OAuthModelCooldownMode             string                           `json:"oauth_model_cooldown_mode"`
 	OAuthModelCooldownSeconds          int                              `json:"oauth_model_cooldown_seconds"`
 	OAuthModelCooldownBackoffEnabled   bool                             `json:"oauth_model_cooldown_backoff_enabled"`
+	OAuthUnsupportedCooldownSeconds    int                              `json:"oauth_unsupported_model_cooldown_seconds"`
 }
 
 type rawJSON = json.RawMessage
@@ -9477,6 +9535,7 @@ type updateSettingsReq struct {
 	CodexWSBusyOverflowEnabled          *bool                            `json:"codex_ws_busy_overflow_enabled"`
 	CodexWSBusyPatienceSec              *int                             `json:"codex_ws_busy_patience_sec"`
 	CodexWSStatelessSlots               *int                             `json:"codex_ws_stateless_slots"`
+	CodexWSDownstreamKeepaliveSlots     *int                             `json:"codex_ws_downstream_keepalive_slots"`
 	GithubToken                         *string                          `json:"github_token"`
 	GithubProxyURL                      *string                          `json:"github_proxy_url"`
 	CodexOverloadPauseEnabled           *bool                            `json:"codex_overload_pause_enabled"`
@@ -9595,6 +9654,7 @@ type updateSettingsReq struct {
 	OAuthModelCooldownMode              *string                          `json:"oauth_model_cooldown_mode"`
 	OAuthModelCooldownSeconds           *int                             `json:"oauth_model_cooldown_seconds"`
 	OAuthModelCooldownBackoffEnabled    *bool                            `json:"oauth_model_cooldown_backoff_enabled"`
+	OAuthUnsupportedCooldownSeconds     *int                             `json:"oauth_unsupported_model_cooldown_seconds"`
 }
 
 func updateSettingsHasFieldsOtherThanCustomPatterns(req updateSettingsReq) bool {
@@ -10279,6 +10339,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		OAuthModelCooldownMode:              modelCooldownSettings.OAuthMode,
 		OAuthModelCooldownSeconds:           modelCooldownSettings.OAuthSeconds,
 		OAuthModelCooldownBackoffEnabled:    modelCooldownSettings.OAuthBackoffEnabled,
+		OAuthUnsupportedCooldownSeconds:     modelCooldownSettings.UnsupportedCooldownSeconds(),
 		BackgroundRefreshIntervalMinutes:    h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:             h.store.GetUsageProbeMaxAgeMinutes(),
 		UsageProbeConcurrency:               h.store.GetUsageProbeConcurrency(),
@@ -10316,6 +10377,7 @@ func (h *Handler) GetSettings(c *gin.Context) {
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
 		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
+		CodexWSDownstreamKeepaliveSlots:     h.store.CodexWSDownstreamKeepaliveSlots(),
 		GithubTokenConfigured:               h.store.GithubToken() != "",
 		GithubProxyURL:                      h.store.GithubProxyURL(),
 		CodexOverloadPauseEnabled:           runtimeCfg.CodexOverloadPauseEnabled,
@@ -10573,7 +10635,8 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		req.RelayModelCooldownBackoffEnabled != nil ||
 		req.OAuthModelCooldownMode != nil ||
 		req.OAuthModelCooldownSeconds != nil ||
-		req.OAuthModelCooldownBackoffEnabled != nil || req.ResponsesCooldownMode != nil || req.ResponsesCooldownSeconds != nil
+		req.OAuthModelCooldownBackoffEnabled != nil || req.ResponsesCooldownMode != nil || req.ResponsesCooldownSeconds != nil ||
+		req.OAuthUnsupportedCooldownSeconds != nil
 	if req.ResponsesCooldownMode != nil && !database.IsValidModelCooldownMode(*req.ResponsesCooldownMode) {
 		writeError(c, http.StatusBadRequest, "responses_cooldown_mode 必须是 off、fixed 或 adaptive")
 		return
@@ -10595,6 +10658,10 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			writeError(c, http.StatusBadRequest, fmt.Sprintf("%s 必须在 1-%d 之间", field, database.MaxModelCooldownSeconds))
 			return
 		}
+	}
+	if value := req.OAuthUnsupportedCooldownSeconds; value != nil && (*value < 0 || *value > database.MaxModelCooldownSeconds) {
+		writeError(c, http.StatusBadRequest, fmt.Sprintf("oauth_unsupported_model_cooldown_seconds 必须在 0-%d 之间（0 表示关闭）", database.MaxModelCooldownSeconds))
+		return
 	}
 	var submittedPromptFilterCustomPatterns []promptfilter.PatternConfig
 	var promptFilterPatternQuarantines []promptfilter.PatternQuarantine
@@ -10961,7 +11028,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 
 	if req.ProxyURL != nil {
 		h.store.SetProxyURL(*req.ProxyURL)
-		log.Printf("设置已更新: proxy_url = %s", *req.ProxyURL)
+		log.Printf("设置已更新: proxy_url = %s", security.MaskURLCredentials(*req.ProxyURL))
 	}
 
 	if req.PgMaxConns != nil {
@@ -11128,6 +11195,13 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		log.Printf("设置已更新: codex_ws_stateless_slots = %d", v)
 	}
 
+	if req.CodexWSDownstreamKeepaliveSlots != nil {
+		v := database.NormalizeCodexWSDownstreamKeepaliveSlots(*req.CodexWSDownstreamKeepaliveSlots)
+		h.store.SetCodexWSDownstreamKeepaliveSlots(v)
+		runtimeCfg.CodexWSDownstreamKeepaliveSlots = v
+		log.Printf("设置已更新: codex_ws_downstream_keepalive_slots = %d", v)
+	}
+
 	// GitHub 访问设置（issue #522）。token 不回显也不落日志，空串表示清除。
 	if req.GithubToken != nil {
 		v := strings.TrimSpace(*req.GithubToken)
@@ -11139,7 +11213,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		v := strings.TrimSpace(*req.GithubProxyURL)
 		h.store.SetGithubProxyURL(v)
 		runtimeCfg.GithubProxyURL = v
-		log.Printf("设置已更新: github_proxy_url = %s", v)
+		log.Printf("设置已更新: github_proxy_url = %s", security.MaskURLCredentials(v))
 	}
 
 	// Codex 过载熔断（配置只存 RuntimeSettings，热更新生效）
@@ -11867,6 +11941,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
 		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
+		CodexWSDownstreamKeepaliveSlots:     h.store.CodexWSDownstreamKeepaliveSlots(),
 		GithubToken:                         h.store.GithubToken(),
 		GithubProxyURL:                      h.store.GithubProxyURL(),
 		CodexOverloadPauseEnabled:           runtimeCfg.CodexOverloadPauseEnabled,
@@ -12095,12 +12170,22 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 			OAuthMode:           req.OAuthModelCooldownMode,
 			OAuthSeconds:        req.OAuthModelCooldownSeconds,
 			OAuthBackoffEnabled: req.OAuthModelCooldownBackoffEnabled,
+
+			OAuthUnsupportedSeconds: req.OAuthUnsupportedCooldownSeconds,
 		})
 		if updateErr != nil {
 			writeError(c, http.StatusInternalServerError, updateErr.Error())
 			return
 		}
+		previousUnsupported := h.store.UnsupportedModelCooldown()
 		h.store.SetModelCooldownSettings(committed)
+		// Existing cooldowns longer than the new setting would otherwise keep
+		// blocking the model after it was disabled or shortened.
+		if next := h.store.UnsupportedModelCooldown(); next < previousUnsupported {
+			if cleared := h.store.ClearModelCooldownsByReason(auth.ModelCooldownReasonUnsupported, next); cleared > 0 {
+				log.Printf("设置已更新: oauth_unsupported_model_cooldown_seconds = %d，已清除 %d 条超出新时长的模型不支持冷却", committed.UnsupportedCooldownSeconds(), cleared)
+			}
+		}
 	}
 
 	if responseCacheUpdateRequested {
@@ -12170,6 +12255,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		OAuthModelCooldownMode:              modelCooldownSettings.OAuthMode,
 		OAuthModelCooldownSeconds:           modelCooldownSettings.OAuthSeconds,
 		OAuthModelCooldownBackoffEnabled:    modelCooldownSettings.OAuthBackoffEnabled,
+		OAuthUnsupportedCooldownSeconds:     modelCooldownSettings.UnsupportedCooldownSeconds(),
 		BackgroundRefreshIntervalMinutes:    h.store.GetBackgroundRefreshIntervalMinutes(),
 		UsageProbeMaxAgeMinutes:             h.store.GetUsageProbeMaxAgeMinutes(),
 		UsageProbeConcurrency:               h.store.GetUsageProbeConcurrency(),
@@ -12207,6 +12293,7 @@ func (h *Handler) UpdateSettings(c *gin.Context) {
 		CodexWSBusyOverflowEnabled:          h.store.CodexWSBusyOverflowEnabled(),
 		CodexWSBusyPatienceSec:              h.store.CodexWSBusyPatienceSec(),
 		CodexWSStatelessSlots:               h.store.CodexWSStatelessSlots(),
+		CodexWSDownstreamKeepaliveSlots:     h.store.CodexWSDownstreamKeepaliveSlots(),
 		GithubTokenConfigured:               h.store.GithubToken() != "",
 		GithubProxyURL:                      h.store.GithubProxyURL(),
 		CodexOverloadPauseEnabled:           runtimeCfg.CodexOverloadPauseEnabled,

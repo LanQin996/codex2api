@@ -3,6 +3,8 @@ package security
 import (
 	"bytes"
 	"crypto/rand"
+	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -15,6 +17,10 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// contentSecurityPolicy is kept in a constant so a unit test can verify that
+// every inline script in frontend/index.html is covered by its hash.
+const contentSecurityPolicy = "default-src 'self'; script-src 'self' 'sha256-8jI3h1oN0D7cJ3eKd/Mjk+hKunZV0rZrmg9g4u/5+Nk='; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http:; media-src 'self' data: blob: https: http:; font-src 'self'; connect-src 'self' https://api.github.com;"
+
 // Security headers middleware
 func SecurityHeadersMiddleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -26,8 +32,8 @@ func SecurityHeadersMiddleware() gin.HandlerFunc {
 
 		// Content Security Policy
 		// script-src 内联哈希对应 frontend/index.html 中的主题恢复脚本（在 React 挂载前同步 localStorage 主题到 <html>，避免刷新闪烁）。
-		// 如修改该脚本，请同步更新此处哈希（浏览器控制台报错会给出新哈希）。
-		c.Header("Content-Security-Policy", "default-src 'self'; script-src 'self' 'sha256-WBkfMfl2yQ2pGMyfjGOlZU/dKJRErT3nin/t7BPNjn0='; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https: http:; media-src 'self' data: blob: https: http:; font-src 'self'; connect-src 'self' https://api.github.com;")
+		// 如修改该脚本，请同步更新 contentSecurityPolicy（security/csp_test.go 会检查）。
+		c.Header("Content-Security-Policy", contentSecurityPolicy)
 
 		// Strict Transport Security (HTTPS only)
 		// c.Header("Strict-Transport-Security", "max-age=31536000; includeSubDomains; preload")
@@ -80,7 +86,10 @@ func requestSizeLimiterWithMemory(maxSize int64, budget *requestMemoryBudget) gi
 			}})
 			return
 		}
-		prepaid := max(c.Request.ContentLength, 0)
+		// Charge the budget as bytes actually arrive. Reserving the declared
+		// Content-Length up front lets a client declare 47MB, send nothing, and
+		// pin the global budget; an empty body must reserve zero.
+		prepaid := int64(0)
 		reservation, admitted := budget.acquire(prepaid)
 		if !admitted {
 			rejectRequestMemory(c)
@@ -141,14 +150,11 @@ func GenerateSecureToken(length int) (string, error) {
 
 // SecureCompare compares two strings in constant time to prevent timing attacks
 func SecureCompare(a, b string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	var result byte
-	for i := 0; i < len(a); i++ {
-		result |= a[i] ^ b[i]
-	}
-	return result == 0
+	// Hash both values first so the comparison takes the same path regardless
+	// of length; a direct byte loop leaks the expected secret's length.
+	aHash := sha256.Sum256([]byte(a))
+	bHash := sha256.Sum256([]byte(b))
+	return subtle.ConstantTimeCompare(aHash[:], bHash[:]) == 1
 }
 
 // SanitizeLog sanitizes data for logging
@@ -156,6 +162,9 @@ func SanitizeLog(data string) string {
 	if data == "" {
 		return data
 	}
+	// Keep one log event per line: URL paths and query values can contain
+	// escaped newlines that would otherwise forge additional audit lines.
+	data = strings.NewReplacer("\r", " ", "\n", " ").Replace(data)
 	// Mask sensitive patterns
 	data = MaskSensitiveData(data)
 	// Truncate very long strings

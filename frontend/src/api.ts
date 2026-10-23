@@ -1,3 +1,4 @@
+import { intelligenceQuery, type IntelligenceSettings, type IntelligenceAccount, type IntelligenceRun, type IntelligenceBar, type IntelligencePage } from './lib/intelligenceCheck.ts'
 import { qualityTestFilterQuery, type QualityTestBatch, type QualityTestJob, type QualityTestJobsFilter, type QualityTestJobsResponse, type QualityTestPrompt } from './lib/qualityTest.ts'
 import type {
   AccountEventTrendPoint,
@@ -1251,7 +1252,9 @@ export const api = {
     sp.set('bucket_minutes', String(params.bucketMinutes))
     return request<{ trend: AccountEventTrendPoint[] }>(`/accounts/event-trend?${sp.toString()}`)
   },
-  getAPIKeys: () => request<APIKeysResponse>('/keys'),
+  // view: 'lite' — 只要密钥行本身,跳过窗口费用/最近使用时间的日志聚合(筛选下拉等场景)。
+  getAPIKeys: (params: { view?: 'lite' } = {}) =>
+    request<APIKeysResponse>(params.view ? `/keys?view=${params.view}` : '/keys'),
   getAPIKeyConcurrency: () => request<{ concurrency: Record<string, number> }>('/keys-concurrency'),
   createAPIKey: (data: CreateAPIKeyRequest) =>
     request<CreateAPIKeyResponse>('/keys', {
@@ -1529,6 +1532,14 @@ export const api = {
   getQualityTestBatch: (id: string, signal?: AbortSignal) => request<QualityTestBatch>(`/quality-test-batches/${encodeURIComponent(id)}`, { signal }),
   cancelQualityTestBatch: (id: string) => request<QualityTestBatch>(`/quality-test-batches/${encodeURIComponent(id)}/cancel`, { method: 'POST' }),
   retryQualityTest: (id: number) => request<{ job: QualityTestJob }>(`/quality-tests/${id}/retry`, { method: 'POST' }),
+  getIntelligenceSettings: (signal?: AbortSignal) => request<IntelligenceSettings>('/intelligence-check/settings', { signal }),
+  saveIntelligenceSettings: (body: IntelligenceSettings) => request<IntelligenceSettings>('/intelligence-check/settings', { method: 'PUT', body: JSON.stringify(body) }),
+  getIntelligenceAccounts: (page = 1, filters: Record<string, string | number | undefined> = {}, signal?: AbortSignal) => request<IntelligencePage<IntelligenceAccount>>(`/intelligence-check/accounts?${intelligenceQuery(page, filters)}`, { signal }),
+  setIntelligenceAccounts: (account_ids: number[], enabled: boolean) => request<{ updated: number }>('/intelligence-check/accounts', { method: 'PATCH', body: JSON.stringify({ account_ids, enabled }) }),
+  createIntelligenceRuns: (account_ids: number[]) => request<{ runs: IntelligenceRun[] }>('/intelligence-check/runs', { method: 'POST', body: JSON.stringify({ account_ids }) }),
+  getIntelligenceRuns: (page = 1, filters: Record<string, string | number | undefined> = {}, signal?: AbortSignal) => request<IntelligencePage<IntelligenceRun>>(`/intelligence-check/runs?${intelligenceQuery(page, filters)}`, { signal }),
+  getIntelligenceRun: (id: number, signal?: AbortSignal) => request<{ run: IntelligenceRun }>(`/intelligence-check/runs/${id}`, { signal }),
+  getIntelligenceBars: (ids: number[], signal?: AbortSignal) => request<{ bars: Record<string, IntelligenceBar> }>(`/intelligence-check/bars?account_ids=${ids.join(',')}`, { signal }),
   getQualityTestOptions: (id: number, signal?: AbortSignal) =>
     request<{ models: string[]; reasoning_efforts: string[] }>(`/accounts/${id}/quality-test/options`, { signal }),
   getQualityTestPrompts: (signal?: AbortSignal) =>

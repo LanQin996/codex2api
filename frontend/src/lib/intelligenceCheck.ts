@@ -1,0 +1,143 @@
+export type IntelligenceStatus =
+  "queued" | "running" | "normal" | "degraded" | "error" | "interrupted";
+export type IntelligenceAction = "none" | "pause" | "switch_group";
+export interface IntelligenceQuestion {
+  id: string;
+  name: string;
+  prompt: string;
+  expected_answer: string;
+  match_mode: "exact" | "contains" | "regex";
+  max_duration_ms: number;
+  enabled: boolean;
+}
+export interface IntelligenceSettings {
+  revision: number;
+  enabled: boolean;
+  gpt_model: string;
+  claude_model: string;
+  reasoning_effort: string;
+  judge_mode: "answer" | "latency" | "both";
+  interval_seconds: number;
+  retry_seconds: number;
+  timeout_seconds: number;
+  concurrency: number;
+  retention: number;
+  new_accounts_enabled: boolean;
+  action: IntelligenceAction;
+  degrade_threshold: number;
+  recover_threshold: number;
+  target_group_id: number;
+  questions: IntelligenceQuestion[];
+}
+export interface IntelligenceRecord {
+  id: number;
+  status: IntelligenceStatus;
+  question_name?: string;
+  duration_ms?: number;
+  created_at?: string;
+  completed_at?: string | null;
+}
+export interface IntelligenceRun extends IntelligenceRecord {
+  account_id: number;
+  account_name: string;
+  channel: string;
+  source: "manual" | "automatic";
+  config_revision: number;
+  answer_passed?: boolean;
+  latency_passed?: boolean;
+  model: string;
+  response_model?: string;
+  reasoning_effort: string;
+  judge_mode: IntelligenceSettings["judge_mode"];
+  question: IntelligenceQuestion;
+  output: string;
+  error: string;
+  input_tokens: number;
+  output_tokens: number;
+  reasoning_tokens: number;
+  started_at?: string | null;
+  action: string;
+  action_message?: string;
+  effective_context?: Record<string, unknown>;
+}
+export interface IntelligenceAccount {
+  account_id: number;
+  account_name: string;
+  channel: string;
+  enabled: boolean;
+  latest_status: IntelligenceStatus | "";
+  config_error?: string;
+  failed_streak: number;
+  passed_streak: number;
+  action: IntelligenceAction;
+  next_due_at?: string | null;
+}
+export interface IntelligenceBar {
+  active_run_id?: number;
+  active_status?: "queued" | "running";
+  enabled: boolean;
+  action: IntelligenceAction;
+  records: IntelligenceRecord[];
+}
+export interface IntelligencePage<T> {
+  items: T[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+export const intelligenceLabels: Record<string, string> = {
+  queued: "等待执行",
+  running: "检测中",
+  normal: "正常",
+  degraded: "未通过",
+  error: "上游错误",
+  interrupted: "已中断",
+  resume: "恢复调度",
+  restore_groups: "还原分组",
+  none: "无处置",
+  pause: "检测暂停调度",
+  switch_group: "检测切换分组",
+};
+export function intelligenceColor(status: string): string | undefined {
+  return (
+    { normal: "#22c55e", degraded: "#ef4444", error: "#991b1b" } as Record<
+      string,
+      string
+    >
+  )[status];
+}
+export function intelligenceWindow<
+  T extends { id: number; status: string; created_at?: string },
+>(records: T[]) {
+  const recent = records
+    .filter((r) => !["queued", "running"].includes(r.status))
+    .slice()
+    .sort(
+      (a, b) =>
+        (a.created_at ?? "").localeCompare(b.created_at ?? "") || a.id - b.id,
+    )
+    .slice(-20);
+  const normal = recent.filter((r) => r.status === "normal").length;
+  const degraded = recent.filter((r) => r.status === "degraded").length;
+  return {
+    records: recent,
+    rate: normal + degraded ? (normal / (normal + degraded)) * 100 : null,
+    errors: recent.filter((r) => r.status === "error").length,
+  };
+}
+export function intelligenceQuery(
+  page = 1,
+  filters: Record<string, string | number | undefined> = {},
+) {
+  const params = new URLSearchParams({ page: String(page), page_size: "20" });
+  for (const [key, value] of Object.entries(filters))
+    if (value !== undefined && value !== "") params.set(key, String(value));
+  return params.toString();
+}
+export function latestRequestGuard() {
+  let revision = 0;
+  return {
+    next: () => ++revision,
+    isCurrent: (value: number) => value === revision,
+  };
+}

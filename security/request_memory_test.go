@@ -3,11 +3,13 @@ package security
 import (
 	"bytes"
 	"compress/gzip"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -82,6 +84,38 @@ func TestRequestMemorySingleRequestSizeStillReturns413(t *testing.T) {
 	router.ServeHTTP(w, httptest.NewRequest("POST", "/", strings.NewReader(strings.Repeat("x", 17))))
 	if w.Code != http.StatusRequestEntityTooLarge || budget.UsedBytes != 0 {
 		t.Fatalf("status=%d bytes=%d", w.Code, budget.UsedBytes)
+	}
+}
+
+func TestRequestMemoryDoesNotPrepayDeclaredLength(t *testing.T) {
+	budget := &requestMemoryBudget{RequestMemorySnapshot: RequestMemorySnapshot{LimitBytes: 64}}
+	router := gin.New()
+	router.Use(requestSizeLimiterWithMemory(128, budget))
+	router.POST("/", func(c *gin.Context) { c.Status(200) })
+
+	pr, pw := io.Pipe()
+	req := httptest.NewRequest("POST", "/", pr)
+	req.ContentLength = 48 // declared, but send nothing yet
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		router.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	if used := budget.snapshot().UsedBytes; used != 0 {
+		t.Fatalf("declared Content-Length was prepaid: used=%d", used)
+	}
+
+	_, _ = pw.Write([]byte("x"))
+	_ = pw.Close()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("request did not finish")
+	}
+	if snap := budget.snapshot(); snap.UsedBytes != 0 || snap.ActiveReservations != 0 {
+		t.Fatalf("reservation leaked: %+v", snap)
 	}
 }
 

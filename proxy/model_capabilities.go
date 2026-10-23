@@ -21,10 +21,11 @@ import (
 var codexCapabilityKinds = map[string]string{
 	"supports_search_tool": "bool", "use_responses_lite": "bool", "prefer_websockets": "bool",
 	"supports_parallel_tool_calls": "bool", "support_verbosity": "bool",
-	"apply_patch_tool_type": "string", "comp_hash": "string", "tool_mode": "string",
+	"experimental_supported_tools": "string_list",
+	"apply_patch_tool_type":        "string", "comp_hash": "string", "tool_mode": "string",
 	"default_reasoning_level": "string", "default_verbosity": "string",
 	"context_window": "number", "max_context_window": "number", "max_output_tokens": "number",
-	"input_modalities": "list", "supported_reasoning_levels": "list", "service_tiers": "list",
+	"input_modalities": "modalities", "supported_reasoning_levels": "list", "service_tiers": "list",
 }
 
 func parseCodexModelCapabilities(body []byte) map[string]map[string]json.RawMessage {
@@ -77,12 +78,21 @@ func validCodexCapability(kind string, raw json.RawMessage) bool {
 	case "number":
 		var value int64
 		return json.Unmarshal(raw, &value) == nil && value > 0 && value <= 100_000_000
-	case "list":
+	case "list", "string_list", "modalities":
 		var values []json.RawMessage
 		if json.Unmarshal(raw, &values) != nil || len(values) > 32 {
 			return false
 		}
 		for _, value := range values {
+			if kind == "string_list" || kind == "modalities" {
+				var text string
+				if json.Unmarshal(value, &text) != nil || !validCapabilityListString(text) {
+					return false
+				}
+				if kind == "modalities" && text != "text" && text != "image" && text != "audio" {
+					return false
+				}
+			}
 			if capabilityListKey(value) == "" {
 				return false
 			}
@@ -92,9 +102,24 @@ func validCodexCapability(kind string, raw json.RawMessage) bool {
 	return false
 }
 
+func validCapabilityListString(value string) bool {
+	if strings.TrimSpace(value) == "" || len(value) > 512 {
+		return false
+	}
+	for _, character := range value {
+		if character < 0x20 || character == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 func capabilityListKey(raw json.RawMessage) string {
 	var value string
 	if json.Unmarshal(raw, &value) == nil {
+		if !validCapabilityListString(value) {
+			return ""
+		}
 		return value
 	}
 	var object map[string]json.RawMessage
@@ -226,8 +251,8 @@ func intersectCodexCapabilities(candidates []map[string]json.RawMessage) map[str
 				}
 			}
 			result[name], _ = json.Marshal(minimum)
-		case "list":
-			var shared []json.RawMessage
+		case "list", "string_list", "modalities":
+			shared := make([]json.RawMessage, 0)
 			_ = json.Unmarshal(values[0], &shared)
 			for _, raw := range values[1:] {
 				var other []json.RawMessage
@@ -261,37 +286,51 @@ func intersectCodexCapabilities(candidates []map[string]json.RawMessage) map[str
 }
 
 func (h *Handler) applyStoredModelCapabilities(ctx context.Context, row *database.APIKeyRow, body []byte) []byte {
-	if h == nil || h.db == nil || h.store == nil || row == nil {
+	return h.applyModelCapabilities(ctx, row, body, false)
+}
+
+// A live upstream descriptor is also an upper bound: an older persisted
+// observation must never add tools or limits that this descriptor removed.
+func (h *Handler) applyUpstreamModelCapabilities(ctx context.Context, row *database.APIKeyRow, body []byte) []byte {
+	return h.applyModelCapabilities(ctx, row, body, true)
+}
+
+func (h *Handler) applyModelCapabilities(ctx context.Context, row *database.APIKeyRow, body []byte, upstream bool) []byte {
+	var root map[string]json.RawMessage
+	var models []map[string]json.RawMessage
+	if json.Unmarshal(body, &root) != nil || json.Unmarshal(root["models"], &models) != nil {
 		return body
 	}
 	var accounts []*auth.Account
 	var ids []int64
-	for _, account := range h.store.Accounts() {
-		if h.accountVisibleToAPIKey(account, row.ID, time.Now()) {
-			accounts = append(accounts, account)
-			ids = append(ids, account.ID())
+	if h != nil && h.store != nil && row != nil {
+		for _, account := range h.store.Accounts() {
+			if h.accountVisibleToAPIKey(account, row.ID, time.Now()) {
+				accounts = append(accounts, account)
+				ids = append(ids, account.ID())
+			}
 		}
 	}
-	snapshots, err := h.db.ListModelCapabilities(ctx, ids)
-	if err != nil || len(snapshots) == 0 {
-		return body
+	snapshots := make(map[int64]database.ModelCapabilitySnapshot)
+	if h != nil && h.db != nil {
+		stored, err := h.db.ListModelCapabilities(ctx, ids)
+		if err == nil {
+			snapshots = stored
+		}
 	}
 	for _, account := range accounts {
 		if snapshot, ok := snapshots[account.ID()]; ok {
 			account.ApplyModelCapabilities(snapshot)
 		}
 	}
-	var root map[string]json.RawMessage
-	var models []map[string]json.RawMessage
-	if json.Unmarshal(body, &root) != nil || json.Unmarshal(root["models"], &models) != nil {
-		return body
-	}
 	for _, model := range models {
 		var slug string
-		if json.Unmarshal(model["slug"], &slug) != nil {
+		if json.Unmarshal(model["slug"], &slug) != nil || !isAllowedUpstreamCodexModel(slug) {
+			// Non-Codex adapters build their own conservative descriptors; their
+			// provider-specific reasoning controls cannot be learned here.
 			continue
 		}
-		filter := accountFilterForResponsesModel(slug, true)
+		filter := codexManifestCapabilityAccountFilter(row, slug)
 		var candidates []map[string]json.RawMessage
 		for _, account := range accounts {
 			if !filter(account) {
@@ -304,14 +343,39 @@ func (h *Handler) applyStoredModelCapabilities(ctx context.Context, row *databas
 			snapshot := snapshots[account.ID()]
 			var fields map[string]json.RawMessage
 			if snapshot.CredentialGeneration == account.GetCredentialGeneration() {
-				fields = snapshot.Models[strings.ToLower(target)]
+				fields = snapshot.Models[strings.ToLower(strings.TrimSpace(target))]
 			}
-			candidates = append(candidates, fields)
+			validated := make(map[string]json.RawMessage)
+			for name, raw := range fields {
+				if kind, ok := codexCapabilityKinds[name]; ok && validCodexCapability(kind, raw) {
+					validated[name] = raw
+				}
+			}
+			candidates = append(candidates, validated)
 		}
-		for name, value := range intersectCodexCapabilities(candidates) {
-			if bytes.Equal(value, []byte("null")) {
+		if upstream {
+			validated := make(map[string]json.RawMessage)
+			for name, kind := range codexCapabilityKinds {
+				if raw := model[name]; validCodexCapability(kind, raw) {
+					validated[name] = raw
+				}
+			}
+			// No eligible credential means there is no usable capability proof.
+			if len(candidates) == 0 {
+				candidates = append(candidates, nil)
+			}
+			candidates = append(candidates, validated)
+		}
+		effective := intersectCodexCapabilities(candidates)
+		for name, kind := range codexCapabilityKinds {
+			value := effective[name]
+			if len(value) == 0 || bytes.Equal(value, []byte("null")) {
 				if name == "input_modalities" {
 					model[name] = json.RawMessage(`["text"]`)
+				} else if kind == "bool" {
+					model[name] = json.RawMessage("false")
+				} else if kind == "list" || kind == "string_list" || kind == "modalities" {
+					model[name] = json.RawMessage("[]")
 				} else {
 					delete(model, name)
 				}
@@ -320,15 +384,40 @@ func (h *Handler) applyStoredModelCapabilities(ctx context.Context, row *databas
 			}
 		}
 	}
-	root["models"], err = json.Marshal(models)
+	encodedModels, err := json.Marshal(models)
 	if err != nil {
 		return body
 	}
+	root["models"] = encodedModels
 	result, err := json.Marshal(root)
 	if err != nil {
 		return body
 	}
 	return result
+}
+
+func codexManifestCapabilityAccountFilter(row *database.APIKeyRow, model string) auth.AccountFilter {
+	filter := excludeClaudeAccountsFilter(accountFilterForResponsesModel(model, true))
+	if row == nil {
+		return filter
+	}
+	return func(account *auth.Account) bool {
+		if !filter(account) {
+			return false
+		}
+		switch row.Limits.ResolveUpstreamChannel() {
+		case database.UpstreamChannelCodex:
+			return !account.IsGrokAPI() && !account.IsAntigravityAPI() && !account.IsClaudeOAuth()
+		case database.UpstreamChannelGrok:
+			return grokChannelAccountFilter(model)(account)
+		case database.UpstreamChannelAntigravity:
+			return antigravityChannelAccountFilter(model)(account)
+		case database.UpstreamChannelClaude:
+			return false // This provider serves native Messages, not Responses.
+		default:
+			return true
+		}
+	}
 }
 
 func restoreModelCapabilities(store *auth.Store, db *database.DB) {

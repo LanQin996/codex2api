@@ -254,6 +254,7 @@ func (h *Handler) buildAccountResponse(
 		AvatarURL:                    row.GetCredential("avatar_url"),
 		VerifiedEmail:                row.GetCredentialBool("verified_email"),
 		ProjectID:                    row.GetCredential("project_id"),
+		AntigravityUserProjectID:     row.GetCredential(auth.AntigravityUserProjectIDCredentialKey),
 		AntigravityQuota:             antigravityQuota,
 		AntigravityPermissions:       antigravityPermissions,
 		AntigravitySyncWarning:       row.GetCredential("antigravity_sync_warning"),

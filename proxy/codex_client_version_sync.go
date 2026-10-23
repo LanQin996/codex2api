@@ -102,7 +102,42 @@ func runCodexClientVersionSync(ctx context.Context, key codexClientSyncKey) (*Co
 	result.DesktopMac = summarizeCodexTargetSync(results[:2], "darwin-arm64")
 	result.DesktopWindows = summarizeCodexTargetSync(results[2:4], "win32-x64")
 	result.VSCode = summarizeCodexTargetSync(results[4:], "linux-x64")
+	if result.anyUpdated() {
+		notifyCodexClientVersionRaised()
+	}
 	return result, nil
+}
+
+func (r *CodexClientVersionsSyncResult) anyUpdated() bool {
+	return r != nil && (r.CLI.Updated || r.DesktopMac.Updated || r.DesktopWindows.Updated || r.VSCode.Updated)
+}
+
+var codexClientVersionRaisedHooks struct {
+	mu    sync.Mutex
+	hooks []func()
+}
+
+// OnCodexClientVersionRaised registers fn to run after a sync persisted a newer
+// client version. Upstream answers an outbound version below a model's
+// minimum with the same "model is not supported" 400 it uses for plan gating,
+// so model cooldowns learned under the old version must not outlive it.
+func OnCodexClientVersionRaised(fn func()) {
+	if fn == nil {
+		return
+	}
+	codexClientVersionRaisedHooks.mu.Lock()
+	codexClientVersionRaisedHooks.hooks = append(codexClientVersionRaisedHooks.hooks, fn)
+	codexClientVersionRaisedHooks.mu.Unlock()
+}
+
+func notifyCodexClientVersionRaised() {
+	resetCodexVersionGates()
+	codexClientVersionRaisedHooks.mu.Lock()
+	hooks := append([]func(){}, codexClientVersionRaisedHooks.hooks...)
+	codexClientVersionRaisedHooks.mu.Unlock()
+	for _, fn := range hooks {
+		fn()
+	}
 }
 
 const codexClientArtifactConcurrency = 2

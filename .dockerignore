@@ -19,6 +19,14 @@ Thumbs.db
 # Env
 .env
 .env.local
+.env.*
+!.env.example
+
+# Logs and local worktrees must not enter the build context.
+logs/
+*.log
+.worktrees/
+.local/
 
 # Local credentials and account-test fixtures must never enter a build context.
 .private-account-fixtures/

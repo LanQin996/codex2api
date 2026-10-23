@@ -367,7 +367,9 @@ func (h *Handler) ProbeAntigravityAccountCapabilities(c *gin.Context) {
 	if len(rawModels) == 0 {
 		rawModels = auth.AntigravityDefaultModelIDs()
 	}
-	models := antigravityPublishedModels(rawModels)
+	// A capability probe chooses a model automatically; disabled placeholders
+	// are only eligible for an explicitly selected connection test.
+	models := proxy.AntigravityPublishedModelIDs(rawModels)
 	if len(models) == 0 {
 		writeError(c, http.StatusBadRequest, "Antigravity account has no probe model")
 		return

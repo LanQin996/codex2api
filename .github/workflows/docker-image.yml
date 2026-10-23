@@ -49,8 +49,8 @@ jobs:
               version="sha-${GITHUB_SHA:0:7}"
             fi
           fi
-          if [[ ! "$version" =~ ^[a-zA-Z0-9][a-zA-Z0-9._+-]{0,127}$ ]]; then
-            echo "::error::Invalid build_version: use 1-128 letters, digits, dots, underscores, plus signs or hyphens."
+          if [[ "$version" == *$'\n'* || "$version" == *$'\r'* ]] || ! [[ "$version" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]{0,63}$ ]]; then
+            echo "::error::Invalid build_version: use 1-64 letters, digits, dots, underscores or hyphens."
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"

@@ -117,7 +117,19 @@ func TestUsageLogsPersistDaybreakAndUpstreamModelTogether(t *testing.T) {
 			} else {
 				// SQLite also accepts numbered placeholders, so exercise the
 				// PostgreSQL multi-row column/argument layout without a server.
-				err = db.batchInsertLogsChunk(ctx, db.conn, batch)
+				tx, beginErr := db.conn.BeginTx(ctx, nil)
+				if beginErr != nil {
+					t.Fatalf("begin transaction: %v", beginErr)
+				}
+				defer tx.Rollback()
+				var ids []int64
+				ids, err = db.batchInsertLogsChunk(ctx, tx, batch)
+				if err == nil {
+					if len(ids) != len(batch) {
+						t.Fatalf("got %d inserted IDs, want %d", len(ids), len(batch))
+					}
+					err = tx.Commit()
+				}
 			}
 			if err != nil {
 				t.Fatalf("insert batch: %v", err)

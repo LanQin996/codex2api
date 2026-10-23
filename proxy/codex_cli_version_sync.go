@@ -129,7 +129,11 @@ func SyncCodexCLIVersion(ctx context.Context, db *database.DB, proxyURL string) 
 	if err != nil {
 		return result, err
 	}
-	return applyCodexCLIVersion(ctx, db, result, fetched)
+	result, err = applyCodexCLIVersion(ctx, db, result, fetched)
+	if err == nil && result.Updated {
+		notifyCodexClientVersionRaised()
+	}
+	return result, err
 }
 
 // applyCodexCLIVersion 是 SyncCodexCLIVersion 拉取之后的持久化部分,供并发拉取后顺序落库复用。
